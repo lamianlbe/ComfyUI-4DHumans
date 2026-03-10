@@ -72,7 +72,7 @@ _FINGER_COLORS_R = [
     (140, 0, 0), (140, 50, 0), (140, 100, 0), (140, 150, 0),   # pinky
 ]
 
-FACE_COLOR = (0, 255, 0)  # green dots
+FACE_COLOR = (255, 255, 255)  # white dots
 
 
 def render_wholebody_openpose(img, keypoints, threshold=0.1):

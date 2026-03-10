@@ -48,7 +48,10 @@ def _run_smplestx_on_bbox(img_np_rgb, bbox_xyxy, model, cfg):
 
     Returns
     -------
-    (137, 3) float32 array with (x, y, confidence) in original image coords,
+    dict with:
+        "kp2d": (137, 3) float32 array (x, y, confidence) in original image coords
+        "joint_cam": (137, 3) float32 array, root-relative 3D joints in camera space
+        "inv_trans": (2, 3) affine to map input_img_shape → original image coords
     or None if the bbox is invalid.
     """
     import torchvision.transforms as transforms
@@ -85,6 +88,8 @@ def _run_smplestx_on_bbox(img_np_rgb, bbox_xyxy, model, cfg):
 
     # joint_proj: (B, 137, 2) in output_hm_shape space
     jp = out["smplx_joint_proj"][0].cpu().numpy()  # (137, 2)
+    # joint_cam: (B, 137, 3) root-relative 3D in camera space
+    joint_cam = out["smplx_joint_cam"][0].cpu().numpy()  # (137, 3)
 
     output_hm = cfg.model.output_hm_shape   # (D=16, H=16, W=12)
     input_img = cfg.model.input_img_shape    # (H=512, W=384)
@@ -99,7 +104,65 @@ def _run_smplestx_on_bbox(img_np_rgb, bbox_xyxy, model, cfg):
     jp_orig = (inv_trans @ jp_homo.T).T                   # (137, 2)
 
     confidence = np.ones((137, 1), dtype=np.float32)
-    return np.concatenate([jp_orig, confidence], axis=1).astype(np.float32)
+    kp2d = np.concatenate([jp_orig, confidence], axis=1).astype(np.float32)
+
+    return {
+        "kp2d": kp2d,
+        "joint_cam": joint_cam.astype(np.float32),
+        "inv_trans": inv_trans.astype(np.float32),
+    }
+
+
+def _project_face_3d_to_2d(joint_cam_face, cfg, inv_trans):
+    """
+    Project face 3D joints (camera-space, root-relative) to original image 2D coords.
+
+    Parameters
+    ----------
+    joint_cam_face : (N, 3) float32 – 3D joints in camera space
+    cfg            : SMPLest-X Config (needs focal, princpt, input_body_shape, output_hm_shape, input_img_shape)
+    inv_trans      : (2, 3) affine – maps input_img_shape pixel coords → original image coords
+
+    Returns
+    -------
+    (N, 2) float32 – pixel coords in original image space
+    """
+    focal = cfg.model.focal          # (fx, fy)
+    princpt = cfg.model.princpt      # (cx, cy)
+    input_body = cfg.model.input_body_shape  # (H=256, W=192)
+    output_hm = cfg.model.output_hm_shape    # (D=16, H=16, W=12)
+    input_img = cfg.model.input_img_shape    # (H=512, W=384)
+
+    # Perspective projection: 3D → heatmap space (same as SMPLest_X.get_coord)
+    z = joint_cam_face[:, 2] + 1e-4
+    x_hm = joint_cam_face[:, 0] / z * focal[0] + princpt[0]
+    y_hm = joint_cam_face[:, 1] / z * focal[1] + princpt[1]
+    x_hm = x_hm / input_body[1] * output_hm[2]
+    y_hm = y_hm / input_body[0] * output_hm[1]
+
+    # Heatmap space → input_img_shape pixel space
+    x_px = x_hm / output_hm[2] * input_img[1]
+    y_px = y_hm / output_hm[1] * input_img[0]
+
+    # Apply inv_trans to map to original image coords
+    pts = np.stack([x_px, y_px, np.ones_like(x_px)], axis=1)  # (N, 3)
+    pts_orig = (inv_trans @ pts.T).T  # (N, 2)
+    return pts_orig.astype(np.float32)
+
+
+def _gaussian_kernel(sigma):
+    """Build a 1D Gaussian kernel for temporal smoothing."""
+    half = max(1, int(3 * sigma))
+    k = np.arange(-half, half + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (k / sigma) ** 2)
+    kernel /= kernel.sum()
+    return kernel, half
+
+
+def _smooth_1d(series, kernel, half, T):
+    """Convolve a 1D signal with edge-padded Gaussian kernel."""
+    padded = np.pad(series, half, mode="edge")
+    return np.convolve(padded, kernel, mode="valid")[:T]
 
 
 def _smooth_track_joints(joint_series, sigma):
@@ -116,16 +179,30 @@ def _smooth_track_joints(joint_series, sigma):
 
     T = len(joint_series)
     n_joints = joint_series.shape[1]
-    half   = max(1, int(3 * sigma))
-    k      = np.arange(-half, half + 1, dtype=np.float64)
-    kernel = np.exp(-0.5 * (k / sigma) ** 2)
-    kernel /= kernel.sum()
+    kernel, half = _gaussian_kernel(sigma)
 
     smoothed = joint_series.copy()
     for j in range(n_joints):
         for c in range(2):  # x and y; leave confidence alone
-            padded          = np.pad(joint_series[:, j, c], half, mode="edge")
-            smoothed[:, j, c] = np.convolve(padded, kernel, mode="valid")[:T]
+            smoothed[:, j, c] = _smooth_1d(joint_series[:, j, c], kernel, half, T)
+    return smoothed
+
+
+def _smooth_3d_series(series_3d, sigma):
+    """
+    Apply Gaussian temporal smoothing to a (T, N, 3) xyz series.
+    """
+    if sigma <= 0 or len(series_3d) < 3:
+        return series_3d
+
+    T = len(series_3d)
+    N = series_3d.shape[1]
+    kernel, half = _gaussian_kernel(sigma)
+
+    smoothed = series_3d.copy()
+    for j in range(N):
+        for c in range(3):  # x, y, z
+            smoothed[:, j, c] = _smooth_1d(series_3d[:, j, c], kernel, half, T)
     return smoothed
 
 
@@ -277,11 +354,11 @@ class PHALPPoseControlNetNode:
                 sx_model = smplestx["model"]
                 sx_cfg   = smplestx["cfg"]
                 for i in range(len(pred_bbox)):
-                    kp137 = _run_smplestx_on_bbox(
+                    result = _run_smplestx_on_bbox(
                         img_np, pred_bbox[i], sx_model, sx_cfg,
                     )
                     score = float(pred_scores[i]) if i < len(pred_scores) else 0.0
-                    frame_smplestx.append((score, kp137))
+                    frame_smplestx.append((score, result))
 
             extra_data = tracker.run_additional_models(
                 img_np, pred_bbox, pred_masks, pred_scores,
@@ -326,22 +403,28 @@ class PHALPPoseControlNetNode:
 
         When *use_smplestx* is True, uses the highest-scoring SMPLest-X
         detection per frame (137 joints) instead of PHALP's 25-joint output.
+
+        Returns (timeline, timeline_3d):
+            timeline   : list of (137,3) or (25,3) 2D keypoints (or None)
+            timeline_3d: list of dicts {"joint_cam": (137,3), "inv_trans": (2,3)} or None
         """
         B = len(snapshots)
         timeline = [None] * B
+        timeline_3d = [None] * B
 
         for t in range(B):
             snap = snapshots[t]
 
             if use_smplestx and "__smplestx" in snap:
                 # Pick the highest-confidence detection's SMPLest-X result
-                best_kp = None
+                best_result = None
                 best_score = -1.0
-                for score, kp137 in snap["__smplestx"]:
-                    if kp137 is not None and score > best_score:
+                for score, result in snap["__smplestx"]:
+                    if result is not None and score > best_score:
                         best_score = score
-                        best_kp = kp137
-                if best_kp is not None:
+                        best_result = result
+                if best_result is not None:
+                    best_kp = best_result["kp2d"].copy()
                     # Apply clip_boundary to 137-joint keypoints
                     if clip_boundary >= 0:
                         lo_x, hi_x = -clip_boundary, img_w + clip_boundary
@@ -350,9 +433,12 @@ class PHALPPoseControlNetNode:
                             (best_kp[:, 0] < lo_x) | (best_kp[:, 0] > hi_x) |
                             (best_kp[:, 1] < lo_y) | (best_kp[:, 1] > hi_y)
                         )
-                        best_kp = best_kp.copy()
                         best_kp[oob, 2] = 0.0
                     timeline[t] = best_kp
+                    timeline_3d[t] = {
+                        "joint_cam": best_result["joint_cam"],
+                        "inv_trans": best_result["inv_trans"],
+                    }
             else:
                 # Fallback: use PHALP 25-joint output
                 best_kp = None
@@ -375,23 +461,62 @@ class PHALPPoseControlNetNode:
                         best_kp, img_h, img_w, clip_boundary
                     )
 
-        return timeline
+        return timeline, timeline_3d
 
     @staticmethod
-    def _smooth_timeline(timeline, sigma):
+    def _smooth_timeline(timeline, sigma, timeline_3d=None, cfg=None):
+        """
+        Smooth a keypoint timeline. When timeline_3d is provided, face joints
+        (65-136) are smoothed in 3D camera space and re-projected to 2D.
+        """
         detected = [(t, kp) for t, kp in enumerate(timeline) if kp is not None]
         if sigma <= 0 or len(detected) < 3:
             return
-        kp_series = np.stack([kp for _, kp in detected])
-        smoothed  = _smooth_track_joints(kp_series, sigma)
-        for i, (t, _) in enumerate(detected):
-            timeline[t] = smoothed[i]
+
+        n_joints = detected[0][1].shape[0]
+        use_3d_face = (timeline_3d is not None and cfg is not None
+                       and n_joints == 137)
+
+        if use_3d_face:
+            # Smooth body+hand joints (0-64) in 2D
+            kp_series = np.stack([kp for _, kp in detected])
+            smoothed_2d = _smooth_track_joints(kp_series, sigma)
+
+            # Smooth face joints (65-136) in 3D
+            detected_3d = [(t, timeline_3d[t]) for t, _ in detected
+                           if timeline_3d[t] is not None]
+            if len(detected_3d) >= 3:
+                face_3d = np.stack([d["joint_cam"][65:137] for _, d in detected_3d])
+                face_3d_smooth = _smooth_3d_series(face_3d, sigma)
+
+                # Re-project smoothed face 3D → 2D for each frame
+                for i, (t, d3d) in enumerate(detected_3d):
+                    inv_trans = d3d["inv_trans"]
+                    face_2d = _project_face_3d_to_2d(face_3d_smooth[i], cfg, inv_trans)
+                    smoothed_2d[i, 65:137, :2] = face_2d
+
+            for i, (t, _) in enumerate(detected):
+                timeline[t] = smoothed_2d[i]
+        else:
+            kp_series = np.stack([kp for _, kp in detected])
+            smoothed = _smooth_track_joints(kp_series, sigma)
+            for i, (t, _) in enumerate(detected):
+                timeline[t] = smoothed[i]
 
     @staticmethod
-    def _interpolate_timeline(timeline):
+    def _interpolate_timeline(timeline, timeline_3d=None, cfg=None):
+        """
+        Linearly interpolate gaps in the timeline. When timeline_3d is provided,
+        face joints (65-136) are interpolated in 3D and re-projected to 2D.
+        """
         detected_times = [t for t in range(len(timeline)) if timeline[t] is not None]
         if len(detected_times) < 2:
             return
+
+        n_joints = timeline[detected_times[0]].shape[0]
+        use_3d_face = (timeline_3d is not None and cfg is not None
+                       and n_joints == 137)
+
         t_first, t_last = detected_times[0], detected_times[-1]
         for t in range(t_first + 1, t_last):
             if timeline[t] is not None:
@@ -399,7 +524,27 @@ class PHALPPoseControlNetNode:
             t0 = max(dt for dt in detected_times if dt < t)
             t1 = min(dt for dt in detected_times if dt > t)
             alpha = (t - t0) / (t1 - t0)
+
+            # Body+hand: linear interpolation in 2D (always)
             timeline[t] = timeline[t0] + alpha * (timeline[t1] - timeline[t0])
+
+            if use_3d_face and timeline_3d[t0] is not None and timeline_3d[t1] is not None:
+                # Face: interpolate in 3D, then project to 2D
+                cam0 = timeline_3d[t0]["joint_cam"][65:137]
+                cam1 = timeline_3d[t1]["joint_cam"][65:137]
+                face_3d_interp = cam0 + alpha * (cam1 - cam0)
+
+                # Use inv_trans from nearest detected frame
+                inv_trans = timeline_3d[t0]["inv_trans"] if alpha < 0.5 else timeline_3d[t1]["inv_trans"]
+                face_2d = _project_face_3d_to_2d(face_3d_interp, cfg, inv_trans)
+                timeline[t][65:137, :2] = face_2d
+
+                # Also interpolate the 3D record for potential downstream use
+                timeline_3d[t] = {
+                    "joint_cam": timeline_3d[t0]["joint_cam"] + alpha * (
+                        timeline_3d[t1]["joint_cam"] - timeline_3d[t0]["joint_cam"]),
+                    "inv_trans": inv_trans,
+                }
 
     @staticmethod
     def _fill_nearest(timeline):
@@ -505,16 +650,20 @@ class PHALPPoseControlNetNode:
 
             if single_person_mode:
                 # ── Single-person pipeline ─────────────────────────────
-                timeline = self._build_single_person_timeline(
+                timeline, timeline_3d = self._build_single_person_timeline(
                     snapshots, eventually_confirmed,
                     img_h, img_w, clip_boundary,
                     use_smplestx=use_smplestx,
                 )
 
-                if smooth_sigma > 0:
-                    self._smooth_timeline(timeline, smooth_sigma)
+                sx_cfg = smplestx["cfg"] if use_smplestx else None
 
-                self._interpolate_timeline(timeline)
+                if smooth_sigma > 0:
+                    self._smooth_timeline(timeline, smooth_sigma,
+                                          timeline_3d=timeline_3d, cfg=sx_cfg)
+
+                self._interpolate_timeline(timeline,
+                                           timeline_3d=timeline_3d, cfg=sx_cfg)
                 self._fill_nearest(timeline)
 
                 if double_frame:
@@ -556,9 +705,9 @@ class PHALPPoseControlNetNode:
 
                     # If SMPLest-X is active, draw all detections' wholebody poses
                     if use_smplestx and "__smplestx" in frame_snap:
-                        for _score, kp137 in frame_snap["__smplestx"]:
-                            if kp137 is not None:
-                                canvas = self._render_kp(canvas, kp137, True)
+                        for _score, result in frame_snap["__smplestx"]:
+                            if result is not None:
+                                canvas = self._render_kp(canvas, result["kp2d"], True)
                     else:
                         for tid, tdata in frame_snap.items():
                             if isinstance(tid, str):
