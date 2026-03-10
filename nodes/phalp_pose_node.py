@@ -112,10 +112,11 @@ class PHALPPoseControlNetNode:
                             "Master switch for gap frames: when a confirmed person "
                             "is not detected in a frame, draw their pose instead of "
                             "leaving a blank. "
-                            "When interpolate_missing is also on, gap frames between "
-                            "two detections use interpolated positions (smooth). "
-                            "When interpolate_missing is off, the last detected pose "
-                            "is reused (may look like a frozen ghost)."
+                            "Combined with interpolate_missing=on: only bounded gaps "
+                            "(between two detections) are filled with smooth interpolation; "
+                            "unbounded gaps (track dying) are left blank to avoid ghost. "
+                            "Combined with interpolate_missing=off: ALL gap frames use "
+                            "the frozen last-known pose (may produce ghost/trail)."
                         ),
                     },
                 ),
@@ -400,20 +401,22 @@ class PHALPPoseControlNetNode:
                             )
                         else:
                             continue
-                    elif draw_predicted:
-                        # Gap frame — draw_predicted is the master gate
-                        if "interpolated_kp" in tdata:
-                            # interpolate_missing filled this frame
-                            kp = tdata["interpolated_kp"]
-                        elif tdata["joints_2d"] is not None:
-                            # frozen last-known pose (no interpolation available)
-                            kp = _joints_to_openpose(
-                                tdata["joints_2d"], img_h, img_w, clip_boundary
-                            )
-                        else:
-                            continue
-                    else:
+                    elif not draw_predicted:
                         continue  # gap frame + draw_predicted off → skip
+                    elif "interpolated_kp" in tdata:
+                        # Gap covered by bounded interpolation → smooth
+                        kp = tdata["interpolated_kp"]
+                    elif not interpolate_missing and tdata["joints_2d"] is not None:
+                        # interpolate_missing off → user explicitly wants
+                        # frozen last-known pose for ALL gap frames
+                        kp = _joints_to_openpose(
+                            tdata["joints_2d"], img_h, img_w, clip_boundary
+                        )
+                    else:
+                        # interpolate_missing is on but couldn't cover this
+                        # frame (no second anchor → track is dying/dead).
+                        # Drawing the frozen pose here = ghost. Skip it.
+                        continue
 
                     canvas = render_openpose(canvas, kp)
 
