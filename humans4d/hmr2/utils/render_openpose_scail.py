@@ -9,10 +9,9 @@ This module converts SMPLest-X data formats into the NLF 3D + DWPose 2D
 formats expected by the SCAIL renderer, and handles the coordinate system
 transformation between SMPLest-X camera space and output image space.
 
-Key insight: SMPLest-X 3D joints live in a camera space with
-focal=(5000,5000) at input_body_shape=(256,192). We must render cylinders
-using these intrinsics (scaled to input_img_shape), then warpAffine each
-frame to output resolution using per-frame inv_trans.
+For each frame, the inv_trans affine matrix is used to compute output-space
+camera intrinsics, allowing direct rendering at output resolution without
+intermediate warpAffine.
 """
 import logging
 
@@ -46,7 +45,10 @@ for _i in range(12): _FLAME_TO_IBUG68[35 + _i] = 48 + _i   # outer mouth → iBU
 for _i in range(8):  _FLAME_TO_IBUG68[47 + _i] = 60 + _i   # inner mouth → iBUG 60-67
 
 
-# ── SMPLest-X 25-body → SMPL 24-joint mapping ───────────────────────────────
+# ── SMPLest-X → SMPL 24-joint mapping ────────────────────────────────────────
+# Maps SMPLest-X 137-joint indices to SMPL 24-joint format for the cylinder
+# renderer. Note: index 66 = Face_2 = SMPL-X joint 15 (Head top), which is
+# the correct Head joint (not index 24 = Nose which would make neck too long).
 _SMPLESTX_TO_SMPL24 = {
     0: 0,    # Pelvis
     1: 1,    # L.Hip
@@ -62,16 +64,16 @@ _SMPLESTX_TO_SMPL24 = {
     11: 19,  # R.Elbow
     12: 20,  # L.Wrist
     13: 21,  # R.Wrist
-    24: 15,  # Nose → Head
+    66: 15,  # Face_2 (SMPL-X Head joint) → Head
 }
 
 
 def _smplestx_3d_to_smpl24(joint_cam_3d, root_cam):
     """
-    Convert SMPLest-X root-relative 3D body joints to SMPL 24-joint
+    Convert SMPLest-X root-relative 3D joints to SMPL 24-joint
     absolute camera-space format for the NLF cylinder renderer.
     """
-    joints_abs = joint_cam_3d[:25] + root_cam[None, :]
+    joints_abs = joint_cam_3d + root_cam[None, :]  # all 137 joints
     smpl24 = np.zeros((24, 3), dtype=np.float32)
     for src, dst in _SMPLESTX_TO_SMPL24.items():
         smpl24[dst] = joints_abs[src]
@@ -158,17 +160,39 @@ def _smplestx_2d_to_dwpose(keypoints_2d, img_h, img_w, threshold=0.1):
     }
 
 
+def _compute_output_intrinsics(fx_img, fy_img, cx_img, cy_img, inv_trans):
+    """
+    Transform camera intrinsics from input_img_shape space to output image
+    space using the inv_trans affine matrix.
+
+    For axis-aligned bboxes, inv_trans is [sx 0 tx; 0 sy ty], giving:
+      fx' = sx * fx,  cx' = sx * cx + tx
+      fy' = sy * fy,  cy' = sy * cy + ty
+
+    For general affine (with rotation), this is approximate but sufficient.
+    """
+    # inv_trans is (2, 3): [[a, b, tx], [c, d, ty]]
+    sx = inv_trans[0, 0]
+    sy = inv_trans[1, 1]
+    tx = inv_trans[0, 2]
+    ty = inv_trans[1, 2]
+
+    fx_out = sx * fx_img
+    fy_out = sy * fy_img
+    cx_out = sx * cx_img + tx
+    cy_out = sy * cy_img + ty
+
+    return fx_out, fy_out, cx_out, cy_out
+
+
 def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
                             render_backend="taichi"):
     """
     Batch-render SCAIL-style pose images for a full timeline.
 
-    Strategy:
-      1. Render 3D cylinders at input_img_shape resolution using SMPLest-X
-         intrinsics (scaled from input_body_shape to input_img_shape).
-      2. Per-frame warpAffine using inv_trans to map rendered cylinders
-         from input_img_shape to output image space.
-      3. Draw 2D hand/face overlay in output image space.
+    For each frame, computes output-space camera intrinsics from inv_trans
+    and renders 3D cylinders directly at output resolution, then overlays
+    2D hand/face drawing.
 
     Args:
         timeline: list of (137, 3) 2D keypoint arrays (or None per frame)
@@ -185,15 +209,11 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
     B = len(timeline)
 
     # ── SMPLest-X intrinsics scaled to input_img_shape ───────────────────
-    # cfg.model.focal = (5000, 5000) at input_body_shape = (256, 192)
-    # cfg.model.princpt = (96, 128) = (input_body_W/2, input_body_H/2)
-    # Scale to input_img_shape = (512, 384)
     focal = cfg.model.focal          # (fx, fy)
     princpt = cfg.model.princpt      # (cx, cy)
     input_body = cfg.model.input_body_shape  # (H, W)
     input_img = cfg.model.input_img_shape    # (H, W)
 
-    render_h, render_w = int(input_img[0]), int(input_img[1])
     scale_x = input_img[1] / input_body[1]  # 384/192 = 2.0
     scale_y = input_img[0] / input_body[0]  # 512/256 = 2.0
 
@@ -202,24 +222,25 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
     cx_img = princpt[0] * scale_x  # 96 * 2 = 192
     cy_img = princpt[1] * scale_y  # 128 * 2 = 256
 
-    # ── Build SMPL 24-joint 3D poses ─────────────────────────────────────
+    # ── Build SMPL 24-joint 3D poses + per-frame output intrinsics ───────
     smpl_poses = []
-    inv_transforms = []
+    frame_intrinsics = []  # (fx, fy, cx, cy) per frame in output space
     for t in range(B):
         if timeline_3d is not None and t < len(timeline_3d) and timeline_3d[t] is not None:
             d3d = timeline_3d[t]
             smpl24 = _smplestx_3d_to_smpl24(d3d["joint_cam"], d3d["root_cam"])
             smpl_poses.append([smpl24])
-            inv_transforms.append(d3d["inv_trans"])
+            fx_o, fy_o, cx_o, cy_o = _compute_output_intrinsics(
+                fx_img, fy_img, cx_img, cy_img, d3d["inv_trans"])
+            frame_intrinsics.append((fx_o, fy_o, cx_o, cy_o))
         else:
             smpl_poses.append([np.zeros((24, 3), dtype=np.float32)])
-            inv_transforms.append(None)
+            frame_intrinsics.append((fx_img, fy_img, cx_img, cy_img))
 
     # ── Compute dynamic cylinder radius ──────────────────────────────────
-    # NLF reference: radius=21.5 at focal≈700, Z≈400, image≈720p
-    #   → projected size ≈ 21.5*700/400 ≈ 37.6 px on 720px height ≈ 5.2%
-    # For SMPLest-X: focal_img≈10000, Z≈2000-5000
-    #   → target ~4% of render_h in projected pixels
+    # NLF reference: radius=21.5 at focal≈700, Z≈400
+    #   → projected ≈ 21.5*700/400 ≈ 37.6 px on 720px height
+    # We target similar visual proportion at output resolution.
     z_values = []
     for t in range(B):
         if timeline_3d is not None and t < len(timeline_3d) and timeline_3d[t] is not None:
@@ -228,10 +249,12 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
                 z_values.append(root_z)
 
     avg_z = np.mean(z_values) if z_values else 3000.0
-    target_px = 0.015 * render_h  # ~8 pixels on 512px (warpAffine will scale up)
-    radius = target_px * avg_z / fy_img
+    # Use the average output focal to compute radius for desired visual thickness
+    avg_fy_out = np.mean([fi[1] for fi in frame_intrinsics])
+    target_px = 0.04 * img_h  # ~4% of output height
+    radius = target_px * avg_z / avg_fy_out
 
-    # ── Build cylinder specs using SCAIL pipeline logic ──────────────────
+    # ── Build cylinder specs + colors ────────────────────────────────────
     base_colors_255 = [
         [255, 0, 0], [0, 255, 255], [255, 85, 0], [255, 170, 0],
         [0, 170, 255], [0, 85, 255], [180, 255, 0], [0, 255, 0],
@@ -248,30 +271,33 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
     ]
     draw_seq = [0, 2, 3, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 
-    cylinder_specs_list = []
-    for i in range(B):
+    # ── Render each frame at output resolution with per-frame intrinsics ─
+    # Choose render function
+    def _render_one_frame(specs_list_1, fx, fy, cx, cy):
+        if render_backend == "taichi" and render_whole_taichi is not None:
+            try:
+                return render_whole_taichi(
+                    specs_list_1, H=img_h, W=img_w,
+                    fx=fx, fy=fy, cx=cx, cy=cy, radius=radius)
+            except Exception:
+                logging.warning("Taichi rendering failed, falling back to torch.")
+                return render_whole_torch(
+                    specs_list_1, H=img_h, W=img_w,
+                    fx=fx, fy=fy, cx=cx, cy=cy, radius=radius)
+        else:
+            return render_whole_torch(
+                specs_list_1, H=img_h, W=img_w,
+                fx=fx, fy=fy, cx=cx, cy=cy, radius=radius)
+
+    frames_rgba = []
+    for t in range(B):
         specs = get_single_pose_cylinder_specs(
-            (i, smpl_poses[i], None, None, None, None, colors, limb_seq, draw_seq))
-        cylinder_specs_list.append(specs)
+            (t, smpl_poses[t], None, None, None, None, colors, limb_seq, draw_seq))
+        fx_o, fy_o, cx_o, cy_o = frame_intrinsics[t]
+        rendered = _render_one_frame([specs], fx_o, fy_o, cx_o, cy_o)
+        frames_rgba.append(rendered[0])
 
-    # ── Render 3D cylinders at input_img_shape resolution ────────────────
-    if render_backend == "taichi" and render_whole_taichi is not None:
-        try:
-            frames_rgba = render_whole_taichi(
-                cylinder_specs_list, H=render_h, W=render_w,
-                fx=fx_img, fy=fy_img, cx=cx_img, cy=cy_img, radius=radius)
-        except Exception:
-            logging.warning("Taichi rendering failed, falling back to torch.")
-            frames_rgba = render_whole_torch(
-                cylinder_specs_list, H=render_h, W=render_w,
-                fx=fx_img, fy=fy_img, cx=cx_img, cy=cy_img, radius=radius)
-    else:
-        frames_rgba = render_whole_torch(
-            cylinder_specs_list, H=render_h, W=render_w,
-            fx=fx_img, fy=fy_img, cx=cx_img, cy=cy_img, radius=radius)
-
-    # ── Per-frame warpAffine to output resolution + 2D overlay ───────────
-    # Build DWPose data for 2D overlay (hands/face/cheekbones)
+    # ── Build DWPose 2D overlay at output resolution ─────────────────────
     dw_poses = []
     for t in range(B):
         if timeline[t] is not None:
@@ -287,49 +313,25 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
                 "hands": [np.zeros((21, 2)).tolist(), np.zeros((21, 2)).tolist()],
             })
 
-    # Draw 2D overlay (hands/face) at output resolution
     canvas_2d = draw_pose_to_canvas_np(
         copy.deepcopy(dw_poses), pool=None, H=img_h, W=img_w, reshape_scale=0,
         show_feet_flag=False, show_body_flag=False, show_cheek_flag=True,
         dw_hand=True, show_face_flag=True, show_hand_flag=True)
 
+    # ── Composite: 3D cylinders + 2D overlay ─────────────────────────────
     result = []
     for t in range(B):
         frame = frames_rgba[t]
-        # Extract RGB from RGBA
         if frame.shape[2] == 4:
             rgb = frame[:, :, :3].copy()
-            alpha = frame[:, :, 3]
         else:
             rgb = frame.copy()
-            alpha = np.ones((render_h, render_w), dtype=np.uint8) * 255
-
-        # warpAffine: input_img_shape → output image space
-        if inv_transforms[t] is not None:
-            inv_trans = inv_transforms[t]  # (2, 3) affine matrix
-            warped_rgb = cv2.warpAffine(
-                rgb, inv_trans, (img_w, img_h),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-            warped_alpha = cv2.warpAffine(
-                alpha, inv_trans, (img_w, img_h),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        else:
-            # No inv_trans — resize to output (fallback, shouldn't normally happen)
-            warped_rgb = cv2.resize(rgb, (img_w, img_h))
-            warped_alpha = cv2.resize(alpha, (img_w, img_h))
-
-        # Composite: 3D cylinders on black background
-        out = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-        mask_3d = warped_alpha > 10  # threshold to avoid aliasing artifacts
-        out[mask_3d] = warped_rgb[mask_3d]
 
         # Overlay 2D hand/face/cheekbone drawing
         canvas_img = canvas_2d[t]
         mask_2d = canvas_img != 0
-        out[mask_2d] = canvas_img[mask_2d]
+        rgb[mask_2d] = canvas_img[mask_2d]
 
-        result.append(out)
+        result.append(rgb)
 
     return result
