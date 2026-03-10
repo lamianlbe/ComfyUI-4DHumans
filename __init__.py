@@ -11,6 +11,9 @@ os.makedirs(SMPL_PATH, exist_ok=True)
 from .nodes.process_humans_node import ProcessHumansNode
 from .nodes.load_detectron_node import LoadDetectronNode
 from .nodes.load_hmr_node import LoadHMRNode
+from .nodes.pose_controlnet_node import HumanPoseControlNetNode
+from .nodes.load_phalp_node import LoadPHALPNode
+from .nodes.phalp_pose_node import PHALPPoseControlNetNode
 # from .nodes.select_human_node import SelectHumanNode
 
 
@@ -18,6 +21,9 @@ NODE_CLASS_MAPPINGS = {
     'ProcessHumans': ProcessHumansNode,
     'LoadDetectron': LoadDetectronNode,
     'LoadHMR': LoadHMRNode,
+    'HumanPoseControlNet': HumanPoseControlNetNode,
+    'LoadPHALP': LoadPHALPNode,
+    'PHALPPoseControlNet': PHALPPoseControlNetNode,
     # 'SelectHuman': SelectHumanNode,
 }
 
@@ -25,5 +31,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'ProcessHumans': 'Process 4D Humans',
     'LoadDetectron': 'Load Detectron Model',
     'LoadHMR': 'Load HMR Model',
+    'HumanPoseControlNet': '4D Human Pose (ControlNet)',
+    'LoadPHALP': 'Load PHALP',
+    'PHALPPoseControlNet': '4D Human Pose Tracking (ControlNet)',
     # 'SelectHuman': 'Select 4D Human'
 }
