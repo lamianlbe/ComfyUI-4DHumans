@@ -5,6 +5,7 @@ import comfy.utils
 
 from ..humans4d.hmr2.utils.render_openpose import render_openpose
 from ..humans4d.hmr2.utils.render_openpose_wholebody import render_wholebody_openpose
+from ..humans4d.hmr2.utils.render_openpose_scail import render_scail_pose
 from .load_phalp_node import _ensure_phalp_importable
 
 
@@ -316,6 +317,19 @@ class PHALPPoseControlNetNode:
                         ),
                     },
                 ),
+                "scail_pose": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Render SCAIL-style pose images instead of OpenPose style. "
+                            "Uses warm/cool color scheme for body limbs, HSV rainbow "
+                            "for hands, and white dots for face. "
+                            "Designed for WAN-SCAIL ControlNet. "
+                            "Requires SMPLest-X (137-joint wholebody estimation)."
+                        ),
+                    },
+                ),
             },
             "optional": {
                 "smplestx": ("SMPLESTX",),
@@ -582,8 +596,10 @@ class PHALPPoseControlNetNode:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _render_kp(canvas, kp, use_wholebody):
+    def _render_kp(canvas, kp, use_wholebody, scail_pose=False):
         """Draw keypoints on canvas using the appropriate renderer."""
+        if scail_pose and use_wholebody:
+            return render_scail_pose(canvas, kp)
         if use_wholebody:
             return render_wholebody_openpose(canvas, kp)
         return render_openpose(canvas, kp)
@@ -593,7 +609,8 @@ class PHALPPoseControlNetNode:
     # ------------------------------------------------------------------
 
     def render_pose(self, images, phalp, single_person_mode, clip_boundary,
-                    smooth_sigma, debug, double_frame, smplestx=None):
+                    smooth_sigma, debug, double_frame, scail_pose=False,
+                    smplestx=None):
         if not _ensure_phalp_importable():
             raise RuntimeError("phalp package not found. See 'Load PHALP' node.")
 
@@ -669,7 +686,7 @@ class PHALPPoseControlNetNode:
                         canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
 
                     if timeline[t] is not None:
-                        canvas = self._render_kp(canvas, timeline[t], use_wholebody)
+                        canvas = self._render_kp(canvas, timeline[t], use_wholebody, scail_pose)
 
                     pose_images.append(
                         torch.from_numpy(canvas.astype(np.float32) / 255.0)
@@ -696,7 +713,7 @@ class PHALPPoseControlNetNode:
                     if use_smplestx and "__smplestx" in frame_snap:
                         for _score, result in frame_snap["__smplestx"]:
                             if result is not None:
-                                canvas = self._render_kp(canvas, result["kp2d"], True)
+                                canvas = self._render_kp(canvas, result["kp2d"], True, scail_pose)
                     else:
                         for tid, tdata in frame_snap.items():
                             if isinstance(tid, str):
