@@ -471,43 +471,17 @@ class PHALPPoseControlNetNode:
     @staticmethod
     def _smooth_timeline(timeline, sigma, timeline_3d=None, cfg=None):
         """
-        Smooth a keypoint timeline. When timeline_3d is provided, face joints
-        (65-136) are smoothed in 3D camera space and re-projected to 2D.
+        Gaussian temporal smoothing on all joints in 2D pixel space.
+        (3D is only used for interpolation, not smoothing, because per-frame
+        projection parameters inv_trans/root_cam are themselves noisy.)
         """
         detected = [(t, kp) for t, kp in enumerate(timeline) if kp is not None]
         if sigma <= 0 or len(detected) < 3:
             return
-
-        n_joints = detected[0][1].shape[0]
-        use_3d_face = (timeline_3d is not None and cfg is not None
-                       and n_joints == 137)
-
-        if use_3d_face:
-            # Smooth body+hand joints (0-64) in 2D
-            kp_series = np.stack([kp for _, kp in detected])
-            smoothed_2d = _smooth_track_joints(kp_series, sigma)
-
-            # Smooth face joints (65-136) in 3D
-            detected_3d = [(t, timeline_3d[t]) for t, _ in detected
-                           if timeline_3d[t] is not None]
-            if len(detected_3d) >= 3:
-                face_3d = np.stack([d["joint_cam"][65:137] for _, d in detected_3d])
-                face_3d_smooth = _smooth_3d_series(face_3d, sigma)
-
-                # Re-project smoothed face 3D → 2D for each frame
-                for i, (t, d3d) in enumerate(detected_3d):
-                    inv_trans = d3d["inv_trans"]
-                    root_cam = d3d["root_cam"]
-                    face_2d = _project_face_3d_to_2d(face_3d_smooth[i], cfg, inv_trans, root_cam)
-                    smoothed_2d[i, 65:137, :2] = face_2d
-
-            for i, (t, _) in enumerate(detected):
-                timeline[t] = smoothed_2d[i]
-        else:
-            kp_series = np.stack([kp for _, kp in detected])
-            smoothed = _smooth_track_joints(kp_series, sigma)
-            for i, (t, _) in enumerate(detected):
-                timeline[t] = smoothed[i]
+        kp_series = np.stack([kp for _, kp in detected])
+        smoothed = _smooth_track_joints(kp_series, sigma)
+        for i, (t, _) in enumerate(detected):
+            timeline[t] = smoothed[i]
 
     @staticmethod
     def _interpolate_timeline(timeline, timeline_3d=None, cfg=None):
