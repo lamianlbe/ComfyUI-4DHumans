@@ -204,7 +204,7 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
                 z_values.append(root_z)
 
     avg_z = np.mean(z_values) if z_values else 3000.0
-    target_px = 0.04 * render_h  # ~20 pixels on 512px
+    target_px = 0.015 * render_h  # ~8 pixels on 512px (warpAffine will scale up)
     radius = target_px * avg_z / fy_img
 
     # ── Build cylinder specs using SCAIL pipeline logic ──────────────────
