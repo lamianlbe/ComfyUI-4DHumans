@@ -85,6 +85,23 @@ def _ensure_phalp_importable():
         return False
 
 
+def _register_torch_safe_globals():
+    """Allow OmegaConf types that PHALP embeds in its checkpoints.
+
+    PyTorch 2.6 changed torch.load's default to weights_only=True, which
+    blocks unpickling of arbitrary globals.  PHALP's checkpoints contain
+    omegaconf.DictConfig objects, so we allowlist them here.
+    """
+    import torch
+    import torch.serialization as ts
+    try:
+        from omegaconf import DictConfig, ListConfig
+        if hasattr(ts, "add_safe_globals"):
+            ts.add_safe_globals([DictConfig, ListConfig])
+    except Exception:
+        pass  # older PyTorch or omegaconf not available — no-op
+
+
 def _build_comfy_phalp_class():
     """PHALP subclass that skips all downloads."""
     from phalp.trackers.PHALP import PHALP
@@ -198,6 +215,7 @@ class LoadPHALPNode:
             )
 
         _check_required_files()
+        _register_torch_safe_globals()
 
         import tempfile
         device  = comfy.model_management.get_torch_device()
