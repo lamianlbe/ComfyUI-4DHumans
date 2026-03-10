@@ -375,6 +375,7 @@ class PHALPPoseControlNetNode:
             pose_images = []
             for t, frame_snap in enumerate(snapshots):
                 canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+                frame_drawn = False
 
                 for tid, tdata in frame_snap.items():
                     confirmed    = tdata["is_confirmed"]
@@ -386,39 +387,54 @@ class PHALPPoseControlNetNode:
                     elif tid in eventually_confirmed:
                         # tentative frame that will later be confirmed
                         if since_update > 0:
-                            continue  # Kalman-only before any detection
+                            print(f"[POSE] frame={t} tid={tid} SKIP tentative+missed (su={since_update})")
+                            continue
                     else:
                         continue  # never confirmed — false positive
+
+                    has_smoothed = "smoothed_kp" in tdata
+                    has_interp   = "interpolated_kp" in tdata
+                    has_joints   = tdata["joints_2d"] is not None
 
                     # ── pick the best available keypoints ──────────────
                     if since_update == 0:
                         # Detected frame — always draw
-                        if "smoothed_kp" in tdata:
+                        if has_smoothed:
                             kp = tdata["smoothed_kp"]
-                        elif tdata["joints_2d"] is not None:
+                        elif has_joints:
                             kp = _joints_to_openpose(
                                 tdata["joints_2d"], img_h, img_w, clip_boundary
                             )
                         else:
+                            print(f"[POSE] frame={t} tid={tid} SKIP detected but no joints (su=0, smoothed={has_smoothed}, joints={has_joints})")
                             continue
                     elif not draw_predicted:
-                        continue  # gap frame + draw_predicted off → skip
-                    elif "interpolated_kp" in tdata:
-                        # Gap covered by bounded interpolation → smooth
+                        print(f"[POSE] frame={t} tid={tid} SKIP draw_predicted=off (su={since_update})")
+                        continue
+                    elif has_interp:
                         kp = tdata["interpolated_kp"]
-                    elif not interpolate_missing and tdata["joints_2d"] is not None:
-                        # interpolate_missing off → user explicitly wants
-                        # frozen last-known pose for ALL gap frames
+                    elif not interpolate_missing and has_joints:
                         kp = _joints_to_openpose(
                             tdata["joints_2d"], img_h, img_w, clip_boundary
                         )
                     else:
-                        # interpolate_missing is on but couldn't cover this
-                        # frame (no second anchor → track is dying/dead).
-                        # Drawing the frozen pose here = ghost. Skip it.
+                        print(f"[POSE] frame={t} tid={tid} SKIP no-anchor-gap (su={since_update}, confirmed={confirmed}, interp={has_interp}, joints={has_joints}, interp_missing={interpolate_missing})")
                         continue
 
+                    source = "smoothed" if (since_update == 0 and has_smoothed) else \
+                             "detected" if since_update == 0 else \
+                             "interpolated" if has_interp else "frozen"
+                    print(f"[POSE] frame={t} tid={tid} DRAW {source} (su={since_update}, confirmed={confirmed})")
                     canvas = render_openpose(canvas, kp)
+                    frame_drawn = True
+
+                if not frame_drawn:
+                    n_tracks = len(frame_snap)
+                    track_info = "; ".join(
+                        f"tid={tid}:conf={d['is_confirmed']},su={d['time_since_update']},j={'Y' if d['joints_2d'] is not None else 'N'},interp={'Y' if 'interpolated_kp' in d else 'N'}"
+                        for tid, d in frame_snap.items()
+                    )
+                    print(f"[POSE] frame={t} BLACK ({n_tracks} tracks: {track_info})")
 
                 pose_images.append(
                     torch.from_numpy(canvas.astype(np.float32) / 255.0)

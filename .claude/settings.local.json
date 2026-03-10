@@ -6,7 +6,13 @@
       "Bash(python3 -c \"from phalp.trackers.PHALP import PHALP; print\\(''''phalp ok''''\\)\")",
       "Bash(python3 -c \"import hmr2; print\\(hmr2.__file__\\)\")",
       "Bash(python3 -c \"from humans4d.hmr2.models import load_hmr2\")",
-      "Bash(pip show:*)"
+      "Bash(pip show:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(python3 -c \"from detectron2 import model_zoo; print\\(model_zoo.get_checkpoint_url\\(''COCO-InstanceSegmentation/mask_rcnn_X_101_32x8d_FPN_3x.yaml''\\)\\)\")",
+      "Bash(python3:*)",
+      "Bash(grep -r \"benchmark\\\\|performance\\\\|accuracy\\\\|F1\\\\|AP\\\\|MPJPE\\\\|PA-MPJPE\" /Users/yongzhang/dev/ml/SMPLest-X/*.md)"
     ]
   }
 }
