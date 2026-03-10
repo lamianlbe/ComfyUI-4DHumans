@@ -9,7 +9,6 @@ from folder_paths import models_dir
 
 from ..smplestx.main.config import Config
 from ..smplestx.models.SMPLest_X import get_model
-from ..smplestx.human_models.human_models import SMPLX
 
 # ── ComfyUI model directory for SMPLest-X assets ─────────────────────────────
 #
@@ -103,9 +102,6 @@ def _build_cfg():
 
 def _load_model(cfg):
     """Load SMPLest-X model with checkpoint, return DataParallel model in eval mode."""
-    # Initialise the SMPLX singleton (must happen before get_model)
-    SMPLX(cfg.model.human_model_path)
-
     model = get_model(cfg, "test")
     model = DataParallel(model).cuda()
 

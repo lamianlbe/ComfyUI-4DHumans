@@ -353,6 +353,9 @@ class Model(nn.Module):
     
 
 def get_model(cfg, mode):
+    # Ensure the SMPLX singleton is initialised from *this* package's class
+    # (must happen before TransformerDecoderHead, which calls SMPLX()).
+    SMPLX(cfg.model.human_model_path)
 
     encoder = ViT(**cfg.model.encoder_config)
     if mode == 'train':
@@ -360,7 +363,7 @@ def get_model(cfg, mode):
         encoder.load_state_dict(encoder_pretrained_model, strict=False)
         print(f"Initialized encoder from {cfg.model.encoder_pretrained_model_path}")
 
-    decoder = TransformerDecoderHead(**cfg.model.decoder_config) 
+    decoder = TransformerDecoderHead(**cfg.model.decoder_config)
 
     model = Model(cfg, encoder, decoder)
     return model
