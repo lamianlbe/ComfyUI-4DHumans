@@ -5,7 +5,7 @@ import comfy.utils
 
 from ..humans4d.hmr2.utils.render_openpose import render_openpose
 from ..humans4d.hmr2.utils.render_openpose_wholebody import render_wholebody_openpose
-from ..humans4d.hmr2.utils.render_openpose_scail import render_scail_pose
+from ..humans4d.hmr2.utils.render_openpose_scail import render_scail_pose_batch
 from .load_phalp_node import _ensure_phalp_importable
 
 
@@ -596,19 +596,8 @@ class PHALPPoseControlNetNode:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _render_kp(canvas, kp, use_wholebody, scail_pose=False,
-                   data_3d=None, cfg=None):
+    def _render_kp(canvas, kp, use_wholebody):
         """Draw keypoints on canvas using the appropriate renderer."""
-        if scail_pose and use_wholebody:
-            if data_3d is not None and cfg is not None:
-                return render_scail_pose(
-                    canvas, kp,
-                    joint_cam_3d=data_3d["joint_cam"],
-                    root_cam=data_3d["root_cam"],
-                    cfg=cfg,
-                    inv_trans=data_3d["inv_trans"],
-                )
-            return render_scail_pose(canvas, kp)
         if use_wholebody:
             return render_wholebody_openpose(canvas, kp)
         return render_openpose(canvas, kp)
@@ -684,32 +673,59 @@ class PHALPPoseControlNetNode:
                 if double_frame:
                     timeline = _double_frames_kp(timeline)
 
-                pose_images = []
-                n_out = len(timeline)
-                for t in range(n_out):
-                    if debug:
-                        src_t = min(t * B // n_out, B - 1) if double_frame else t
-                        bg = (images_nchw[src_t].permute(1, 2, 0) * 255).byte().numpy()
-                        canvas = bg.copy()
-                    else:
-                        canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-
-                    if timeline[t] is not None:
-                        # For SCAIL 3D rendering, pass 3D data if available
-                        t3d = None
-                        if scail_pose and not double_frame and timeline_3d is not None:
-                            t3d = timeline_3d[t] if t < len(timeline_3d) else None
-                        elif scail_pose and double_frame and timeline_3d is not None:
-                            # Map doubled frame index back to original
+                # ── SCAIL batch rendering ──────────────────────────
+                if scail_pose and use_wholebody:
+                    # Build timeline_3d for doubled frames if needed
+                    tl_3d_for_render = timeline_3d
+                    if double_frame and timeline_3d is not None:
+                        tl_3d_doubled = []
+                        for t in range(len(timeline)):
                             src_t = min(t // 2, len(timeline_3d) - 1)
-                            t3d = timeline_3d[src_t]
-                        canvas = self._render_kp(canvas, timeline[t], use_wholebody,
-                                                 scail_pose, data_3d=t3d, cfg=sx_cfg)
+                            tl_3d_doubled.append(timeline_3d[src_t])
+                        tl_3d_for_render = tl_3d_doubled
 
-                    pose_images.append(
-                        torch.from_numpy(canvas.astype(np.float32) / 255.0)
+                    scail_frames = render_scail_pose_batch(
+                        timeline, tl_3d_for_render,
+                        img_h, img_w, cfg=sx_cfg,
                     )
-                    pbar.update(1)
+
+                    pose_images = []
+                    n_out = len(timeline)
+                    for t in range(n_out):
+                        if debug:
+                            src_t = min(t * B // n_out, B - 1) if double_frame else t
+                            bg = (images_nchw[src_t].permute(1, 2, 0) * 255).byte().numpy()
+                            canvas = bg.copy()
+                            # Overlay SCAIL frame on debug background
+                            scail_img = scail_frames[t]
+                            mask = scail_img > 0
+                            canvas[mask] = scail_img[mask]
+                        else:
+                            canvas = scail_frames[t]
+
+                        pose_images.append(
+                            torch.from_numpy(canvas.astype(np.float32) / 255.0)
+                        )
+                        pbar.update(1)
+                else:
+                    # ── Standard per-frame rendering ──────────────────
+                    pose_images = []
+                    n_out = len(timeline)
+                    for t in range(n_out):
+                        if debug:
+                            src_t = min(t * B // n_out, B - 1) if double_frame else t
+                            bg = (images_nchw[src_t].permute(1, 2, 0) * 255).byte().numpy()
+                            canvas = bg.copy()
+                        else:
+                            canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+
+                        if timeline[t] is not None:
+                            canvas = self._render_kp(canvas, timeline[t], use_wholebody)
+
+                        pose_images.append(
+                            torch.from_numpy(canvas.astype(np.float32) / 255.0)
+                        )
+                        pbar.update(1)
 
             else:
                 # ── Multi-person pipeline ──────────────────────────────
@@ -728,14 +744,11 @@ class PHALPPoseControlNetNode:
                         canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
 
                     # If SMPLest-X is active, draw all detections' wholebody poses
-                    sx_cfg = smplestx["cfg"] if use_smplestx else None
                     if use_smplestx and "__smplestx" in frame_snap:
                         for _score, result in frame_snap["__smplestx"]:
                             if result is not None:
-                                d3d = result if scail_pose else None
                                 canvas = self._render_kp(
-                                    canvas, result["kp2d"], True, scail_pose,
-                                    data_3d=d3d, cfg=sx_cfg)
+                                    canvas, result["kp2d"], True)
                     else:
                         for tid, tdata in frame_snap.items():
                             if isinstance(tid, str):
