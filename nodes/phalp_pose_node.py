@@ -332,14 +332,14 @@ class PHALPPoseControlNetNode:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _run_tracking(tracker, images_nchw, measurements, smplestx=None):
+    def _run_tracking(tracker, images_nchw, measurements, smplestx=None, pbar=None):
         """
         Run PHALP tracking on all frames.  Optionally run SMPLest-X on each
         detection to produce 137-joint keypoints per frame.
 
         Returns a list of per-frame snapshot dicts.  When smplestx is provided
         each snapshot also contains a ``"__smplestx"`` key with a list of
-        ``(score, kp137)`` tuples — one per detection.
+        ``(score, result)`` tuples — one per detection.
         """
         snapshots = []
         for t, img_tensor in enumerate(images_nchw):
@@ -391,6 +391,8 @@ class PHALPPoseControlNetNode:
                 frame_snap["__smplestx"] = frame_smplestx
 
             snapshots.append(frame_snap)
+            if pbar is not None:
+                pbar.update(1)
 
         return snapshots
 
@@ -609,8 +611,6 @@ class PHALPPoseControlNetNode:
         top          = (new_size - img_h) // 2
         measurements = [img_h, img_w, new_size, left, top]
 
-        pbar = comfy.utils.ProgressBar(B)
-
         # single_person_mode → draw_predicted=True, interpolate_missing=True
         # multi-person       → draw_predicted=False, interpolate_missing=False
         draw_predicted     = single_person_mode
@@ -619,13 +619,16 @@ class PHALPPoseControlNetNode:
         # Always use two-pass when smoothing, single-person, or SMPLest-X
         use_two_pass = single_person_mode or smooth_sigma > 0 or use_smplestx
 
+        # Progress: tracking frames + rendering frames
+        pbar = comfy.utils.ProgressBar(2 * B if use_two_pass else B)
+
         if use_two_pass:
             # ── Pass 1: full tracking ──────────────────────────────────
             snapshots = self._run_tracking(
                 tracker, images_nchw, measurements,
                 smplestx=smplestx,
+                pbar=pbar,
             )
-            pbar.update(B // 2)
 
             eventually_confirmed = {
                 tid
