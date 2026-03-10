@@ -33,8 +33,8 @@ _REQUIRED_FILES = {
     os.path.join(_SMPLX_PATH, "SMPL-X__FLAME_vertex_ids.npy"): "SMPLX FLAME vertex IDs",
 }
 
-# ── SMPLest-X repo path ──────────────────────────────────────────────────────
-_SMPLESTX_REPO = os.path.join(os.path.dirname(REPO_PATH), "SMPLest-X")
+# ── Bundled SMPLest-X source (copied into this repo) ─────────────────────────
+_SMPLESTX_REPO = os.path.join(REPO_PATH, "smplestx")
 
 
 def _check_required_files():
@@ -53,21 +53,14 @@ def _check_required_files():
 
 
 def _ensure_smplestx_importable():
-    """Add SMPLest-X repo to sys.path so its bare-module imports resolve."""
+    """Add bundled SMPLest-X dir to sys.path so its bare-module imports resolve."""
+    if _SMPLESTX_REPO not in sys.path:
+        sys.path.insert(0, _SMPLESTX_REPO)
     try:
         from models.SMPLest_X import get_model  # noqa: F401
         return True
     except ImportError:
-        pass
-
-    if os.path.isdir(_SMPLESTX_REPO) and _SMPLESTX_REPO not in sys.path:
-        sys.path.insert(0, _SMPLESTX_REPO)
-        try:
-            from models.SMPLest_X import get_model  # noqa: F401
-            return True
-        except ImportError:
-            sys.path.remove(_SMPLESTX_REPO)
-    return False
+        return False
 
 
 def _build_cfg():
@@ -167,8 +160,6 @@ class LoadSMPLestXNode:
                 ├── SMPLX_to_J14.pkl
                 ├── MANO_SMPLX_vertex_ids.pkl
                 └── SMPL-X__FLAME_vertex_ids.npy
-
-    The SMPLest-X source repo must be cloned next to ComfyUI-4DHumans.
     """
 
     @classmethod
@@ -180,12 +171,7 @@ class LoadSMPLestXNode:
     CATEGORY = "4dhumans"
 
     def load(self):
-        if not _ensure_smplestx_importable():
-            raise RuntimeError(
-                "SMPLest-X package not found.\n"
-                f"Expected repo at: {_SMPLESTX_REPO}\n"
-                "Clone it and install its requirements, then restart ComfyUI."
-            )
+        _ensure_smplestx_importable()
 
         _check_required_files()
 
