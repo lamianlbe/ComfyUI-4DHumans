@@ -30,6 +30,22 @@ except Exception:
 from .scail.render_torch import render_whole as render_whole_torch
 
 
+# ── FLAME 72-face → iBUG 68-face mapping ─────────────────────────────────────
+# SMPLest-X face points (offset from index 65) use FLAME ordering.
+# DWPose draw_facepose expects iBUG 68-point ordering.
+# Offsets 0-3 (jaw, head, eyeballs) have no iBUG equivalent and are skipped.
+_FLAME_TO_IBUG68 = {}
+for _i in range(17): _FLAME_TO_IBUG68[55 + _i] = _i        # contour → iBUG 0-16
+for _i in range(5):  _FLAME_TO_IBUG68[4 + _i]  = 17 + _i   # L eyebrow → iBUG 17-21
+for _i in range(5):  _FLAME_TO_IBUG68[9 + _i]  = 22 + _i   # R eyebrow → iBUG 22-26
+for _i in range(4):  _FLAME_TO_IBUG68[14 + _i] = 27 + _i   # nose bridge → iBUG 27-30
+for _i in range(5):  _FLAME_TO_IBUG68[18 + _i] = 31 + _i   # nose bottom → iBUG 31-35
+for _i in range(6):  _FLAME_TO_IBUG68[23 + _i] = 36 + _i   # L eye → iBUG 36-41
+for _i in range(6):  _FLAME_TO_IBUG68[29 + _i] = 42 + _i   # R eye → iBUG 42-47
+for _i in range(12): _FLAME_TO_IBUG68[35 + _i] = 48 + _i   # outer mouth → iBUG 48-59
+for _i in range(8):  _FLAME_TO_IBUG68[47 + _i] = 60 + _i   # inner mouth → iBUG 60-67
+
+
 # ── SMPLest-X 25-body → SMPL 24-joint mapping ───────────────────────────────
 _SMPLESTX_TO_SMPL24 = {
     0: 0,    # Pelvis
@@ -117,12 +133,20 @@ def _smplestx_2d_to_dwpose(keypoints_2d, img_h, img_w, threshold=0.1):
         hands.append(hand.tolist())
 
     # ── Face (68 landmarks, normalized) ───────────────────────────────────
+    # SMPLest-X face (indices 65-136) uses FLAME ordering (72 points):
+    #   offset 0-1: jaw, head  |  2-3: eyeballs  |  4-13: eyebrows (10)
+    #   14-17: nose (4)  |  18-22: below nose (5)  |  23-34: eyes (12)
+    #   35-46: outer mouth (12)  |  47-54: inner mouth (8)  |  55-71: contour (17)
+    # DWPose expects iBUG 68 ordering:
+    #   0-16: contour  |  17-21: L eyebrow  |  22-26: R eyebrow
+    #   27-30: nose bridge  |  31-35: nose bottom  |  36-41: L eye
+    #   42-47: R eye  |  48-59: outer mouth  |  60-67: inner mouth
     face = np.zeros((68, 2), dtype=np.float32)
-    for j in range(min(68, 72)):
-        idx = 65 + j
+    for flame_off, ibug_idx in _FLAME_TO_IBUG68.items():
+        idx = 65 + flame_off  # absolute index in 137-joint array
         if idx < kp.shape[0] and kp[idx, 2] > threshold:
-            face[j, 0] = kp[idx, 0] / img_w
-            face[j, 1] = kp[idx, 1] / img_h
+            face[ibug_idx, 0] = kp[idx, 0] / img_w
+            face[ibug_idx, 1] = kp[idx, 1] / img_h
 
     return {
         "bodies": {
