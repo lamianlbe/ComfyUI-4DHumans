@@ -3,6 +3,14 @@ import numpy as np
 import random
 import math
 
+_ti_initialized = False
+
+def _ensure_ti_init():
+    global _ti_initialized
+    if not _ti_initialized:
+        ti.init(arch=ti.gpu, default_fp=ti.f32)
+        _ti_initialized = True
+
 def flatten_specs(specs_list):
     """Flatten specs_list into numpy arrays + index tables"""
     starts, ends, colors = [], [], []
@@ -25,6 +33,7 @@ def flatten_specs(specs_list):
     )
 
 def render_whole(specs_list, H=480, W=640, fx=500, fy=500, cx=240, cy=320, radius=21.5):
+    _ensure_ti_init()
     img = ti.Vector.field(4, dtype=ti.f32, shape=(H, W))
     starts, ends, colors, frame_offset, frame_count = flatten_specs(specs_list)
     total_cyl = len(starts)

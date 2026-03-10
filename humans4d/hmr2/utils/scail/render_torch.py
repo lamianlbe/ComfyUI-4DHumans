@@ -169,7 +169,7 @@ def render_whole(
             # We only need to compute SDF for active pixels, but let's do all for simplicity first,
             # or better: filter indices.
 
-            active_indices = torch.nonzero(flat_active).squeeze()
+            active_indices = torch.nonzero(flat_active).reshape(-1)
             if active_indices.numel() == 0:
                 break
 
@@ -242,7 +242,7 @@ def render_whole(
 
         # --- Shading ---
         # Compute normals for all hit pixels
-        hit_indices = torch.nonzero(flat_hit).squeeze()
+        hit_indices = torch.nonzero(flat_hit).reshape(-1)
 
         if hit_indices.numel() > 0:
             p_hit = flat_hit_pos[hit_indices]  # (NumHits, 3)
