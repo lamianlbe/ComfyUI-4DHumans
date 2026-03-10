@@ -596,9 +596,18 @@ class PHALPPoseControlNetNode:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _render_kp(canvas, kp, use_wholebody, scail_pose=False):
+    def _render_kp(canvas, kp, use_wholebody, scail_pose=False,
+                   data_3d=None, cfg=None):
         """Draw keypoints on canvas using the appropriate renderer."""
         if scail_pose and use_wholebody:
+            if data_3d is not None and cfg is not None:
+                return render_scail_pose(
+                    canvas, kp,
+                    joint_cam_3d=data_3d["joint_cam"],
+                    root_cam=data_3d["root_cam"],
+                    cfg=cfg,
+                    inv_trans=data_3d["inv_trans"],
+                )
             return render_scail_pose(canvas, kp)
         if use_wholebody:
             return render_wholebody_openpose(canvas, kp)
@@ -686,7 +695,16 @@ class PHALPPoseControlNetNode:
                         canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
 
                     if timeline[t] is not None:
-                        canvas = self._render_kp(canvas, timeline[t], use_wholebody, scail_pose)
+                        # For SCAIL 3D rendering, pass 3D data if available
+                        t3d = None
+                        if scail_pose and not double_frame and timeline_3d is not None:
+                            t3d = timeline_3d[t] if t < len(timeline_3d) else None
+                        elif scail_pose and double_frame and timeline_3d is not None:
+                            # Map doubled frame index back to original
+                            src_t = min(t // 2, len(timeline_3d) - 1)
+                            t3d = timeline_3d[src_t]
+                        canvas = self._render_kp(canvas, timeline[t], use_wholebody,
+                                                 scail_pose, data_3d=t3d, cfg=sx_cfg)
 
                     pose_images.append(
                         torch.from_numpy(canvas.astype(np.float32) / 255.0)
@@ -710,10 +728,14 @@ class PHALPPoseControlNetNode:
                         canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
 
                     # If SMPLest-X is active, draw all detections' wholebody poses
+                    sx_cfg = smplestx["cfg"] if use_smplestx else None
                     if use_smplestx and "__smplestx" in frame_snap:
                         for _score, result in frame_snap["__smplestx"]:
                             if result is not None:
-                                canvas = self._render_kp(canvas, result["kp2d"], True, scail_pose)
+                                d3d = result if scail_pose else None
+                                canvas = self._render_kp(
+                                    canvas, result["kp2d"], True, scail_pose,
+                                    data_3d=d3d, cfg=sx_cfg)
                     else:
                         for tid, tdata in frame_snap.items():
                             if isinstance(tid, str):
