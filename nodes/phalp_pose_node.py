@@ -90,6 +90,8 @@ def _run_smplestx_on_bbox(img_np_rgb, bbox_xyxy, model, cfg):
     jp = out["smplx_joint_proj"][0].cpu().numpy()  # (137, 2)
     # joint_cam: (B, 137, 3) root-relative 3D in camera space
     joint_cam = out["smplx_joint_cam"][0].cpu().numpy()  # (137, 3)
+    # root_cam: (B, 1, 3) absolute root position in camera space
+    root_cam = out["root_cam"][0, 0].cpu().numpy()       # (3,)
 
     output_hm = cfg.model.output_hm_shape   # (D=16, H=16, W=12)
     input_img = cfg.model.input_img_shape    # (H=512, W=384)
@@ -109,40 +111,42 @@ def _run_smplestx_on_bbox(img_np_rgb, bbox_xyxy, model, cfg):
     return {
         "kp2d": kp2d,
         "joint_cam": joint_cam.astype(np.float32),
+        "root_cam": root_cam.astype(np.float32),
         "inv_trans": inv_trans.astype(np.float32),
     }
 
 
-def _project_face_3d_to_2d(joint_cam_face, cfg, inv_trans):
+def _project_face_3d_to_2d(joint_cam_face, cfg, inv_trans, root_cam):
     """
-    Project face 3D joints (camera-space, root-relative) to original image 2D coords.
+    Project face 3D joints (root-relative) to original image 2D coords.
 
     Parameters
     ----------
-    joint_cam_face : (N, 3) float32 – 3D joints in camera space
-    cfg            : SMPLest-X Config (needs focal, princpt, input_body_shape, output_hm_shape, input_img_shape)
+    joint_cam_face : (N, 3) float32 – root-relative 3D joints
+    cfg            : SMPLest-X Config
     inv_trans      : (2, 3) affine – maps input_img_shape pixel coords → original image coords
+    root_cam       : (3,) float32 – absolute root (pelvis) position in camera space
 
     Returns
     -------
     (N, 2) float32 – pixel coords in original image space
     """
+    # Convert root-relative → absolute camera-space coords
+    joints_abs = joint_cam_face + root_cam[None, :]
+
     focal = cfg.model.focal          # (fx, fy)
     princpt = cfg.model.princpt      # (cx, cy)
     input_body = cfg.model.input_body_shape  # (H=256, W=192)
-    output_hm = cfg.model.output_hm_shape    # (D=16, H=16, W=12)
     input_img = cfg.model.input_img_shape    # (H=512, W=384)
 
-    # Perspective projection: 3D → heatmap space (same as SMPLest_X.get_coord)
-    z = joint_cam_face[:, 2] + 1e-4
-    x_hm = joint_cam_face[:, 0] / z * focal[0] + princpt[0]
-    y_hm = joint_cam_face[:, 1] / z * focal[1] + princpt[1]
-    x_hm = x_hm / input_body[1] * output_hm[2]
-    y_hm = y_hm / input_body[0] * output_hm[1]
+    # Perspective projection: 3D absolute → input_body pixel space
+    z = joints_abs[:, 2] + 1e-4
+    x_body = joints_abs[:, 0] / z * focal[0] + princpt[0]
+    y_body = joints_abs[:, 1] / z * focal[1] + princpt[1]
 
-    # Heatmap space → input_img_shape pixel space
-    x_px = x_hm / output_hm[2] * input_img[1]
-    y_px = y_hm / output_hm[1] * input_img[0]
+    # input_body pixel space → input_img pixel space
+    x_px = x_body / input_body[1] * input_img[1]
+    y_px = y_body / input_body[0] * input_img[0]
 
     # Apply inv_trans to map to original image coords
     pts = np.stack([x_px, y_px, np.ones_like(x_px)], axis=1)  # (N, 3)
@@ -437,6 +441,7 @@ class PHALPPoseControlNetNode:
                     timeline[t] = best_kp
                     timeline_3d[t] = {
                         "joint_cam": best_result["joint_cam"],
+                        "root_cam": best_result["root_cam"],
                         "inv_trans": best_result["inv_trans"],
                     }
             else:
@@ -492,7 +497,8 @@ class PHALPPoseControlNetNode:
                 # Re-project smoothed face 3D → 2D for each frame
                 for i, (t, d3d) in enumerate(detected_3d):
                     inv_trans = d3d["inv_trans"]
-                    face_2d = _project_face_3d_to_2d(face_3d_smooth[i], cfg, inv_trans)
+                    root_cam = d3d["root_cam"]
+                    face_2d = _project_face_3d_to_2d(face_3d_smooth[i], cfg, inv_trans, root_cam)
                     smoothed_2d[i, 65:137, :2] = face_2d
 
             for i, (t, _) in enumerate(detected):
@@ -534,15 +540,21 @@ class PHALPPoseControlNetNode:
                 cam1 = timeline_3d[t1]["joint_cam"][65:137]
                 face_3d_interp = cam0 + alpha * (cam1 - cam0)
 
-                # Use inv_trans from nearest detected frame
-                inv_trans = timeline_3d[t0]["inv_trans"] if alpha < 0.5 else timeline_3d[t1]["inv_trans"]
-                face_2d = _project_face_3d_to_2d(face_3d_interp, cfg, inv_trans)
+                # Use inv_trans and root_cam from nearest detected frame
+                src = timeline_3d[t0] if alpha < 0.5 else timeline_3d[t1]
+                inv_trans = src["inv_trans"]
+                root_cam = src["root_cam"]
+                face_2d = _project_face_3d_to_2d(face_3d_interp, cfg, inv_trans, root_cam)
                 timeline[t][65:137, :2] = face_2d
 
                 # Also interpolate the 3D record for potential downstream use
+                root_cam_interp = (timeline_3d[t0]["root_cam"]
+                                   + alpha * (timeline_3d[t1]["root_cam"]
+                                              - timeline_3d[t0]["root_cam"]))
                 timeline_3d[t] = {
                     "joint_cam": timeline_3d[t0]["joint_cam"] + alpha * (
                         timeline_3d[t1]["joint_cam"] - timeline_3d[t0]["joint_cam"]),
+                    "root_cam": root_cam_interp,
                     "inv_trans": inv_trans,
                 }
 

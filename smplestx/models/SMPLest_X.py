@@ -324,7 +324,7 @@ class Model(nn.Module):
             out['smplx_expr'] = pred_mano_params['face_expression']
             out['cam_trans'] = body_trans
             out['smplx_joint_cam'] = joint_cam_wo_ra # for bedlam test
-
+            out['root_cam'] = pred_root_cam           # (B, 1, 3) absolute root in camera space
 
             if 'smplx_shape' in targets:
                 out['smplx_shape_target'] = targets['smplx_shape']
