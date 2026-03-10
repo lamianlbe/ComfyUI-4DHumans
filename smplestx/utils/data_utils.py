@@ -2,8 +2,8 @@ import numpy as np
 import cv2
 import random
 import math
-from human_models.human_models import SMPL, SMPLX
-from utils.transforms import cam2pixel, transform_joint_to_other_db
+from ..human_models.human_models import SMPL, SMPLX
+from .transforms import cam2pixel, transform_joint_to_other_db
 import torch
 
 

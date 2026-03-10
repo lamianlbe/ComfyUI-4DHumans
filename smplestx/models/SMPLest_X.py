@@ -4,11 +4,11 @@ from torch.nn import functional as F
 import cv2
 import math
 import copy
-from models.module import TransformerDecoderHead, ViT
-from models.loss import CoordLoss, ParamLoss
-from human_models.human_models import SMPL, SMPLX
-from utils.transforms import rot6d_to_axis_angle, batch_rodrigues, rot6d_to_rotmat
-from utils.data_utils import load_img
+from .module import TransformerDecoderHead, ViT
+from .loss import CoordLoss, ParamLoss
+from ..human_models.human_models import SMPL, SMPLX
+from ..utils.transforms import rot6d_to_axis_angle, batch_rodrigues, rot6d_to_rotmat
+from ..utils.data_utils import load_img
 
 
 class Model(nn.Module):

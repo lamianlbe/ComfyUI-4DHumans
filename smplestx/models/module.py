@@ -5,7 +5,7 @@ import copy
 import einops
 from einops import rearrange, repeat
 from typing import Callable, Optional, List
-from human_models.human_models import SMPLX, SMPL
+from ..human_models.human_models import SMPLX, SMPL
 from functools import partial
 from timm.layers import drop_path, to_2tuple, trunc_normal_
 import torch.utils.checkpoint as checkpoint

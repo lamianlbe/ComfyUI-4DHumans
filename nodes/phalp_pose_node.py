@@ -52,7 +52,7 @@ def _run_smplestx_on_bbox(img_np_rgb, bbox_xyxy, model, cfg):
     or None if the bbox is invalid.
     """
     import torchvision.transforms as transforms
-    from utils.data_utils import process_bbox, generate_patch_image
+    from ..smplestx.utils.data_utils import process_bbox, generate_patch_image
 
     h, w = img_np_rgb.shape[:2]
 

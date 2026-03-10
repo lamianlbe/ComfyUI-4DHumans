@@ -1,5 +1,4 @@
 import os
-import sys
 
 import torch
 from torch.nn.parallel.data_parallel import DataParallel
@@ -8,7 +7,9 @@ from collections import OrderedDict
 import comfy.model_management
 from folder_paths import models_dir
 
-from .. import REPO_PATH
+from ..smplestx.main.config import Config
+from ..smplestx.models.SMPLest_X import get_model
+from ..smplestx.human_models.human_models import SMPLX
 
 # ── ComfyUI model directory for SMPLest-X assets ─────────────────────────────
 #
@@ -33,9 +34,6 @@ _REQUIRED_FILES = {
     os.path.join(_SMPLX_PATH, "SMPL-X__FLAME_vertex_ids.npy"): "SMPLX FLAME vertex IDs",
 }
 
-# ── Bundled SMPLest-X source (copied into this repo) ─────────────────────────
-_SMPLESTX_REPO = os.path.join(REPO_PATH, "smplestx")
-
 
 def _check_required_files():
     missing = []
@@ -52,21 +50,8 @@ def _check_required_files():
         )
 
 
-def _ensure_smplestx_importable():
-    """Add bundled SMPLest-X dir to sys.path so its bare-module imports resolve."""
-    if _SMPLESTX_REPO not in sys.path:
-        sys.path.insert(0, _SMPLESTX_REPO)
-    try:
-        from models.SMPLest_X import get_model  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
 def _build_cfg():
     """Build a minimal Config for SMPLest-X ViT-Huge inference."""
-    from main.config import Config
-
     return Config({
         "model": {
             "model_type": "vit_huge",
@@ -118,9 +103,6 @@ def _build_cfg():
 
 def _load_model(cfg):
     """Load SMPLest-X model with checkpoint, return DataParallel model in eval mode."""
-    from models.SMPLest_X import get_model
-    from human_models.human_models import SMPLX
-
     # Initialise the SMPLX singleton (must happen before get_model)
     SMPLX(cfg.model.human_model_path)
 
@@ -171,8 +153,6 @@ class LoadSMPLestXNode:
     CATEGORY = "4dhumans"
 
     def load(self):
-        _ensure_smplestx_importable()
-
         _check_required_files()
 
         cfg = _build_cfg()
