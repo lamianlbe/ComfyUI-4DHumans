@@ -77,6 +77,15 @@ def _smplestx_3d_to_smpl24(joint_cam_3d, root_cam):
     smpl24 = np.zeros((24, 3), dtype=np.float32)
     for src, dst in _SMPLESTX_TO_SMPL24.items():
         smpl24[dst] = joints_abs[src]
+
+    # Shorten neck: SMPL-X Head (joint 15) is at the skull top, which makes
+    # the neck→head bone too long compared to NLF/SCAIL. Move head position
+    # to 60% of the way from neck to head top for a more natural look.
+    neck = smpl24[12]  # Neck
+    head = smpl24[15]  # Head (skull top)
+    if np.sum(np.abs(neck)) > 0.01 and np.sum(np.abs(head)) > 0.01:
+        smpl24[15] = neck + 0.6 * (head - neck)
+
     return smpl24
 
 
