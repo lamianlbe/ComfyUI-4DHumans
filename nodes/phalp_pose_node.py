@@ -109,12 +109,13 @@ class PHALPPoseControlNetNode:
                     {
                         "default": False,
                         "tooltip": (
-                            "When a confirmed person is not detected in a frame "
-                            "(occluded, off-screen, etc.), draw their LAST KNOWN "
-                            "pose instead of leaving a blank. "
-                            "Note: this reuses the previous detection's frozen pose "
-                            "and may produce a ghost/trail effect. "
-                            "Has no effect on frames that are filled by interpolation."
+                            "Master switch for gap frames: when a confirmed person "
+                            "is not detected in a frame, draw their pose instead of "
+                            "leaving a blank. "
+                            "When interpolate_missing is also on, gap frames between "
+                            "two detections use interpolated positions (smooth). "
+                            "When interpolate_missing is off, the last detected pose "
+                            "is reused (may look like a frozen ghost)."
                         ),
                     },
                 ),
@@ -139,10 +140,9 @@ class PHALPPoseControlNetNode:
                             "When a confirmed person is temporarily not detected "
                             "between two detected frames, linearly interpolate their "
                             "joint positions from the surrounding detections. "
-                            "Produces smooth transitions instead of blank frames or "
-                            "frozen ghost poses. "
-                            "Frames before the first detection or after the last "
-                            "detection of a track are not interpolated."
+                            "Produces smooth transitions instead of frozen ghost poses. "
+                            "Only works for gap frames bounded by detections on both "
+                            "sides. Requires draw_predicted=True to take effect."
                         ),
                     },
                 ),
@@ -264,19 +264,12 @@ class PHALPPoseControlNetNode:
     def _interpolate_gaps(snapshots, eventually_confirmed, img_h, img_w,
                           clip_boundary):
         """
-        Fill every gap frame for confirmed tracks.
+        Linearly interpolate gap frames that lie *between* two detected
+        anchor frames for each confirmed track.
 
-        Strategy (in priority order for each gap frame):
-
-        1. **Bounded linear interpolation** – frame lies between two detected
-           anchor frames → linearly interpolate x/y between them.
-        2. **Nearest-neighbour extrapolation** – frame is before the first
-           detection or after the last detection of the track → hold the
-           nearest anchor's pose.  This prevents black screens when the
-           detector briefly misses the person at the start/end of their
-           appearance or when a tentative-phase frame was never written into
-           the snapshot (PHALP deletes tentative tracks on any single miss,
-           so that frame has no entry for this tid).
+        Only bounded gaps are filled — frames before the first detection or
+        after the last detection are left untouched (those are handled by
+        the draw_predicted fallback in the render loop).
 
         Interpolation uses 'smoothed_kp' as the anchor when available so
         that the interpolated curve is consistent with the smoothed detections.
@@ -292,8 +285,8 @@ class PHALPPoseControlNetNode:
                 if snapshots[t][tid]["joints_2d"] is not None
                 and snapshots[t][tid]["time_since_update"] == 0
             ]
-            if not detected_frames:
-                continue
+            if len(detected_frames) < 2:
+                continue  # need at least two anchors to interpolate
 
             # Build anchor keypoints (prefer smoothed)
             anchor_kps = {}
@@ -309,31 +302,21 @@ class PHALPPoseControlNetNode:
             t_first = detected_frames[0]
             t_last  = detected_frames[-1]
 
-            # Fill every gap frame that's in the snapshot for this track
+            # Fill only gap frames that lie between two detection anchors
             for t in track_frames:
                 tdata = snapshots[t][tid]
                 if tdata["time_since_update"] == 0:
                     continue  # detected frame – no fill needed
-                if "interpolated_kp" in tdata:
-                    continue  # already filled
+                if t <= t_first or t >= t_last:
+                    continue  # boundary frame – leave for draw_predicted
 
-                if t < t_first:
-                    # Before first detection: hold first anchor
-                    tdata["interpolated_kp"] = anchor_kps[t_first].copy()
-
-                elif t > t_last:
-                    # After last detection: hold last anchor
-                    tdata["interpolated_kp"] = anchor_kps[t_last].copy()
-
-                else:
-                    # Between two detections: linear interpolation
-                    # Find the nearest anchor on each side
-                    t0 = max(a for a in detected_frames if a < t)
-                    t1 = min(a for a in detected_frames if a > t)
-                    alpha = (t - t0) / (t1 - t0)
-                    tdata["interpolated_kp"] = (
-                        anchor_kps[t0] + alpha * (anchor_kps[t1] - anchor_kps[t0])
-                    )
+                # Between two detections: linear interpolation
+                t0 = max(a for a in detected_frames if a < t)
+                t1 = min(a for a in detected_frames if a > t)
+                alpha = (t - t0) / (t1 - t0)
+                tdata["interpolated_kp"] = (
+                    anchor_kps[t0] + alpha * (anchor_kps[t1] - anchor_kps[t0])
+                )
 
     # ------------------------------------------------------------------
     # main entry point
@@ -407,22 +390,30 @@ class PHALPPoseControlNetNode:
                         continue  # never confirmed — false positive
 
                     # ── pick the best available keypoints ──────────────
-                    # Priority: smoothed > interpolated > raw > frozen (draw_predicted)
-                    if "smoothed_kp" in tdata:
-                        kp = tdata["smoothed_kp"]
-                    elif "interpolated_kp" in tdata:
-                        kp = tdata["interpolated_kp"]
-                    elif since_update == 0 and tdata["joints_2d"] is not None:
-                        kp = _joints_to_openpose(
-                            tdata["joints_2d"], img_h, img_w, clip_boundary
-                        )
-                    elif draw_predicted and tdata["joints_2d"] is not None:
-                        # frozen last-known pose (may look like ghost)
-                        kp = _joints_to_openpose(
-                            tdata["joints_2d"], img_h, img_w, clip_boundary
-                        )
+                    if since_update == 0:
+                        # Detected frame — always draw
+                        if "smoothed_kp" in tdata:
+                            kp = tdata["smoothed_kp"]
+                        elif tdata["joints_2d"] is not None:
+                            kp = _joints_to_openpose(
+                                tdata["joints_2d"], img_h, img_w, clip_boundary
+                            )
+                        else:
+                            continue
+                    elif draw_predicted:
+                        # Gap frame — draw_predicted is the master gate
+                        if "interpolated_kp" in tdata:
+                            # interpolate_missing filled this frame
+                            kp = tdata["interpolated_kp"]
+                        elif tdata["joints_2d"] is not None:
+                            # frozen last-known pose (no interpolation available)
+                            kp = _joints_to_openpose(
+                                tdata["joints_2d"], img_h, img_w, clip_boundary
+                            )
+                        else:
+                            continue
                     else:
-                        continue  # no data or draw_predicted disabled
+                        continue  # gap frame + draw_predicted off → skip
 
                     canvas = render_openpose(canvas, kp)
 
