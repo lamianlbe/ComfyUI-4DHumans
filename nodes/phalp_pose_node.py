@@ -135,11 +135,14 @@ class PHALPPoseControlNetNode:
                 "draw_predicted": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": (
-                            "If enabled, also draw skeletons for tracks whose "
-                            "person was not detected in this frame but whose pose "
-                            "was predicted by PHALP's temporal model."
+                            "When a confirmed person is not detected in a frame "
+                            "(occluded, off-screen, etc.), draw their LAST KNOWN "
+                            "pose instead of leaving a blank. "
+                            "Note: this reuses the previous detection's frozen pose "
+                            "and may produce a ghost/trail effect. "
+                            "Disable to only render frames with actual detections."
                         ),
                     },
                 ),
