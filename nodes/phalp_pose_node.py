@@ -112,11 +112,11 @@ class PHALPPoseControlNetNode:
                             "Master switch for gap frames: when a confirmed person "
                             "is not detected in a frame, draw their pose instead of "
                             "leaving a blank. "
-                            "Combined with interpolate_missing=on: only bounded gaps "
-                            "(between two detections) are filled with smooth interpolation; "
-                            "unbounded gaps (track dying) are left blank to avoid ghost. "
+                            "Combined with interpolate_missing=on: bounded gaps use "
+                            "smooth interpolation, brief unbounded gaps (≤ max_frozen_gap) "
+                            "use frozen last-known pose, long gaps are left blank. "
                             "Combined with interpolate_missing=off: ALL gap frames use "
-                            "the frozen last-known pose (may produce ghost/trail)."
+                            "the frozen last-known pose."
                         ),
                     },
                 ),
@@ -159,6 +159,24 @@ class PHALPPoseControlNetNode:
                             "to reduce per-frame jitter. "
                             "Sigma is in frames. "
                             "0 = disabled. 1-2 = light. 3-5 = strong."
+                        ),
+                    },
+                ),
+                "max_frozen_gap": (
+                    "INT",
+                    {
+                        "default": 4,
+                        "min": 0,
+                        "max": 50,
+                        "step": 1,
+                        "tooltip": (
+                            "When interpolate_missing is on but a gap frame has no "
+                            "interpolation anchor (track lost with no future detection), "
+                            "still draw the frozen last-known pose for up to this many "
+                            "frames. Covers brief detector hiccups where the person is "
+                            "clearly still in the scene. "
+                            "0 = never use frozen fallback (strict, may cause black frames). "
+                            "3-5 = recommended (covers brief gaps without visible ghost)."
                         ),
                     },
                 ),
@@ -324,7 +342,8 @@ class PHALPPoseControlNetNode:
     # ------------------------------------------------------------------
 
     def render_pose(self, images, phalp, clip_boundary, draw_predicted,
-                    retroactive_fill, interpolate_missing, smooth_sigma):
+                    retroactive_fill, interpolate_missing, smooth_sigma,
+                    max_frozen_gap):
         if not _ensure_phalp_importable():
             raise RuntimeError("phalp package not found. See 'Load PHALP' node.")
 
@@ -406,35 +425,25 @@ class PHALPPoseControlNetNode:
                                 tdata["joints_2d"], img_h, img_w, clip_boundary
                             )
                         else:
-                            print(f"[POSE] frame={t} tid={tid} SKIP detected but no joints (su=0, smoothed={has_smoothed}, joints={has_joints})")
                             continue
                     elif not draw_predicted:
-                        print(f"[POSE] frame={t} tid={tid} SKIP draw_predicted=off (su={since_update})")
-                        continue
+                        continue  # gap frame + draw_predicted off → skip
                     elif has_interp:
+                        # Bounded interpolation between two anchors
                         kp = tdata["interpolated_kp"]
-                    elif not interpolate_missing and has_joints:
+                    elif has_joints and (not interpolate_missing
+                                         or since_update <= max_frozen_gap):
+                        # Frozen last-known pose, used when:
+                        # - interpolate_missing off: all gap frames
+                        # - interpolate_missing on: only brief gaps (≤ max_frozen_gap)
+                        #   to cover detector hiccups without long-lived ghosts
                         kp = _joints_to_openpose(
                             tdata["joints_2d"], img_h, img_w, clip_boundary
                         )
                     else:
-                        print(f"[POSE] frame={t} tid={tid} SKIP no-anchor-gap (su={since_update}, confirmed={confirmed}, interp={has_interp}, joints={has_joints}, interp_missing={interpolate_missing})")
-                        continue
+                        continue  # long gap, no anchor → skip to avoid ghost
 
-                    source = "smoothed" if (since_update == 0 and has_smoothed) else \
-                             "detected" if since_update == 0 else \
-                             "interpolated" if has_interp else "frozen"
-                    print(f"[POSE] frame={t} tid={tid} DRAW {source} (su={since_update}, confirmed={confirmed})")
                     canvas = render_openpose(canvas, kp)
-                    frame_drawn = True
-
-                if not frame_drawn:
-                    n_tracks = len(frame_snap)
-                    track_info = "; ".join(
-                        f"tid={tid}:conf={d['is_confirmed']},su={d['time_since_update']},j={'Y' if d['joints_2d'] is not None else 'N'},interp={'Y' if 'interpolated_kp' in d else 'N'}"
-                        for tid, d in frame_snap.items()
-                    )
-                    print(f"[POSE] frame={t} BLACK ({n_tracks} tracks: {track_info})")
 
                 pose_images.append(
                     torch.from_numpy(canvas.astype(np.float32) / 255.0)
