@@ -264,27 +264,35 @@ class PHALPPoseControlNetNode:
     def _interpolate_gaps(snapshots, eventually_confirmed, img_h, img_w,
                           clip_boundary):
         """
-        For each confirmed track, linearly interpolate joint positions for
-        frames that lie between two detected anchor frames.
+        Fill every gap frame for confirmed tracks.
 
-        Interpolation uses 'smoothed_kp' as the anchor when available
-        (i.e. after smoothing has already run), so the interpolated curve
-        is consistent with the smoothed detections.
+        Strategy (in priority order for each gap frame):
 
+        1. **Bounded linear interpolation** – frame lies between two detected
+           anchor frames → linearly interpolate x/y between them.
+        2. **Nearest-neighbour extrapolation** – frame is before the first
+           detection or after the last detection of the track → hold the
+           nearest anchor's pose.  This prevents black screens when the
+           detector briefly misses the person at the start/end of their
+           appearance or when a tentative-phase frame was never written into
+           the snapshot (PHALP deletes tentative tracks on any single miss,
+           so that frame has no entry for this tid).
+
+        Interpolation uses 'smoothed_kp' as the anchor when available so
+        that the interpolated curve is consistent with the smoothed detections.
         Gap frames get an 'interpolated_kp' key written into their snapshot.
-        Frames before the first or after the last detection are not touched.
         """
         B = len(snapshots)
         for tid in eventually_confirmed:
             track_frames = sorted(t for t in range(B) if tid in snapshots[t])
 
-            # Anchor frames: actual detections
+            # Anchor frames: actual detections (time_since_update == 0)
             detected_frames = [
                 t for t in track_frames
                 if snapshots[t][tid]["joints_2d"] is not None
                 and snapshots[t][tid]["time_since_update"] == 0
             ]
-            if len(detected_frames) < 2:
+            if not detected_frames:
                 continue
 
             # Build anchor keypoints (prefer smoothed)
@@ -298,23 +306,33 @@ class PHALPPoseControlNetNode:
                     )
                 )
 
-            # Fill each bounded gap with linear interpolation
-            for i in range(len(detected_frames) - 1):
-                t0, t1 = detected_frames[i], detected_frames[i + 1]
-                if t1 - t0 <= 1:
-                    continue  # adjacent frames, no gap
+            t_first = detected_frames[0]
+            t_last  = detected_frames[-1]
 
-                kp0, kp1 = anchor_kps[t0], anchor_kps[t1]
+            # Fill every gap frame that's in the snapshot for this track
+            for t in track_frames:
+                tdata = snapshots[t][tid]
+                if tdata["time_since_update"] == 0:
+                    continue  # detected frame – no fill needed
+                if "interpolated_kp" in tdata:
+                    continue  # already filled
 
-                gap_frames = [
-                    t for t in track_frames
-                    if t0 < t < t1
-                    and snapshots[t][tid]["time_since_update"] > 0
-                ]
-                for t in gap_frames:
+                if t < t_first:
+                    # Before first detection: hold first anchor
+                    tdata["interpolated_kp"] = anchor_kps[t_first].copy()
+
+                elif t > t_last:
+                    # After last detection: hold last anchor
+                    tdata["interpolated_kp"] = anchor_kps[t_last].copy()
+
+                else:
+                    # Between two detections: linear interpolation
+                    # Find the nearest anchor on each side
+                    t0 = max(a for a in detected_frames if a < t)
+                    t1 = min(a for a in detected_frames if a > t)
                     alpha = (t - t0) / (t1 - t0)
-                    snapshots[t][tid]["interpolated_kp"] = (
-                        kp0 + alpha * (kp1 - kp0)
+                    tdata["interpolated_kp"] = (
+                        anchor_kps[t0] + alpha * (anchor_kps[t1] - anchor_kps[t0])
                     )
 
     # ------------------------------------------------------------------
