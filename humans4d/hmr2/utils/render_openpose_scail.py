@@ -251,7 +251,7 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
     avg_z = np.mean(z_values) if z_values else 3000.0
     # Use the average output focal to compute radius for desired visual thickness
     avg_fy_out = np.mean([fi[1] for fi in frame_intrinsics])
-    target_px = 0.04 * img_h  # ~4% of output height
+    target_px = 0.015 * img_h  # ~1.5% of output height
     radius = target_px * avg_z / avg_fy_out
 
     # ── Build cylinder specs + colors ────────────────────────────────────
