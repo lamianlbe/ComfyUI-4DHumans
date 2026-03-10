@@ -26,7 +26,10 @@ from .. import REPO_PATH
 #   ├── weights/
 #   │   ├── hmar_v2_weights.pth
 #   │   ├── pose_predictor.pth
-#   │   └── pose_predictor.yaml
+#   │   ├── pose_predictor.yaml
+#   │   ├── resnet50-19c8e357.pth       (ResNet-50 ImageNet backbone)
+#   │   ├── model_final_f05665.pkl      (ViTDet COCO detector)
+#   │   └── model_final_2d9806.pkl      (Mask R-CNN X-101 segmenter)
 #   └── ava/
 #       ├── ava_labels.pkl
 #       └── ava_class_mapping.pkl
@@ -46,11 +49,14 @@ _REQUIRED_FILES = {
     os.path.join(_PHALP_3D_PATH,      "mean_std.npy"):          "pose mean/std normalisation",
     os.path.join(_PHALP_3D_PATH,      "bmap_256.npy"):          "UV bmap",
     os.path.join(_PHALP_3D_PATH,      "fmap_256.npy"):          "UV fmap",
-    os.path.join(_PHALP_WEIGHTS_PATH, "hmar_v2_weights.pth"):   "HMAR model weights",
-    os.path.join(_PHALP_WEIGHTS_PATH, "pose_predictor.pth"):    "pose predictor weights",
-    os.path.join(_PHALP_WEIGHTS_PATH, "pose_predictor.yaml"):   "pose predictor config",
-    os.path.join(_PHALP_AVA_PATH,     "ava_labels.pkl"):        "AVA labels",
-    os.path.join(_PHALP_AVA_PATH,     "ava_class_mapping.pkl"): "AVA class mapping",
+    os.path.join(_PHALP_WEIGHTS_PATH, "hmar_v2_weights.pth"):      "HMAR model weights",
+    os.path.join(_PHALP_WEIGHTS_PATH, "pose_predictor.pth"):       "pose predictor weights",
+    os.path.join(_PHALP_WEIGHTS_PATH, "pose_predictor.yaml"):      "pose predictor config",
+    os.path.join(_PHALP_WEIGHTS_PATH, "resnet50-19c8e357.pth"):    "ResNet-50 ImageNet backbone",
+    os.path.join(_PHALP_WEIGHTS_PATH, "model_final_f05665.pkl"):   "ViTDet COCO detector",
+    os.path.join(_PHALP_WEIGHTS_PATH, "model_final_2d9806.pkl"):   "Mask R-CNN X-101 segmenter",
+    os.path.join(_PHALP_AVA_PATH,     "ava_labels.pkl"):           "AVA labels",
+    os.path.join(_PHALP_AVA_PATH,     "ava_class_mapping.pkl"):    "AVA class mapping",
 }
 
 
@@ -125,6 +131,9 @@ def _make_comfy_cfg(n_init, device_str, tmp_dir):
 
     cfg.ava_config.ava_labels_path         = os.path.join(_PHALP_AVA_PATH, "ava_labels.pkl")
     cfg.ava_config.ava_class_mappping_path = os.path.join(_PHALP_AVA_PATH, "ava_class_mapping.pkl")
+
+    # Redirect resnet50 and detectron2 weights away from ~/.cache to models/phalp/weights/
+    cfg.local_model_dir = _PHALP_WEIGHTS_PATH
 
     return cfg
 
