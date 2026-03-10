@@ -51,6 +51,37 @@ def _joints_to_openpose(joints_2d_flat, img_h, img_w, clip_boundary):
     return np.concatenate([openpose_xy, confidence], axis=-1)   # (25, 3)
 
 
+def _smooth_track_joints(joint_series, sigma):
+    """
+    Apply Gaussian temporal smoothing to a track's 2D joint time series.
+
+    Parameters
+    ----------
+    joint_series : np.ndarray  (T, 25, 3)  – (x, y, confidence) per frame
+    sigma        : float       – Gaussian sigma in frames; 0 = no-op
+
+    Returns
+    -------
+    np.ndarray  (T, 25, 3)  with x/y smoothed, confidence unchanged
+    """
+    if sigma <= 0 or len(joint_series) < 3:
+        return joint_series
+
+    T = len(joint_series)
+    half  = max(1, int(3 * sigma))
+    k     = np.arange(-half, half + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (k / sigma) ** 2)
+    kernel /= kernel.sum()
+
+    smoothed = joint_series.copy()
+    for j in range(25):
+        for c in range(2):  # smooth x and y; leave confidence column alone
+            padded = np.pad(joint_series[:, j, c], half, mode="edge")
+            conv   = np.convolve(padded, kernel, mode="valid")
+            smoothed[:, j, c] = conv[:T]
+    return smoothed
+
+
 class PHALPPoseControlNetNode:
     """
     Runs the full PHALP tracking pipeline on an IMAGE batch:
@@ -64,16 +95,17 @@ class PHALPPoseControlNetNode:
       5. Projects the tracked/predicted 3D skeleton to 2D and renders an
          OpenPose-style skeleton on a black canvas.
 
-    Compared to the per-frame '4D Human Pose (ControlNet)' node, this node
-    produces temporally consistent track IDs and smoother joint trajectories,
-    which typically gives better ControlNet results on video.
-
     When retroactive_fill is enabled the node uses a two-pass strategy:
       Pass 1 – run full tracking across ALL frames, recording every track's
                pose data even while it is still tentative (not yet confirmed).
       Pass 2 – render; for tracks that eventually get confirmed, the early
                tentative frames are retroactively filled in so no skeleton
                is missing from the output even when n_init > 1.
+
+    smooth_sigma applies Gaussian temporal smoothing to each confirmed
+    track's 2D joint positions, reducing per-frame jitter.  It is applied
+    after the full tracking pass so it automatically uses bidirectional
+    context (past and future frames).
 
     Requires the PHALP node to be loaded upstream via 'Load PHALP'.
     """
@@ -120,7 +152,25 @@ class PHALPPoseControlNetNode:
                             "Tracks confirmed later in the video are retroactively "
                             "drawn for their early tentative frames, so no skeleton "
                             "is lost during the n_init warm-up period. "
-                            "Has no effect when n_init=1."
+                            "Has no effect when n_init=1. "
+                            "Automatically enabled when smooth_sigma > 0."
+                        ),
+                    },
+                ),
+                "smooth_sigma": (
+                    "FLOAT",
+                    {
+                        "default": 1.5,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.5,
+                        "tooltip": (
+                            "Gaussian temporal smoothing applied to each track's "
+                            "2D joint positions to reduce per-frame jitter. "
+                            "Value is the sigma (standard deviation) in frames. "
+                            "0 = disabled. "
+                            "1-2 = light smoothing. "
+                            "3-5 = strong smoothing (may blur fast motion)."
                         ),
                     },
                 ),
@@ -146,8 +196,8 @@ class PHALPPoseControlNetNode:
         -------
         snapshots : list[dict]
             snapshots[t] maps track_id -> {
-                'joints_2d':       np.ndarray (90,) or None,
-                'is_confirmed':    bool,
+                'joints_2d':         np.ndarray (90,) or None,
+                'is_confirmed':      bool,
                 'time_since_update': int,
             }
         """
@@ -178,7 +228,7 @@ class PHALPPoseControlNetNode:
 
             frame_snap = {}
             for track_ in tracker.tracker.tracks:
-                hist = track_.track_data.get("history", [])
+                hist   = track_.track_data.get("history", [])
                 joints = hist[-1]["2d_joints"] if hist else None
                 frame_snap[track_.track_id] = {
                     "joints_2d":         joints,
@@ -189,21 +239,54 @@ class PHALPPoseControlNetNode:
 
         return snapshots
 
+    @staticmethod
+    def _apply_smoothing(snapshots, eventually_confirmed, img_h, img_w,
+                         clip_boundary, sigma):
+        """
+        Build per-track joint time series, smooth, and write back into
+        snapshots in-place.  Only smooths frames with actual detections
+        (time_since_update == 0); predicted/occluded entries are left as-is.
+        """
+        B = len(snapshots)
+
+        for tid in eventually_confirmed:
+            # Collect frames where this track has a real detection
+            detected_frames = [
+                t for t in range(B)
+                if tid in snapshots[t]
+                and snapshots[t][tid]["joints_2d"] is not None
+                and snapshots[t][tid]["time_since_update"] == 0
+            ]
+            if len(detected_frames) < 3:
+                continue
+
+            # Convert raw joints → OpenPose pixel coords for each detection
+            kp_series = np.stack([
+                _joints_to_openpose(
+                    snapshots[t][tid]["joints_2d"], img_h, img_w, clip_boundary
+                )
+                for t in detected_frames
+            ])  # (N_detected, 25, 3)
+
+            smoothed = _smooth_track_joints(kp_series, sigma)
+
+            # Store smoothed keypoints back — we use a special key so the
+            # render pass can use them directly without re-converting.
+            for i, t in enumerate(detected_frames):
+                snapshots[t][tid]["smoothed_kp"] = smoothed[i]
+
     # ------------------------------------------------------------------
     # main entry point
     # ------------------------------------------------------------------
 
     def render_pose(self, images, phalp, clip_boundary, draw_predicted,
-                    retroactive_fill):
+                    retroactive_fill, smooth_sigma):
         if not _ensure_phalp_importable():
             raise RuntimeError("phalp package not found. See 'Load PHALP' node.")
 
         tracker = phalp["tracker"]
-
-        # Re-initialise DeepSort so track IDs start fresh.
         tracker.setup_deepsort()
 
-        # images: (B, H, W, 3) float [0,1]  – ComfyUI convention
         images_nchw = images.permute(0, 3, 1, 2)   # (B, C, H, W)
         B, C, img_h, img_w = images_nchw.shape
 
@@ -214,13 +297,13 @@ class PHALPPoseControlNetNode:
 
         pbar = comfy.utils.ProgressBar(B)
 
-        if retroactive_fill:
+        use_two_pass = retroactive_fill or (smooth_sigma > 0)
+
+        if use_two_pass:
             # ── Two-pass mode ─────────────────────────────────────────
-            # Pass 1: collect all track data (progress counts as B frames)
             snapshots = self._run_tracking(tracker, images_nchw, measurements)
             pbar.update(B // 2)
 
-            # Which track IDs ever reach confirmed state?
             eventually_confirmed = {
                 tid
                 for frame_snap in snapshots
@@ -228,34 +311,40 @@ class PHALPPoseControlNetNode:
                 if tdata["is_confirmed"]
             }
 
-            # Pass 2: render using full knowledge of track fates
+            if smooth_sigma > 0:
+                self._apply_smoothing(
+                    snapshots, eventually_confirmed,
+                    img_h, img_w, clip_boundary, smooth_sigma
+                )
+
             pose_images = []
             for t, frame_snap in enumerate(snapshots):
                 canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
 
                 for tid, tdata in frame_snap.items():
-                    joints = tdata["joints_2d"]
-                    if joints is None:
-                        continue
-
                     confirmed    = tdata["is_confirmed"]
                     since_update = tdata["time_since_update"]
 
                     if confirmed:
-                        # Normal confirmed track: respect draw_predicted
                         if since_update > 0 and not draw_predicted:
                             continue
                     elif tid in eventually_confirmed:
-                        # Tentative now but will be confirmed later:
-                        # retroactively fill — it was actually detected this
-                        # frame (since_update==0 for fresh tentative entries)
                         if since_update > 0:
-                            continue  # Kalman-only prediction, skip
+                            continue  # pure Kalman prediction before confirm
                     else:
-                        # Never confirmed (false positive) — skip
+                        continue  # never confirmed — false positive
+
+                    # Use pre-smoothed keypoints when available, otherwise
+                    # convert raw joints on the fly.
+                    if "smoothed_kp" in tdata:
+                        kp = tdata["smoothed_kp"]
+                    elif tdata["joints_2d"] is not None:
+                        kp = _joints_to_openpose(
+                            tdata["joints_2d"], img_h, img_w, clip_boundary
+                        )
+                    else:
                         continue
 
-                    kp = _joints_to_openpose(joints, img_h, img_w, clip_boundary)
                     canvas = render_openpose(canvas, kp)
 
                 pose_images.append(
