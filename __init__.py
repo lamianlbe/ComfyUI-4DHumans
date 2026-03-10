@@ -14,6 +14,7 @@ from .nodes.load_hmr_node import LoadHMRNode
 from .nodes.pose_controlnet_node import HumanPoseControlNetNode
 from .nodes.load_phalp_node import LoadPHALPNode
 from .nodes.phalp_pose_node import PHALPPoseControlNetNode
+from .nodes.load_smplestx_node import LoadSMPLestXNode
 # from .nodes.select_human_node import SelectHumanNode
 
 
@@ -24,6 +25,7 @@ NODE_CLASS_MAPPINGS = {
     'HumanPoseControlNet': HumanPoseControlNetNode,
     'LoadPHALP': LoadPHALPNode,
     'PHALPPoseControlNet': PHALPPoseControlNetNode,
+    'LoadSMPLestX': LoadSMPLestXNode,
     # 'SelectHuman': SelectHumanNode,
 }
 
@@ -34,5 +36,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'HumanPoseControlNet': '4D Human Pose (ControlNet)',
     'LoadPHALP': 'Load PHALP',
     'PHALPPoseControlNet': '4D Human Pose Tracking (ControlNet)',
+    'LoadSMPLestX': 'Load SMPLest-X',
     # 'SelectHuman': 'Select 4D Human'
 }
