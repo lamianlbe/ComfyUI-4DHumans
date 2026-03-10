@@ -84,7 +84,7 @@ def _smplestx_3d_to_smpl24(joint_cam_3d, root_cam):
     neck = smpl24[12]  # Neck
     head = smpl24[15]  # Head (skull top)
     if np.sum(np.abs(neck)) > 0.01 and np.sum(np.abs(head)) > 0.01:
-        smpl24[15] = neck + 0.6 * (head - neck)
+        smpl24[15] = neck + 0.5 * (head - neck)
 
     return smpl24
 
