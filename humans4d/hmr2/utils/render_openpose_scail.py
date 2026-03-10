@@ -195,7 +195,7 @@ def _compute_output_intrinsics(fx_img, fy_img, cx_img, cy_img, inv_trans):
 
 
 def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
-                            render_backend="taichi"):
+                            render_backend="taichi", target_fov_deg=55.0):
     """
     Batch-render SCAIL-style pose images for a full timeline.
 
@@ -209,11 +209,17 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
         img_h, img_w: output image dimensions
         cfg: SMPLest-X config (required for intrinsic matrix computation)
         render_backend: "taichi" or "torch"
+        target_fov_deg: target virtual FOV in degrees for perspective effect.
+            Original SCAIL uses ~55°. SMPLest-X focal is very large (~10000),
+            giving near-orthographic projection. We re-project 3D joints to a
+            virtual camera with this FOV to restore natural perspective
+            (closer limbs appear thicker, farther ones thinner).
 
     Returns:
         list of (H, W, 3) uint8 images
     """
     import copy
+    import math
 
     B = len(timeline)
 
@@ -246,22 +252,45 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
             smpl_poses.append([np.zeros((24, 3), dtype=np.float32)])
             frame_intrinsics.append((fx_img, fy_img, cx_img, cy_img))
 
+    # ── Re-project to virtual camera with target FOV for perspective ─────
+    # SMPLest-X focal (~10000) gives near-orthographic projection.
+    # To match SCAIL's perspective effect, compress Z so that the rendering
+    # focal matches target_fov_deg. 2D projection is preserved:
+    #   f_target * X / Z_new = f_orig * X / Z_orig  (Z_new = Z * f_target/f_orig)
+    larger_side = max(img_h, img_w)
+    f_target = larger_side / (2.0 * math.tan(math.radians(target_fov_deg) / 2.0))
+
+    render_intrinsics = []
+    for t in range(B):
+        fx_o, fy_o, cx_o, cy_o = frame_intrinsics[t]
+        # Per-frame Z compression ratio (use average of fx and fy)
+        f_orig = (fx_o + fy_o) / 2.0
+        z_scale = f_target / f_orig if f_orig > 0 else 1.0
+        # Compress Z for all joints in this frame
+        for pose in smpl_poses[t]:
+            pose[:, 2] *= z_scale
+        # Render intrinsics: scale focal by same ratio, cx/cy unchanged
+        render_intrinsics.append((
+            fx_o * z_scale,
+            fy_o * z_scale,
+            cx_o,
+            cy_o,
+        ))
+
     # ── Compute dynamic cylinder radius ──────────────────────────────────
-    # NLF reference: radius=21.5 at focal≈700, Z≈400
-    #   → projected ≈ 21.5*700/400 ≈ 37.6 px on 720px height
-    # We target similar visual proportion at output resolution.
+    # After Z compression, joints are in virtual camera space with f_target.
+    # Compute radius so projected thickness ≈ 1.5% of output height.
     z_values = []
     for t in range(B):
-        if timeline_3d is not None and t < len(timeline_3d) and timeline_3d[t] is not None:
-            root_z = timeline_3d[t]["root_cam"][2]
+        for pose in smpl_poses[t]:
+            root_z = pose[0, 2]  # Pelvis Z (already compressed)
             if root_z > 0:
                 z_values.append(root_z)
 
-    avg_z = np.mean(z_values) if z_values else 3000.0
-    # Use the average output focal to compute radius for desired visual thickness
-    avg_fy_out = np.mean([fi[1] for fi in frame_intrinsics])
+    avg_z = np.mean(z_values) if z_values else 400.0
+    avg_fy_render = np.mean([ri[1] for ri in render_intrinsics])
     target_px = 0.015 * img_h  # ~1.5% of output height
-    radius = target_px * avg_z / avg_fy_out
+    radius = target_px * avg_z / avg_fy_render
 
     # ── Build cylinder specs + colors ────────────────────────────────────
     base_colors_255 = [
@@ -289,7 +318,7 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
 
     if render_backend == "taichi" and render_whole_taichi is not None:
         # Taichi doesn't support per-frame intrinsics, use first frame's
-        fx_0, fy_0, cx_0, cy_0 = frame_intrinsics[0]
+        fx_0, fy_0, cx_0, cy_0 = render_intrinsics[0]
         try:
             frames_rgba = render_whole_taichi(
                 cylinder_specs_list, H=img_h, W=img_w,
@@ -298,11 +327,11 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
             logging.warning("Taichi rendering failed, falling back to torch.")
             frames_rgba = render_whole_batch_torch(
                 cylinder_specs_list, H=img_h, W=img_w, radius=radius,
-                intrinsics_list=frame_intrinsics)
+                intrinsics_list=render_intrinsics)
     else:
         frames_rgba = render_whole_batch_torch(
             cylinder_specs_list, H=img_h, W=img_w, radius=radius,
-            intrinsics_list=frame_intrinsics)
+            intrinsics_list=render_intrinsics)
 
     # ── Build DWPose 2D overlay at output resolution ─────────────────────
     dw_poses = []
