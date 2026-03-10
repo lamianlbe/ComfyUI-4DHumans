@@ -10,31 +10,45 @@ from folder_paths import models_dir
 
 from .. import REPO_PATH
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# ── ComfyUI model directory for SMPLest-X assets ─────────────────────────────
 #
-# Checkpoint:      models/smplestx/smplest_x_h.pth.tar
-# SMPL-X models:   Reused from the SMPLest-X repo (human_models/human_model_files/)
+#   models/smplestx/
+#   ├── smplest_x_h.pth.tar              (model checkpoint)
+#   └── human_model_files/
+#       └── smplx/
+#           ├── SMPLX_NEUTRAL.npz
+#           ├── SMPLX_to_J14.pkl
+#           ├── MANO_SMPLX_vertex_ids.pkl
+#           └── SMPL-X__FLAME_vertex_ids.npy
 #
 SMPLESTX_PATH = os.path.join(models_dir, "smplestx")
+_HUMAN_MODEL_PATH = os.path.join(SMPLESTX_PATH, "human_model_files")
+_SMPLX_PATH = os.path.join(_HUMAN_MODEL_PATH, "smplx")
 _DEFAULT_CKPT = os.path.join(SMPLESTX_PATH, "smplest_x_h.pth.tar")
+
+_REQUIRED_FILES = {
+    os.path.join(_SMPLX_PATH, "SMPLX_NEUTRAL.npz"):          "SMPL-X neutral body model",
+    os.path.join(_SMPLX_PATH, "SMPLX_to_J14.pkl"):           "SMPL-X to J14 regressor",
+    os.path.join(_SMPLX_PATH, "MANO_SMPLX_vertex_ids.pkl"):  "MANO SMPLX vertex IDs",
+    os.path.join(_SMPLX_PATH, "SMPL-X__FLAME_vertex_ids.npy"): "SMPLX FLAME vertex IDs",
+}
 
 # ── SMPLest-X repo path ──────────────────────────────────────────────────────
 _SMPLESTX_REPO = os.path.join(os.path.dirname(REPO_PATH), "SMPLest-X")
-_HUMAN_MODEL_PATH = os.path.join(_SMPLESTX_REPO, "human_models", "human_model_files")
 
 
 def _check_required_files():
     missing = []
+    for path, desc in _REQUIRED_FILES.items():
+        if not os.path.exists(path):
+            missing.append(f"  {desc}  →  {path}")
     if not os.path.exists(_DEFAULT_CKPT):
         missing.append(f"  Model checkpoint  →  {_DEFAULT_CKPT}")
-    if not os.path.isdir(_HUMAN_MODEL_PATH):
-        missing.append(
-            f"  SMPL-X human model files  →  {_HUMAN_MODEL_PATH}\n"
-            f"    (download from https://smpl-x.is.tue.mpg.de/ into the SMPLest-X repo)"
-        )
     if missing:
         raise FileNotFoundError(
-            "SMPLest-X files missing:\n\n" + "\n".join(missing)
+            "The following SMPLest-X model files are missing.\n"
+            "Please place them under  models/smplestx/  before loading:\n\n"
+            + "\n".join(missing)
         )
 
 
@@ -143,10 +157,18 @@ class LoadSMPLestXNode:
     """
     Loads a SMPLest-X whole-body pose estimator (ViT-Huge, 137 joints).
 
-    Setup:
-      1. Clone SMPLest-X next to ComfyUI-4DHumans and install its requirements.
-      2. Download SMPL-X body models into ``SMPLest-X/human_models/human_model_files/``.
-      3. Place the checkpoint at ``models/smplestx/smplest_x_h.pth.tar``.
+    All files must be placed manually under  models/smplestx/  before use::
+
+        models/smplestx/
+        ├── smplest_x_h.pth.tar
+        └── human_model_files/
+            └── smplx/
+                ├── SMPLX_NEUTRAL.npz
+                ├── SMPLX_to_J14.pkl
+                ├── MANO_SMPLX_vertex_ids.pkl
+                └── SMPL-X__FLAME_vertex_ids.npy
+
+    The SMPLest-X source repo must be cloned next to ComfyUI-4DHumans.
     """
 
     @classmethod
