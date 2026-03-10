@@ -65,20 +65,6 @@ class PHALPPoseControlNetNode:
     Runs the full PHALP tracking pipeline on an IMAGE batch and renders
     OpenPose-style skeletons on a black canvas.
 
-    Two-pass mode (enabled when retroactive_fill, smooth_sigma>0, or
-    interpolate_missing is active):
-
-      Pass 1 – run full tracking, recording every track's data including
-               tentative frames.
-      Pass 2 – post-process then render:
-               • retroactive_fill  – draw early tentative frames for tracks
-                                     that are later confirmed.
-               • smooth_sigma      – Gaussian-smooth detected joint positions
-                                     along the time axis to reduce jitter.
-               • interpolate_missing – linearly interpolate joint positions
-                                     for frames between two detections where
-                                     the person was temporarily lost.
-
     Requires the PHALP node to be loaded upstream via 'Load PHALP'.
     """
 
@@ -88,6 +74,19 @@ class PHALPPoseControlNetNode:
             "required": {
                 "images": ("IMAGE",),
                 "phalp": ("PHALP",),
+                "single_person_mode": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Assume all detections belong to one person. "
+                            "Merges all track IDs into a single timeline so that "
+                            "smoothing and interpolation work seamlessly across "
+                            "track switches caused by detector hiccups. "
+                            "Recommended for single-person scenes."
+                        ),
+                    },
+                ),
                 "clip_boundary": (
                     "FLOAT",
                     {
@@ -107,16 +106,13 @@ class PHALPPoseControlNetNode:
                 "draw_predicted": (
                     "BOOLEAN",
                     {
-                        "default": False,
+                        "default": True,
                         "tooltip": (
-                            "Master switch for gap frames: when a confirmed person "
-                            "is not detected in a frame, draw their pose instead of "
-                            "leaving a blank. "
-                            "Combined with interpolate_missing=on: bounded gaps use "
-                            "smooth interpolation, brief unbounded gaps (≤ max_frozen_gap) "
-                            "use frozen last-known pose, long gaps are left blank. "
-                            "Combined with interpolate_missing=off: ALL gap frames use "
-                            "the frozen last-known pose."
+                            "Fill gap frames where the person is not detected. "
+                            "In single-person mode: bounded gaps use interpolation, "
+                            "remaining gaps use nearest detected pose. "
+                            "In multi-person mode: gap frames use the frozen "
+                            "last-known pose per track."
                         ),
                     },
                 ),
@@ -138,12 +134,9 @@ class PHALPPoseControlNetNode:
                     {
                         "default": True,
                         "tooltip": (
-                            "When a confirmed person is temporarily not detected "
-                            "between two detected frames, linearly interpolate their "
-                            "joint positions from the surrounding detections. "
-                            "Produces smooth transitions instead of frozen ghost poses. "
-                            "Only works for gap frames bounded by detections on both "
-                            "sides. Requires draw_predicted=True to take effect."
+                            "Linearly interpolate joint positions for gap frames "
+                            "between two detected frames. "
+                            "Requires draw_predicted=True to take effect."
                         ),
                     },
                 ),
@@ -162,24 +155,6 @@ class PHALPPoseControlNetNode:
                         ),
                     },
                 ),
-                "max_frozen_gap": (
-                    "INT",
-                    {
-                        "default": 4,
-                        "min": 0,
-                        "max": 50,
-                        "step": 1,
-                        "tooltip": (
-                            "When interpolate_missing is on but a gap frame has no "
-                            "interpolation anchor (track lost with no future detection), "
-                            "still draw the frozen last-known pose for up to this many "
-                            "frames. Covers brief detector hiccups where the person is "
-                            "clearly still in the scene. "
-                            "0 = never use frozen fallback (strict, may cause black frames). "
-                            "3-5 = recommended (covers brief gaps without visible ghost)."
-                        ),
-                    },
-                ),
             }
         }
 
@@ -189,7 +164,7 @@ class PHALPPoseControlNetNode:
     CATEGORY = "4dhumans"
 
     # ------------------------------------------------------------------
-    # pass-1 helper
+    # pass-1: run tracker and collect snapshots
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -197,15 +172,6 @@ class PHALPPoseControlNetNode:
         """
         Forward pass: run PHALP tracking and record every track's state
         (tentative and confirmed alike) for every frame.
-
-        Returns
-        -------
-        snapshots : list[dict]
-            snapshots[t] maps track_id -> {
-                'joints_2d':         np.ndarray (90,) or None,
-                'is_confirmed':      bool,
-                'time_since_update': int,
-            }
         """
         snapshots = []
         for t, img_tensor in enumerate(images_nchw):
@@ -244,18 +210,97 @@ class PHALPPoseControlNetNode:
         return snapshots
 
     # ------------------------------------------------------------------
-    # pass-2 post-processing helpers
+    # single-person mode helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_single_person_timeline(snapshots, eventually_confirmed,
+                                      img_h, img_w, clip_boundary):
+        """
+        Merge all tracks into one timeline.  For each frame, pick the
+        freshest detection (time_since_update == 0 preferred).
+
+        Returns: list[np.ndarray | None] of length B, each (25,3) or None.
+        """
+        B = len(snapshots)
+        timeline = [None] * B
+
+        for t in range(B):
+            best_kp = None
+            best_su = float("inf")
+
+            for tid, tdata in snapshots[t].items():
+                if not tdata["is_confirmed"] and tid not in eventually_confirmed:
+                    continue
+                if tdata["joints_2d"] is None:
+                    continue
+                su = tdata["time_since_update"]
+                if su < best_su:
+                    best_su = su
+                    best_kp = tdata["joints_2d"]
+
+            # Only keep actual detections as anchors
+            if best_su == 0 and best_kp is not None:
+                timeline[t] = _joints_to_openpose(
+                    best_kp, img_h, img_w, clip_boundary
+                )
+
+        return timeline
+
+    @staticmethod
+    def _smooth_timeline(timeline, sigma):
+        """Gaussian-smooth a single-person timeline in-place."""
+        detected = [(t, kp) for t, kp in enumerate(timeline) if kp is not None]
+        if sigma <= 0 or len(detected) < 3:
+            return
+
+        kp_series = np.stack([kp for _, kp in detected])
+        smoothed  = _smooth_track_joints(kp_series, sigma)
+        for i, (t, _) in enumerate(detected):
+            timeline[t] = smoothed[i]
+
+    @staticmethod
+    def _interpolate_timeline(timeline):
+        """Linearly interpolate bounded gaps in a single-person timeline."""
+        detected_times = [t for t in range(len(timeline)) if timeline[t] is not None]
+        if len(detected_times) < 2:
+            return
+
+        t_first, t_last = detected_times[0], detected_times[-1]
+        for t in range(t_first + 1, t_last):
+            if timeline[t] is not None:
+                continue
+            t0 = max(dt for dt in detected_times if dt < t)
+            t1 = min(dt for dt in detected_times if dt > t)
+            alpha = (t - t0) / (t1 - t0)
+            timeline[t] = timeline[t0] + alpha * (timeline[t1] - timeline[t0])
+
+    @staticmethod
+    def _fill_nearest(timeline):
+        """Forward-then-backward fill remaining None frames with nearest pose."""
+        B = len(timeline)
+        # Forward fill
+        last = None
+        for t in range(B):
+            if timeline[t] is not None:
+                last = timeline[t]
+            elif last is not None:
+                timeline[t] = last
+        # Backward fill (for frames before first detection)
+        last = None
+        for t in range(B - 1, -1, -1):
+            if timeline[t] is not None:
+                last = timeline[t]
+            elif last is not None:
+                timeline[t] = last
+
+    # ------------------------------------------------------------------
+    # multi-person mode helpers (per-track)
     # ------------------------------------------------------------------
 
     @staticmethod
     def _apply_smoothing(snapshots, eventually_confirmed, img_h, img_w,
                          clip_boundary, sigma):
-        """
-        Gaussian-smooth the detected joint positions for each confirmed track
-        and write the result back as 'smoothed_kp' in the snapshot dicts.
-        Only detected frames (time_since_update==0) are smoothed; gap frames
-        are left for _interpolate_gaps to handle.
-        """
         B = len(snapshots)
         for tid in eventually_confirmed:
             detected_frames = [
@@ -272,42 +317,25 @@ class PHALPPoseControlNetNode:
                     snapshots[t][tid]["joints_2d"], img_h, img_w, clip_boundary
                 )
                 for t in detected_frames
-            ])  # (N_detected, 25, 3)
-
+            ])
             smoothed = _smooth_track_joints(kp_series, sigma)
-
             for i, t in enumerate(detected_frames):
                 snapshots[t][tid]["smoothed_kp"] = smoothed[i]
 
     @staticmethod
     def _interpolate_gaps(snapshots, eventually_confirmed, img_h, img_w,
                           clip_boundary):
-        """
-        Linearly interpolate gap frames that lie *between* two detected
-        anchor frames for each confirmed track.
-
-        Only bounded gaps are filled — frames before the first detection or
-        after the last detection are left untouched (those are handled by
-        the draw_predicted fallback in the render loop).
-
-        Interpolation uses 'smoothed_kp' as the anchor when available so
-        that the interpolated curve is consistent with the smoothed detections.
-        Gap frames get an 'interpolated_kp' key written into their snapshot.
-        """
         B = len(snapshots)
         for tid in eventually_confirmed:
             track_frames = sorted(t for t in range(B) if tid in snapshots[t])
-
-            # Anchor frames: actual detections (time_since_update == 0)
             detected_frames = [
                 t for t in track_frames
                 if snapshots[t][tid]["joints_2d"] is not None
                 and snapshots[t][tid]["time_since_update"] == 0
             ]
             if len(detected_frames) < 2:
-                continue  # need at least two anchors to interpolate
+                continue
 
-            # Build anchor keypoints (prefer smoothed)
             anchor_kps = {}
             for t in detected_frames:
                 tdata = snapshots[t][tid]
@@ -318,18 +346,13 @@ class PHALPPoseControlNetNode:
                     )
                 )
 
-            t_first = detected_frames[0]
-            t_last  = detected_frames[-1]
-
-            # Fill only gap frames that lie between two detection anchors
+            t_first, t_last = detected_frames[0], detected_frames[-1]
             for t in track_frames:
                 tdata = snapshots[t][tid]
                 if tdata["time_since_update"] == 0:
-                    continue  # detected frame – no fill needed
+                    continue
                 if t <= t_first or t >= t_last:
-                    continue  # boundary frame – leave for draw_predicted
-
-                # Between two detections: linear interpolation
+                    continue
                 t0 = max(a for a in detected_frames if a < t)
                 t1 = min(a for a in detected_frames if a > t)
                 alpha = (t - t0) / (t1 - t0)
@@ -341,9 +364,9 @@ class PHALPPoseControlNetNode:
     # main entry point
     # ------------------------------------------------------------------
 
-    def render_pose(self, images, phalp, clip_boundary, draw_predicted,
-                    retroactive_fill, interpolate_missing, smooth_sigma,
-                    max_frozen_gap):
+    def render_pose(self, images, phalp, single_person_mode, clip_boundary,
+                    draw_predicted, retroactive_fill, interpolate_missing,
+                    smooth_sigma):
         if not _ensure_phalp_importable():
             raise RuntimeError("phalp package not found. See 'Load PHALP' node.")
 
@@ -360,7 +383,8 @@ class PHALPPoseControlNetNode:
 
         pbar = comfy.utils.ProgressBar(B)
 
-        use_two_pass = retroactive_fill or interpolate_missing or (smooth_sigma > 0)
+        use_two_pass = (single_person_mode or retroactive_fill
+                        or interpolate_missing or smooth_sigma > 0)
 
         if use_two_pass:
             # ── Pass 1: full tracking ──────────────────────────────────
@@ -374,81 +398,91 @@ class PHALPPoseControlNetNode:
                 if tdata["is_confirmed"]
             }
 
-            # ── Post-processing (order matters) ───────────────────────
-            # 1. Smooth detected frames first so interpolation anchors
-            #    are already smooth.
-            if smooth_sigma > 0:
-                self._apply_smoothing(
-                    snapshots, eventually_confirmed,
-                    img_h, img_w, clip_boundary, smooth_sigma
-                )
-
-            # 2. Interpolate gap frames using (smoothed) anchors.
-            if interpolate_missing:
-                self._interpolate_gaps(
+            if single_person_mode:
+                # ── Single-person pipeline ─────────────────────────────
+                timeline = self._build_single_person_timeline(
                     snapshots, eventually_confirmed,
                     img_h, img_w, clip_boundary
                 )
 
-            # ── Pass 2: render ─────────────────────────────────────────
-            pose_images = []
-            for t, frame_snap in enumerate(snapshots):
-                canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-                frame_drawn = False
+                if smooth_sigma > 0:
+                    self._smooth_timeline(timeline, smooth_sigma)
 
-                for tid, tdata in frame_snap.items():
-                    confirmed    = tdata["is_confirmed"]
-                    since_update = tdata["time_since_update"]
+                if interpolate_missing and draw_predicted:
+                    self._interpolate_timeline(timeline)
 
-                    # ── decide whether to draw this track in this frame ──
-                    if confirmed:
-                        pass  # always eligible; key selection below
-                    elif tid in eventually_confirmed:
-                        # tentative frame that will later be confirmed
-                        if since_update > 0:
-                            print(f"[POSE] frame={t} tid={tid} SKIP tentative+missed (su={since_update})")
+                if draw_predicted:
+                    self._fill_nearest(timeline)
+
+                pose_images = []
+                for t in range(B):
+                    canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+                    if timeline[t] is not None:
+                        canvas = render_openpose(canvas, timeline[t])
+                    pose_images.append(
+                        torch.from_numpy(canvas.astype(np.float32) / 255.0)
+                    )
+                    pbar.update(1)
+
+            else:
+                # ── Multi-person pipeline ──────────────────────────────
+                if smooth_sigma > 0:
+                    self._apply_smoothing(
+                        snapshots, eventually_confirmed,
+                        img_h, img_w, clip_boundary, smooth_sigma
+                    )
+                if interpolate_missing:
+                    self._interpolate_gaps(
+                        snapshots, eventually_confirmed,
+                        img_h, img_w, clip_boundary
+                    )
+
+                pose_images = []
+                for t, frame_snap in enumerate(snapshots):
+                    canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+
+                    for tid, tdata in frame_snap.items():
+                        confirmed    = tdata["is_confirmed"]
+                        since_update = tdata["time_since_update"]
+
+                        # eligibility
+                        if confirmed:
+                            pass
+                        elif tid in eventually_confirmed:
+                            if since_update > 0:
+                                continue
+                        else:
                             continue
-                    else:
-                        continue  # never confirmed — false positive
 
-                    has_smoothed = "smoothed_kp" in tdata
-                    has_interp   = "interpolated_kp" in tdata
-                    has_joints   = tdata["joints_2d"] is not None
-
-                    # ── pick the best available keypoints ──────────────
-                    if since_update == 0:
-                        # Detected frame — always draw
-                        if has_smoothed:
-                            kp = tdata["smoothed_kp"]
-                        elif has_joints:
+                        # pick keypoints
+                        if since_update == 0:
+                            if "smoothed_kp" in tdata:
+                                kp = tdata["smoothed_kp"]
+                            elif tdata["joints_2d"] is not None:
+                                kp = _joints_to_openpose(
+                                    tdata["joints_2d"], img_h, img_w,
+                                    clip_boundary
+                                )
+                            else:
+                                continue
+                        elif not draw_predicted:
+                            continue
+                        elif "interpolated_kp" in tdata:
+                            kp = tdata["interpolated_kp"]
+                        elif tdata["joints_2d"] is not None:
                             kp = _joints_to_openpose(
-                                tdata["joints_2d"], img_h, img_w, clip_boundary
+                                tdata["joints_2d"], img_h, img_w,
+                                clip_boundary
                             )
                         else:
                             continue
-                    elif not draw_predicted:
-                        continue  # gap frame + draw_predicted off → skip
-                    elif has_interp:
-                        # Bounded interpolation between two anchors
-                        kp = tdata["interpolated_kp"]
-                    elif has_joints and (not interpolate_missing
-                                         or since_update <= max_frozen_gap):
-                        # Frozen last-known pose, used when:
-                        # - interpolate_missing off: all gap frames
-                        # - interpolate_missing on: only brief gaps (≤ max_frozen_gap)
-                        #   to cover detector hiccups without long-lived ghosts
-                        kp = _joints_to_openpose(
-                            tdata["joints_2d"], img_h, img_w, clip_boundary
-                        )
-                    else:
-                        continue  # long gap, no anchor → skip to avoid ghost
 
-                    canvas = render_openpose(canvas, kp)
+                        canvas = render_openpose(canvas, kp)
 
-                pose_images.append(
-                    torch.from_numpy(canvas.astype(np.float32) / 255.0)
-                )
-                pbar.update(1)
+                    pose_images.append(
+                        torch.from_numpy(canvas.astype(np.float32) / 255.0)
+                    )
+                    pbar.update(1)
 
         else:
             # ── Single-pass mode (original behaviour) ─────────────────
