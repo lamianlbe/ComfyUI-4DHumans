@@ -45,68 +45,183 @@ def flatten_specs(specs_list):
     )
 
 
+def _render_frame_torch(
+    curr_starts, curr_ends, curr_colors, ba, ba_len, ba_norm,
+    flat_ray_dirs, flat_ray_origins, H, W, radius, znear, zfar,
+    z_min_val, z_max_val, light_dir, device,
+):
+    """Render a single frame's cylinders. Returns (H, W, 4) uint8 numpy."""
+    n_pix = H * W
+
+    # Smart t initialization: start rays near the scene instead of at znear
+    # Ray z-component determines how fast we advance in z.
+    # For each pixel, t_start = max(z_min / ray_dir_z, znear)
+    ray_z = flat_ray_dirs[:, 2].clamp(min=1e-6)
+    t_start = ((z_min_val - radius * 2) / ray_z).clamp(min=znear)
+
+    flat_t = t_start.clone()
+    flat_active = torch.ones(n_pix, dtype=torch.bool, device=device)
+    flat_hit = torch.zeros(n_pix, dtype=torch.bool, device=device)
+    flat_hit_color = torch.zeros((n_pix, 4), device=device)
+    flat_hit_pos = torch.zeros((n_pix, 3), device=device)
+
+    depth_near = max(z_min_val, 0.1)
+    depth_far = min(z_max_val + 6000, 20000)
+
+    MAX_STEPS = 64
+    EPSILON = 1e-3
+
+    for step in range(MAX_STEPS):
+        active_indices = torch.nonzero(flat_active).reshape(-1)
+        if active_indices.numel() == 0:
+            break
+
+        p_active = flat_ray_origins[active_indices] + \
+            flat_ray_dirs[active_indices] * flat_t[active_indices].unsqueeze(1)
+
+        pa = p_active.unsqueeze(1) - curr_starts.unsqueeze(0)
+        proj = (pa * ba_norm.unsqueeze(0)).sum(dim=-1)
+        proj_clamped = proj.clamp(min=0.0).min(ba_len.unsqueeze(0))
+        closest_on_axis = curr_starts.unsqueeze(0) + \
+            proj_clamped.unsqueeze(-1) * ba_norm.unsqueeze(0)
+        dist_euc = torch.norm(p_active.unsqueeze(1) - closest_on_axis, dim=-1)
+        sdf = dist_euc - radius
+        min_sdf, min_idx = sdf.min(dim=1)
+
+        current_t_vals = flat_t[active_indices]
+        hit_cond = min_sdf < EPSILON
+        miss_cond = current_t_vals > zfar
+        new_hits = hit_cond & (~miss_cond)
+
+        hit_global_idx = active_indices[new_hits]
+        if hit_global_idx.numel() > 0:
+            flat_hit[hit_global_idx] = True
+            flat_active[hit_global_idx] = False
+            flat_hit_pos[hit_global_idx] = p_active[new_hits]
+            flat_hit_color[hit_global_idx] = curr_colors[min_idx[new_hits]]
+
+        miss_global_idx = active_indices[miss_cond]
+        if miss_global_idx.numel() > 0:
+            flat_active[miss_global_idx] = False
+
+        still_active_local = ~(hit_cond | miss_cond)
+        if still_active_local.any():
+            step_dist = min_sdf[still_active_local].clamp(min=1e-4)
+            flat_t[active_indices[still_active_local]] += step_dist
+
+    # --- Shading ---
+    hit_indices = torch.nonzero(flat_hit).reshape(-1)
+    if hit_indices.numel() > 0:
+        p_hit = flat_hit_pos[hit_indices]
+        hit_cols = flat_hit_color[hit_indices]
+
+        e = 1e-3
+
+        def get_sdf_batch(points):
+            pa = points.unsqueeze(1) - curr_starts.unsqueeze(0)
+            proj = (pa * ba_norm.unsqueeze(0)).sum(dim=-1)
+            proj_clamped = proj.clamp(min=0.0).min(ba_len.unsqueeze(0))
+            closest = curr_starts.unsqueeze(0) + \
+                proj_clamped.unsqueeze(-1) * ba_norm.unsqueeze(0)
+            dist = torch.norm(points.unsqueeze(1) - closest, dim=-1)
+            return (dist - radius).min(dim=1)[0]
+
+        offsets = [
+            torch.tensor([e, 0, 0], device=device),
+            torch.tensor([0, e, 0], device=device),
+            torch.tensor([0, 0, e], device=device),
+        ]
+        grads = []
+        for off in offsets:
+            grads.append(get_sdf_batch(p_hit + off) - get_sdf_batch(p_hit - off))
+        normals = torch.stack(grads, dim=-1)
+        normals = normals / (torch.norm(normals, dim=-1, keepdim=True) + 1e-8)
+
+        view_dir = -flat_ray_dirs[hit_indices]
+        view_dir = view_dir / (torch.norm(view_dir, dim=-1, keepdim=True) + 1e-8)
+
+        diff = torch.clamp((normals * (-light_dir)).sum(dim=-1), min=0.0)
+        half_dir = (view_dir + (-light_dir)).float()
+        half_dir = half_dir / (torch.norm(half_dir, dim=-1, keepdim=True) + 1e-8)
+        spec = torch.clamp((normals * half_dir).sum(dim=-1), min=0.0) ** 32
+
+        z_vals = p_hit[:, 2]
+        depth_factor = (1.0 - (z_vals - depth_near) / (depth_far - znear)).clamp(0.0, 1.0)
+
+        diffuse_term = 0.3 + 0.7 * diff
+        base_rgb = hit_cols[:, :3] * diffuse_term.unsqueeze(-1) * depth_factor.unsqueeze(-1)
+        highlight = 0.5 * spec.unsqueeze(-1) * depth_factor.unsqueeze(-1)
+
+        flat_hit_color[hit_indices, :3] = base_rgb + highlight
+        flat_hit_color[hit_indices, 3] = hit_cols[:, 3]
+
+    frame_img = flat_hit_color.view(H, W, 4)
+    return (frame_img.clamp(0, 1) * 255).byte().cpu().numpy()
+
+
 def render_whole(
     specs_list, H=480, W=640, fx=500, fy=500, cx=240, cy=320, radius=21.5, device=None
 ):
     """
-    Render cylinders using PyTorch ray marching.
+    Render cylinders using PyTorch ray marching (single set of intrinsics).
+    """
+    return render_whole_batch(
+        specs_list, H=H, W=W, radius=radius, device=device,
+        intrinsics_list=[(fx, fy, cx, cy)] * len(specs_list),
+    )
+
+
+def render_whole_batch(
+    specs_list, H=480, W=640, radius=21.5, device=None,
+    intrinsics_list=None,
+):
+    """
+    Render cylinders with per-frame camera intrinsics.
+    Geometry is uploaded to GPU once; ray grid is recomputed per-frame only
+    when intrinsics differ from the previous frame.
+
+    Args:
+        specs_list: list of cylinder specs per frame
+        intrinsics_list: list of (fx, fy, cx, cy) tuples, one per frame
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    n_frames = len(specs_list)
 
     starts_np, ends_np, colors_np, frame_offset_np, frame_count_np = flatten_specs(
         specs_list
     )
 
-    # Check if there is anything to render
     if len(starts_np) == 0:
-        return [np.zeros((H, W, 4), dtype=np.uint8) for _ in range(len(specs_list))]
+        return [np.zeros((H, W, 4), dtype=np.uint8) for _ in range(n_frames)]
 
-    # Move geometry data to device
+    # Upload all geometry to GPU once
     all_starts = torch.from_numpy(starts_np).to(device).float()
     all_ends = torch.from_numpy(ends_np).to(device).float()
     all_colors = torch.from_numpy(colors_np).to(device).float()
 
-    # Calculate global z bounds for simple culling/near-far plane setting
     z_min_val = min(starts_np[:, 2].min(), ends_np[:, 2].min())
     z_max_val = max(starts_np[:, 2].max(), ends_np[:, 2].max())
-
     znear = 0.1
     zfar = max(min(z_max_val, 25000), 10000)
 
-    # Prepare rays for the whole image
-    # Grid of coordinates
+    light_dir = torch.tensor([0.0, 0.0, 1.0], device=device)
+
+    # Pixel coordinate grid (computed once, reused)
     y_coords, x_coords = torch.meshgrid(
         torch.arange(H, device=device).float(),
         torch.arange(W, device=device).float(),
         indexing="ij",
     )
+    flat_ray_origins = torch.zeros((H * W, 3), device=device)
 
-    # Camera intrinsics to ray directions
-    u = (x_coords - cx) / fx
-    v = (y_coords - cy) / fy
-    z = torch.ones_like(u)
-
-    # Ray directions in camera/world space (assuming identity rotation for camera)
-    ray_dirs = torch.stack([u, v, z], dim=-1)
-    ray_dirs = ray_dirs / torch.norm(ray_dirs, dim=-1, keepdim=True)  # (H, W, 3)
-
-    ray_origins = torch.zeros(
-        (H, W, 3), device=device
-    )  # Camera at (0,0,0) [C variable in taichi]
-
-    light_dir = torch.tensor([0.0, 0.0, 1.0], device=device)
-
-    # Rendering parameters
-    MAX_STEPS = 100
-    EPSILON = 1e-3
+    # Cache ray dirs for repeated intrinsics
+    prev_intrinsics = None
+    flat_ray_dirs = None
 
     rendered_frames = []
-
-    # We render frame by frame to avoid OOM with large cylinder counts per frame
-    # But batching pixels is implicitly done by operating on full (H, W) tensors.
-
-    for i in range(len(specs_list)):
+    for i in range(n_frames):
         start_idx = frame_offset_np[i]
         count = frame_count_np[i]
 
@@ -114,231 +229,31 @@ def render_whole(
             rendered_frames.append(np.zeros((H, W, 4), dtype=np.uint8))
             continue
 
-        # Get cylinders for this frame
-        curr_starts = all_starts[start_idx : start_idx + count]  # (M, 3)
-        curr_ends = all_ends[start_idx : start_idx + count]  # (M, 3)
-        curr_colors = all_colors[start_idx : start_idx + count]  # (M, 4)
+        fx, fy, cx, cy = intrinsics_list[i]
 
-        # --- Ray Marching ---
+        # Recompute ray directions only if intrinsics changed
+        if (fx, fy, cx, cy) != prev_intrinsics:
+            u = (x_coords - cx) / fx
+            v = (y_coords - cy) / fy
+            z = torch.ones_like(u)
+            ray_dirs = torch.stack([u, v, z], dim=-1)
+            ray_dirs = ray_dirs / torch.norm(ray_dirs, dim=-1, keepdim=True)
+            flat_ray_dirs = ray_dirs.view(-1, 3)
+            prev_intrinsics = (fx, fy, cx, cy)
 
-        # Optimization: Precompute cylinder vectors
-        ba = curr_ends - curr_starts  # (M, 3)
+        curr_starts = all_starts[start_idx: start_idx + count]
+        curr_ends = all_ends[start_idx: start_idx + count]
+        curr_colors = all_colors[start_idx: start_idx + count]
+
+        ba = curr_ends - curr_starts
         ba_len = torch.sqrt((ba * ba).sum(dim=1))
-        ba_norm = ba / ba_len.unsqueeze(1)  # Normalized axis
+        ba_norm = ba / ba_len.unsqueeze(1)
 
-        # We need to find closest cylinder for each pixel.
-        # Since M (num cylinders) is small (~20-100), we can broadcast.
-        # But (H*W) is large (480*640 = 307200).
-        # (H, W, 1, 3) - (1, 1, M, 3) -> Memory heavey.
-        # So we flatten pixels.
-
-        pixels_shape = (H * W,)
-        flat_ray_dirs = ray_dirs.view(-1, 3)
-        flat_ray_origins = ray_origins.view(-1, 3)
-
-        flat_t = torch.ones(pixels_shape[0], device=device) * znear
-        flat_active = torch.ones(pixels_shape[0], dtype=torch.bool, device=device)
-        flat_hit = torch.zeros(pixels_shape[0], dtype=torch.bool, device=device)
-        flat_hit_color = torch.zeros((pixels_shape[0], 4), device=device)
-        flat_hit_pos = torch.zeros(
-            (pixels_shape[0], 3), device=device
-        )  # Store hit pos for normal calc
-
-        # To avoid OOM, checking 300k pixels vs 100 cylinders is fine (30MB matrices).
-        # Let's verify:
-        # Points P: (N_pix, 3)
-        # Cyl Start A: (N_cyl, 3)
-        # P - A: (N_pix, N_cyl, 3). 300k * 100 * 3 * 4bytes ~= 360MB.
-        # This fits in standard GPU memory easily.
-
-        depth_near = max(z_min_val, 0.1)
-        depth_far = min(z_max_val + 6000, 20000)
-
-        for step in range(MAX_STEPS):
-            if not flat_active.any():
-                break
-
-            # Current points for active rays
-            # Only compute for active rays to save time?
-            # Indexing might be slower than just masking. Let's try masking.
-
-            p = flat_ray_origins + flat_ray_dirs * flat_t.unsqueeze(1)  # (N_pix, 3)
-
-            # --- SDF Calculation ---
-            # Broadcast p against cylinders
-            # We only need to compute SDF for active pixels, but let's do all for simplicity first,
-            # or better: filter indices.
-
-            active_indices = torch.nonzero(flat_active).reshape(-1)
-            if active_indices.numel() == 0:
-                break
-
-            p_active = p[active_indices]  # (K, 3)
-
-            pa = p_active.unsqueeze(1) - curr_starts.unsqueeze(0)  # (K, M, 3)
-
-            # proj
-            # ba_norm: (M, 3) -> (1, M, 3)
-            proj = (pa * ba_norm.unsqueeze(0)).sum(dim=-1)  # (K, M)
-
-            # clamp
-            proj_clamped = proj.clamp(min=0.0).min(ba_len.unsqueeze(0))  # (K, M)
-
-            # vec to closest point on axis
-            closest_on_axis = curr_starts.unsqueeze(0) + proj_clamped.unsqueeze(
-                -1
-            ) * ba_norm.unsqueeze(0)  # (K, M, 3)
-
-            # dist
-            dist_vec = p_active.unsqueeze(1) - closest_on_axis
-            dist_euc = torch.norm(dist_vec, dim=-1)  # (K, M)
-            sdf = dist_euc - radius  # (K, M)
-
-            # Combine all cylinders (Union = min)
-            min_sdf, min_idx = sdf.min(dim=1)  # (K,)
-
-            # Update t
-            # If min_sdf < EPSILON, we hit
-            # If flat_t > zfar, we miss
-
-            # Map back to full arrays
-            current_t_vals = flat_t[active_indices]
-
-            hit_cond = min_sdf < EPSILON
-            miss_cond = current_t_vals > zfar
-
-            # For hits
-            new_hits = hit_cond & (~miss_cond)
-            # Only update hit info for newly hit rays
-
-            # We need to write back results
-            # Global indices of new hits
-            hit_global_idx = active_indices[new_hits]
-
-            if hit_global_idx.numel() > 0:
-                flat_hit[hit_global_idx] = True
-                flat_active[hit_global_idx] = False
-                flat_hit_pos[hit_global_idx] = p_active[new_hits]  # Store position
-
-                # Get color of closest cylinder
-                closest_cyl_idx = min_idx[new_hits]
-                flat_hit_color[hit_global_idx] = curr_colors[closest_cyl_idx]
-
-            # For misses
-            miss_global_idx = active_indices[miss_cond]
-            if miss_global_idx.numel() > 0:
-                flat_active[miss_global_idx] = False
-
-            # Step t
-            # Only step remaining active
-            still_active_local = ~(hit_cond | miss_cond)
-            if still_active_local.any():
-                step_dist = min_sdf[still_active_local]
-                # Avoid stepping too small to prevent stuck
-                step_dist = torch.max(step_dist, torch.tensor(1e-4, device=device))
-
-                active_global_idx = active_indices[still_active_local]
-                flat_t[active_global_idx] += step_dist
-
-        # --- Shading ---
-        # Compute normals for all hit pixels
-        hit_indices = torch.nonzero(flat_hit).reshape(-1)
-
-        if hit_indices.numel() > 0:
-            p_hit = flat_hit_pos[hit_indices]  # (NumHits, 3)
-            hit_cols = flat_hit_color[hit_indices]  # (NumHits, 4)
-
-            # Finite difference normal
-            e = 1e-3
-
-            # We need a function to compute scene SDF at arbitrary points quickly
-            def get_sdf_batch(points):
-                # points: (N, 3)
-                # returns: (N,) min sdf
-                # Re-use curr_starts, curr_ends logic
-
-                # Chunking if too large?
-                # Assuming it fits since points are subset of image
-
-                pa = points.unsqueeze(1) - curr_starts.unsqueeze(0)  # (N, M, 3)
-                proj = (pa * ba_norm.unsqueeze(0)).sum(dim=-1)
-                proj_clamped = proj.clamp(min=0.0).min(ba_len.unsqueeze(0))
-
-                closest = curr_starts.unsqueeze(0) + proj_clamped.unsqueeze(
-                    -1
-                ) * ba_norm.unsqueeze(0)
-                dist = torch.norm(points.unsqueeze(1) - closest, dim=-1)
-                sdf = dist - radius
-                return sdf.min(dim=1)[0]
-
-            def get_normal_batch(points):
-                # Central difference
-                dx = get_sdf_batch(
-                    points + torch.tensor([e, 0, 0], device=device)
-                ) - get_sdf_batch(points - torch.tensor([e, 0, 0], device=device))
-                dy = get_sdf_batch(
-                    points + torch.tensor([0, e, 0], device=device)
-                ) - get_sdf_batch(points - torch.tensor([0, e, 0], device=device))
-                dz = get_sdf_batch(
-                    points + torch.tensor([0, 0, e], device=device)
-                ) - get_sdf_batch(points - torch.tensor([0, 0, e], device=device))
-                n = torch.stack([dx, dy, dz], dim=-1)
-                return n / (torch.norm(n, dim=-1, keepdim=True) + 1e-8)
-
-            normals = get_normal_batch(p_hit)
-
-            # Blinn-Phong
-            # View dir is -ray_dir
-            view_dir = -flat_ray_dirs[hit_indices]
-            view_dir = view_dir / torch.norm(view_dir, dim=-1, keepdim=True)
-
-            # Light dir (0,0,1)
-            # Diffuse
-            # max(n.dot(-light_dir), 0) -> note taichi code used -light_dir for diffuse?
-            # Taichi: diff = max(n.dot(-light_dir), 0.0) where light_dir = [0,0,1]
-            # So light comes from +Z (camera).
-
-            diff = torch.clamp(
-                (normals * (-light_dir)).sum(dim=-1), min=0.0
-            )  # (NumHits,)
-
-            # Specular
-            half_dir = (view_dir + (-light_dir)).float()
-            half_dir = half_dir / (torch.norm(half_dir, dim=-1, keepdim=True) + 1e-8)
-
-            spec = torch.clamp((normals * half_dir).sum(dim=-1), min=0.0)
-            spec = spec**32
-
-            # Depth factor
-            z_vals = p_hit[:, 2]
-            depth_factor = 1.0 - (z_vals - depth_near) / (depth_far - znear)
-            depth_factor = depth_factor.clamp(0.0, 1.0)
-
-            # Combine
-            diffuse_term = 0.3 + 0.7 * diff
-            base_rgb = (
-                hit_cols[:, :3]
-                * diffuse_term.unsqueeze(-1)
-                * depth_factor.unsqueeze(-1)
-            )
-
-            highlight = (
-                torch.tensor([1.0, 1.0, 1.0], device=device)
-                * (0.5 * spec.unsqueeze(-1))
-                * depth_factor.unsqueeze(-1)
-            )
-
-            final_rgb = base_rgb + highlight
-
-            # Assign back
-            flat_hit_color[hit_indices, :3] = final_rgb
-            flat_hit_color[hit_indices, 3] = hit_cols[:, 3]  # Alpha
-
-        # Reshape to image
-        frame_img = flat_hit_color.view(H, W, 4)
-
-        # Convert to numpy uint8
-        frame_np = (frame_img.clamp(0, 1) * 255).byte().cpu().numpy()
+        frame_np = _render_frame_torch(
+            curr_starts, curr_ends, curr_colors, ba, ba_len, ba_norm,
+            flat_ray_dirs, flat_ray_origins, H, W, radius, znear, zfar,
+            z_min_val, z_max_val, light_dir, device,
+        )
         rendered_frames.append(frame_np)
 
     return rendered_frames

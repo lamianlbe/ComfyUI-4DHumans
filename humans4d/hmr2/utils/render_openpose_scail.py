@@ -26,7 +26,7 @@ try:
 except Exception:
     render_whole_taichi = None
 
-from .scail.render_torch import render_whole as render_whole_torch
+from .scail.render_torch import render_whole_batch as render_whole_batch_torch
 
 
 # ── FLAME 72-face → iBUG 68-face mapping ─────────────────────────────────────
@@ -280,31 +280,29 @@ def render_scail_pose_batch(timeline, timeline_3d, img_h, img_w, cfg=None,
     ]
     draw_seq = [0, 2, 3, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 
-    # ── Render each frame at output resolution with per-frame intrinsics ─
-    # Choose render function
-    def _render_one_frame(specs_list_1, fx, fy, cx, cy):
-        if render_backend == "taichi" and render_whole_taichi is not None:
-            try:
-                return render_whole_taichi(
-                    specs_list_1, H=img_h, W=img_w,
-                    fx=fx, fy=fy, cx=cx, cy=cy, radius=radius)
-            except Exception:
-                logging.warning("Taichi rendering failed, falling back to torch.")
-                return render_whole_torch(
-                    specs_list_1, H=img_h, W=img_w,
-                    fx=fx, fy=fy, cx=cx, cy=cy, radius=radius)
-        else:
-            return render_whole_torch(
-                specs_list_1, H=img_h, W=img_w,
-                fx=fx, fy=fy, cx=cx, cy=cy, radius=radius)
-
-    frames_rgba = []
+    # ── Batch render all frames with per-frame intrinsics ──────────────
+    cylinder_specs_list = []
     for t in range(B):
         specs = get_single_pose_cylinder_specs(
             (t, smpl_poses[t], None, None, None, None, colors, limb_seq, draw_seq))
-        fx_o, fy_o, cx_o, cy_o = frame_intrinsics[t]
-        rendered = _render_one_frame([specs], fx_o, fy_o, cx_o, cy_o)
-        frames_rgba.append(rendered[0])
+        cylinder_specs_list.append(specs)
+
+    if render_backend == "taichi" and render_whole_taichi is not None:
+        # Taichi doesn't support per-frame intrinsics, use first frame's
+        fx_0, fy_0, cx_0, cy_0 = frame_intrinsics[0]
+        try:
+            frames_rgba = render_whole_taichi(
+                cylinder_specs_list, H=img_h, W=img_w,
+                fx=fx_0, fy=fy_0, cx=cx_0, cy=cy_0, radius=radius)
+        except Exception:
+            logging.warning("Taichi rendering failed, falling back to torch.")
+            frames_rgba = render_whole_batch_torch(
+                cylinder_specs_list, H=img_h, W=img_w, radius=radius,
+                intrinsics_list=frame_intrinsics)
+    else:
+        frames_rgba = render_whole_batch_torch(
+            cylinder_specs_list, H=img_h, W=img_w, radius=radius,
+            intrinsics_list=frame_intrinsics)
 
     # ── Build DWPose 2D overlay at output resolution ─────────────────────
     dw_poses = []
