@@ -8,17 +8,39 @@ from omegaconf import OmegaConf
 from .. import REPO_PATH
 
 # ── ComfyUI model directory for all PHALP assets ─────────────────────────────
+# Actual layout downloaded by PHALP:
+#
+#   models/phalp/
+#   ├── 3D/
+#   │   ├── models/
+#   │   │   ├── smpl/
+#   │   │   │   └── SMPL_NEUTRAL.pkl
+#   │   │   └── smpl_mean_params.npz   (duplicate, ignored)
+#   │   ├── SMPL_to_J19.pkl
+#   │   ├── smpl_mean_params.npz
+#   │   ├── texture.npz
+#   │   ├── head_faces.npy
+#   │   ├── mean_std.npy
+#   │   ├── bmap_256.npy
+#   │   └── fmap_256.npy
+#   ├── weights/
+#   │   ├── hmar_v2_weights.pth
+#   │   ├── pose_predictor.pth
+#   │   └── pose_predictor.yaml
+#   └── ava/
+#       ├── ava_labels.pkl
+#       └── ava_class_mapping.pkl
 PHALP_PATH          = os.path.join(models_dir, "phalp")
-_PHALP_SMPL_PATH    = os.path.join(PHALP_PATH, "smpl")
-_PHALP_WEIGHTS_PATH = os.path.join(PHALP_PATH, "weights")
 _PHALP_3D_PATH      = os.path.join(PHALP_PATH, "3D")
+_PHALP_SMPL_PATH    = os.path.join(_PHALP_3D_PATH, "models", "smpl")
+_PHALP_WEIGHTS_PATH = os.path.join(PHALP_PATH, "weights")
 _PHALP_AVA_PATH     = os.path.join(PHALP_PATH, "ava")
 
 # All files that must exist before the tracker can be initialised
 _REQUIRED_FILES = {
     os.path.join(_PHALP_SMPL_PATH,    "SMPL_NEUTRAL.pkl"):      "SMPL neutral body model",
-    os.path.join(_PHALP_SMPL_PATH,    "SMPL_to_J19.pkl"):       "SMPL-to-J19 joint regressor",
-    os.path.join(_PHALP_SMPL_PATH,    "smpl_mean_params.npz"):  "SMPL mean parameters",
+    os.path.join(_PHALP_3D_PATH,      "SMPL_to_J19.pkl"):       "SMPL-to-J19 joint regressor",
+    os.path.join(_PHALP_3D_PATH,      "smpl_mean_params.npz"):  "SMPL mean parameters",
     os.path.join(_PHALP_3D_PATH,      "texture.npz"):           "SMPL texture atlas",
     os.path.join(_PHALP_3D_PATH,      "head_faces.npy"):        "SMPL head faces",
     os.path.join(_PHALP_3D_PATH,      "mean_std.npy"):          "pose mean/std normalisation",
@@ -90,9 +112,9 @@ def _make_comfy_cfg(n_init, device_str, tmp_dir):
     cfg.phalp.detector = "vitdet"
 
     cfg.SMPL.MODEL_PATH            = _PHALP_SMPL_PATH
-    cfg.SMPL.JOINT_REGRESSOR_EXTRA = os.path.join(_PHALP_SMPL_PATH, "SMPL_to_J19.pkl")
+    cfg.SMPL.JOINT_REGRESSOR_EXTRA = os.path.join(_PHALP_3D_PATH,   "SMPL_to_J19.pkl")
     cfg.SMPL.TEXTURE               = os.path.join(_PHALP_3D_PATH,   "texture.npz")
-    cfg.MODEL.SMPL_HEAD.SMPL_MEAN_PARAMS = os.path.join(_PHALP_SMPL_PATH, "smpl_mean_params.npz")
+    cfg.MODEL.SMPL_HEAD.SMPL_MEAN_PARAMS = os.path.join(_PHALP_3D_PATH, "smpl_mean_params.npz")
 
     cfg.hmr.hmar_path               = os.path.join(_PHALP_WEIGHTS_PATH, "hmar_v2_weights.pth")
     cfg.pose_predictor.weights_path = os.path.join(_PHALP_WEIGHTS_PATH, "pose_predictor.pth")
