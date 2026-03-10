@@ -68,6 +68,13 @@ class PHALPPoseControlNetNode:
     produces temporally consistent track IDs and smoother joint trajectories,
     which typically gives better ControlNet results on video.
 
+    When retroactive_fill is enabled the node uses a two-pass strategy:
+      Pass 1 – run full tracking across ALL frames, recording every track's
+               pose data even while it is still tentative (not yet confirmed).
+      Pass 2 – render; for tracks that eventually get confirmed, the early
+               tentative frames are retroactively filled in so no skeleton
+               is missing from the output even when n_init > 1.
+
     Requires the PHALP node to be loaded upstream via 'Load PHALP'.
     """
 
@@ -104,6 +111,19 @@ class PHALPPoseControlNetNode:
                         ),
                     },
                 ),
+                "retroactive_fill": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Two-pass mode: run full tracking first, then render. "
+                            "Tracks confirmed later in the video are retroactively "
+                            "drawn for their early tentative frames, so no skeleton "
+                            "is lost during the n_init warm-up period. "
+                            "Has no effect when n_init=1."
+                        ),
+                    },
+                ),
             }
         }
 
@@ -112,42 +132,37 @@ class PHALPPoseControlNetNode:
     FUNCTION = "render_pose"
     CATEGORY = "4dhumans"
 
-    def render_pose(self, images, phalp, clip_boundary, draw_predicted):
-        if not _ensure_phalp_importable():
-            raise RuntimeError("phalp package not found. See 'Load PHALP' node.")
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
 
-        tracker     = phalp["tracker"]
-        cfg         = phalp["cfg"]
+    @staticmethod
+    def _run_tracking(tracker, images_nchw, measurements):
+        """
+        Forward pass: run PHALP tracking over every frame and return a
+        per-frame snapshot of every track (tentative and confirmed alike).
 
-        # Re-initialise DeepSort for this video sequence so track IDs start
-        # fresh and the Kalman filter state is clean.
-        tracker.setup_deepsort()
-
-        # images: (B, H, W, 3) float [0,1]  – ComfyUI convention
-        images_nchw = images.permute(0, 3, 1, 2)   # (B, C, H, W)
+        Returns
+        -------
+        snapshots : list[dict]
+            snapshots[t] maps track_id -> {
+                'joints_2d':       np.ndarray (90,) or None,
+                'is_confirmed':    bool,
+                'time_since_update': int,
+            }
+        """
         B, C, img_h, img_w = images_nchw.shape
-
-        new_size = max(img_h, img_w)
-        left     = (new_size - img_w) // 2
-        top      = (new_size - img_h) // 2
-        # PHALP's measurments tuple: [img_h, img_w, new_size, left, top]
-        measurements = [img_h, img_w, new_size, left, top]
-
-        pose_images = []
-        pbar = comfy.utils.ProgressBar(B)
+        snapshots = []
 
         for t, img_tensor in enumerate(images_nchw):
-            img_np = (img_tensor.permute(1, 2, 0) * 255).byte().numpy()
+            img_np     = (img_tensor.permute(1, 2, 0) * 255).byte().numpy()
             frame_name = str(t)
 
-            # ── 1. Detect ──────────────────────────────────────────────────
             (pred_bbox, pred_bbox_pad, pred_masks,
              pred_scores, pred_classes,
              gt_tids, gt_annots) = tracker.get_detections(
                 img_np, frame_name, t, {}, measurements
             )
-
-            # ── 2. HMAR: extract pose + appearance features ────────────────
             extra_data = tracker.run_additional_models(
                 img_np, pred_bbox, pred_masks, pred_scores,
                 pred_classes, frame_name, t, measurements, gt_tids, gt_annots
@@ -158,30 +173,138 @@ class PHALPPoseControlNetNode:
                 measurements, gt_tids, gt_annots, extra_data
             )
 
-            # ── 3. DeepSort: predict + update ─────────────────────────────
             tracker.tracker.predict()
             tracker.tracker.update(detections, t, frame_name, shot=0)
 
-            # ── 4. Render confirmed tracks onto a black canvas ─────────────
-            canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-
+            frame_snap = {}
             for track_ in tracker.tracker.tracks:
-                if not track_.is_confirmed():
-                    continue
-                # time_since_update == 0  →  detected this frame
-                # time_since_update  > 0  →  predicted (occluded/off-screen)
-                if track_.time_since_update > 0 and not draw_predicted:
-                    continue
+                hist = track_.track_data.get("history", [])
+                joints = hist[-1]["2d_joints"] if hist else None
+                frame_snap[track_.track_id] = {
+                    "joints_2d":         joints,
+                    "is_confirmed":      track_.is_confirmed(),
+                    "time_since_update": track_.time_since_update,
+                }
+            snapshots.append(frame_snap)
 
-                hist = track_.track_data["history"][-1]
-                kp = _joints_to_openpose(
-                    hist["2d_joints"], img_h, img_w, clip_boundary
+        return snapshots
+
+    # ------------------------------------------------------------------
+    # main entry point
+    # ------------------------------------------------------------------
+
+    def render_pose(self, images, phalp, clip_boundary, draw_predicted,
+                    retroactive_fill):
+        if not _ensure_phalp_importable():
+            raise RuntimeError("phalp package not found. See 'Load PHALP' node.")
+
+        tracker = phalp["tracker"]
+
+        # Re-initialise DeepSort so track IDs start fresh.
+        tracker.setup_deepsort()
+
+        # images: (B, H, W, 3) float [0,1]  – ComfyUI convention
+        images_nchw = images.permute(0, 3, 1, 2)   # (B, C, H, W)
+        B, C, img_h, img_w = images_nchw.shape
+
+        new_size     = max(img_h, img_w)
+        left         = (new_size - img_w) // 2
+        top          = (new_size - img_h) // 2
+        measurements = [img_h, img_w, new_size, left, top]
+
+        pbar = comfy.utils.ProgressBar(B)
+
+        if retroactive_fill:
+            # ── Two-pass mode ─────────────────────────────────────────
+            # Pass 1: collect all track data (progress counts as B frames)
+            snapshots = self._run_tracking(tracker, images_nchw, measurements)
+            pbar.update(B // 2)
+
+            # Which track IDs ever reach confirmed state?
+            eventually_confirmed = {
+                tid
+                for frame_snap in snapshots
+                for tid, tdata in frame_snap.items()
+                if tdata["is_confirmed"]
+            }
+
+            # Pass 2: render using full knowledge of track fates
+            pose_images = []
+            for t, frame_snap in enumerate(snapshots):
+                canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+
+                for tid, tdata in frame_snap.items():
+                    joints = tdata["joints_2d"]
+                    if joints is None:
+                        continue
+
+                    confirmed    = tdata["is_confirmed"]
+                    since_update = tdata["time_since_update"]
+
+                    if confirmed:
+                        # Normal confirmed track: respect draw_predicted
+                        if since_update > 0 and not draw_predicted:
+                            continue
+                    elif tid in eventually_confirmed:
+                        # Tentative now but will be confirmed later:
+                        # retroactively fill — it was actually detected this
+                        # frame (since_update==0 for fresh tentative entries)
+                        if since_update > 0:
+                            continue  # Kalman-only prediction, skip
+                    else:
+                        # Never confirmed (false positive) — skip
+                        continue
+
+                    kp = _joints_to_openpose(joints, img_h, img_w, clip_boundary)
+                    canvas = render_openpose(canvas, kp)
+
+                pose_images.append(
+                    torch.from_numpy(canvas.astype(np.float32) / 255.0)
                 )
-                canvas = render_openpose(canvas, kp)
+                pbar.update(1)
 
-            pose_images.append(
-                torch.from_numpy(canvas.astype(np.float32) / 255.0)
-            )
-            pbar.update(1)
+        else:
+            # ── Single-pass mode (original behaviour) ─────────────────
+            pose_images = []
+            for t, img_tensor in enumerate(images_nchw):
+                img_np     = (img_tensor.permute(1, 2, 0) * 255).byte().numpy()
+                frame_name = str(t)
+
+                (pred_bbox, pred_bbox_pad, pred_masks,
+                 pred_scores, pred_classes,
+                 gt_tids, gt_annots) = tracker.get_detections(
+                    img_np, frame_name, t, {}, measurements
+                )
+                extra_data = tracker.run_additional_models(
+                    img_np, pred_bbox, pred_masks, pred_scores,
+                    pred_classes, frame_name, t, measurements, gt_tids, gt_annots
+                )
+                detections = tracker.get_human_features(
+                    img_np, pred_masks, pred_bbox, pred_bbox_pad,
+                    pred_scores, frame_name, pred_classes, t,
+                    measurements, gt_tids, gt_annots, extra_data
+                )
+
+                tracker.tracker.predict()
+                tracker.tracker.update(detections, t, frame_name, shot=0)
+
+                canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+
+                for track_ in tracker.tracker.tracks:
+                    if not track_.is_confirmed():
+                        continue
+                    if track_.time_since_update > 0 and not draw_predicted:
+                        continue
+
+                    hist = track_.track_data["history"][-1]
+                    kp   = _joints_to_openpose(
+                        hist["2d_joints"], img_h, img_w, clip_boundary
+                    )
+                    canvas = render_openpose(canvas, kp)
+
+                pose_images.append(
+                    torch.from_numpy(canvas.astype(np.float32) / 255.0)
+                )
+                pbar.update(1)
 
         return (torch.stack(pose_images),)
