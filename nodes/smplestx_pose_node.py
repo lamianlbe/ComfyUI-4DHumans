@@ -156,27 +156,26 @@ class SMPLestXPoseNode:
         top = (new_size - img_h) // 2
         measurements = [img_h, img_w, new_size, left, top]
 
-        pbar = comfy.utils.ProgressBar(B)
-        pose_images = []
+        pbar = comfy.utils.ProgressBar(2 * B)
 
+        # Pass 1: detection + inference
+        frame_results = []  # per-frame list of SMPLest-X results
         for t in range(B):
             img_np = (images_nchw[t].permute(1, 2, 0) * 255).byte().numpy()
             frame_name = str(t)
 
-            # Detect people
             (pred_bbox, pred_bbox_pad, pred_masks,
              pred_scores, pred_classes,
              gt_tids, gt_annots) = tracker.get_detections(
                 img_np, frame_name, t, {}, measurements)
 
-            # Run SMPLest-X on each detection
             sx_results = []
             for i in range(len(pred_bbox)):
                 result = run_smplestx_on_bbox(
                     img_np, pred_bbox[i], sx_model, sx_cfg)
-                sx_results.append(result)
+                if result is not None:
+                    sx_results.append(result)
 
-            # Update tracker state
             extra_data = tracker.run_additional_models(
                 img_np, pred_bbox, pred_masks, pred_scores,
                 pred_classes, frame_name, t, measurements, gt_tids, gt_annots)
@@ -187,31 +186,66 @@ class SMPLestXPoseNode:
             tracker.tracker.predict()
             tracker.tracker.update(detections, t, frame_name, shot=0)
 
-            # Render all detected people
-            if debug:
-                canvas = img_np.copy()
-            else:
-                canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+            frame_results.append(sx_results)
+            pbar.update(1)
 
-            for result in sx_results:
-                if result is None:
-                    continue
-                if scail_pose:
-                    kp3d = {
+        # Pass 2: render
+        if scail_pose:
+            # Flatten all person-frames into one batch for SCAIL rendering
+            flat_kp2d = []
+            flat_3d = []
+            flat_frame_idx = []  # which original frame each entry belongs to
+            for t in range(B):
+                for result in frame_results[t]:
+                    flat_kp2d.append(result["kp2d"])
+                    flat_3d.append({
                         "joint_cam": result["joint_cam"],
                         "root_cam": result["root_cam"],
                         "inv_trans": result["inv_trans"],
-                    }
-                    scail_frames = render_scail_pose_batch(
-                        [result["kp2d"]], [kp3d], img_h, img_w, cfg=sx_cfg)
-                    scail_img = scail_frames[0]
+                    })
+                    flat_frame_idx.append(t)
+
+            # Single batch render call for all person-frames
+            if flat_kp2d:
+                scail_all = render_scail_pose_batch(
+                    flat_kp2d, flat_3d, img_h, img_w, cfg=sx_cfg)
+            else:
+                scail_all = []
+
+            # Composite per-person SCAIL images back onto per-frame canvases
+            pose_images = []
+            scail_by_frame = [[] for _ in range(B)]
+            for i, t in enumerate(flat_frame_idx):
+                scail_by_frame[t].append(scail_all[i])
+
+            for t in range(B):
+                if debug:
+                    canvas = (images_nchw[t].permute(1, 2, 0)
+                              * 255).byte().numpy().copy()
+                else:
+                    canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+
+                for scail_img in scail_by_frame[t]:
                     mask = scail_img > 0
                     canvas[mask] = scail_img[mask]
+
+                pose_images.append(
+                    torch.from_numpy(canvas.astype(np.float32) / 255.0))
+                pbar.update(1)
+        else:
+            pose_images = []
+            for t in range(B):
+                if debug:
+                    canvas = (images_nchw[t].permute(1, 2, 0)
+                              * 255).byte().numpy().copy()
                 else:
+                    canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+
+                for result in frame_results[t]:
                     canvas = render_wholebody_openpose(canvas, result["kp2d"])
 
-            pose_images.append(
-                torch.from_numpy(canvas.astype(np.float32) / 255.0))
-            pbar.update(1)
+                pose_images.append(
+                    torch.from_numpy(canvas.astype(np.float32) / 255.0))
+                pbar.update(1)
 
         return (torch.stack(pose_images),)
