@@ -4,10 +4,10 @@ ComfyUI node for loading a Sapiens pose estimation model.
 Places model checkpoints under::
 
     ComfyUI/models/sapiens/pose/
-        sapiens_1b_goliath_best_goliath_AP_640_torchscript.pt2   (recommended)
+        sapiens_2b_coco_wholebody_best_coco_wholebody_AP_745_torchscript.pt2
 
-Any ``*torchscript*.pt2`` or ``*.pth`` file in that directory will be listed
-as a selectable checkpoint.
+Any ``*.pt2`` or ``*.pth`` file in that directory will be listed
+as a selectable checkpoint.  COCO-WholeBody (133 keypoints) is recommended.
 """
 
 import glob
@@ -58,9 +58,10 @@ def _build_preprocessor():
 
 class LoadSapiensNode:
     """
-    Loads a Sapiens Goliath pose estimation model (TorchScript or PyTorch).
+    Loads a Sapiens pose estimation model (TorchScript or PyTorch).
 
     Checkpoint files should be placed in ``models/sapiens/pose/``.
+    COCO-WholeBody 133-keypoint model is recommended.
     """
 
     @classmethod

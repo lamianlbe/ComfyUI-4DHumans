@@ -10,8 +10,7 @@ from ..humans4d.hmr2.utils.render_openpose_scail import render_scail_pose_batch
 from ..humans4d.hmr2.utils.render_sapiens import render_sapiens_dwpose
 from ..humans4d.hmr2.utils.sapiens_inference import (
     run_sapiens_on_bbox,
-    goliath_pixel_kp_to_flat137,
-    flat137_to_dwpose,
+    fuse_sapiens_smplestx,
 )
 from .load_phalp_node import _ensure_phalp_importable
 
@@ -342,9 +341,11 @@ class PHALPPoseControlNetNode:
                         "default": "sapiens",
                         "tooltip": (
                             "Which pose estimation model to use.\n"
-                            "• sapiens: Goliath 308-joint whole-body via Sapiens "
+                            "• sapiens: COCO-WholeBody 133-joint via Sapiens "
                             "(body + hands + face). Best 2D accuracy. "
-                            "Requires the Sapiens model to be loaded and connected.\n"
+                            "If SMPLest-X is also connected, its 3D pose is used "
+                            "to fill in joints missing from Sapiens (e.g. limbs "
+                            "cut off at screen edges).\n"
                             "• smplestx: 137-joint whole-body via SMPLest-X "
                             "(body + hands + face). Required for SCAIL 3D rendering. "
                             "Requires the SMPLest-X model to be loaded and connected."
@@ -481,10 +482,6 @@ class PHALPPoseControlNetNode:
                         best_result = result
                 if best_result is not None:
                     raw_kp = best_result["pixel_kp"].copy()
-                    # COCO-WB (133) can be stored directly;
-                    # Goliath (308+) needs conversion to flat 137
-                    if raw_kp.shape[0] != 133:
-                        raw_kp = goliath_pixel_kp_to_flat137(raw_kp)
                     if clip_boundary >= 0:
                         lo_x, hi_x = -clip_boundary, img_w + clip_boundary
                         lo_y, hi_y = -clip_boundary, img_h + clip_boundary
@@ -722,6 +719,9 @@ class PHALPPoseControlNetNode:
             pbar = comfy.utils.ProgressBar(2 * B)
             whole_bbox = np.array([0, 0, img_w, img_h], dtype=np.float32)
 
+            # Check if SMPLest-X is available as 3D fallback for Sapiens
+            use_3d_fallback = use_sapiens and smplestx is not None
+
             timeline = [None] * B
             timeline_3d = [None] * B
             for t in range(B):
@@ -729,8 +729,17 @@ class PHALPPoseControlNetNode:
                 if use_sapiens:
                     result = run_sapiens_on_bbox(img_np, whole_bbox, sapiens)
                     if result is not None:
-                        # Store raw pixel_kp (133 for COCO-WB, 308+ for Goliath)
                         raw_kp = result["pixel_kp"].copy()
+
+                        # Fuse with SMPLest-X 3D→2D when available
+                        if use_3d_fallback:
+                            sx_result = _run_smplestx_on_bbox(
+                                img_np, whole_bbox,
+                                smplestx["model"], smplestx["cfg"])
+                            if sx_result is not None:
+                                raw_kp = fuse_sapiens_smplestx(
+                                    raw_kp, sx_result["kp2d"])
+
                         if clip_boundary >= 0:
                             lo_x, hi_x = -clip_boundary, img_w + clip_boundary
                             lo_y, hi_y = -clip_boundary, img_h + clip_boundary
@@ -952,14 +961,9 @@ class PHALPPoseControlNetNode:
                     if use_sapiens and "__sapiens" in frame_snap:
                         for _score, result in frame_snap["__sapiens"]:
                             if result is not None:
-                                raw_kp = result["pixel_kp"]
-                                # COCO-WB (133) rendered directly;
-                                # Goliath needs flat137 conversion
-                                if raw_kp.shape[0] != 133:
-                                    raw_kp = goliath_pixel_kp_to_flat137(
-                                        raw_kp)
                                 canvas = self._render_kp(
-                                    canvas, raw_kp, False, use_sapiens=True)
+                                    canvas, result["pixel_kp"],
+                                    False, use_sapiens=True)
                     elif use_smplestx and "__smplestx" in frame_snap:
                         for _score, result in frame_snap["__smplestx"]:
                             if result is not None:
