@@ -409,11 +409,12 @@ def draw_handpose_lr(canvas, all_hand_peaks):
                     hsv_color = [ (base_hue + ie / float(len(edges)) * 0.8), 0.9, 0.9 ]
                 else:
                     hsv_color = [ (base_hue + ie / float(len(edges)) * 0.8), 0.8, 1 ]
+                rgb = hsv_to_rgb(hsv_color)
                 cv2.line(
                     canvas,
                     (x1, y1),
                     (x2, y2),
-                    hsv_to_rgb(hsv_color),
+                    tuple(int(c) for c in rgb),
                     thickness=2,
                 )
 
