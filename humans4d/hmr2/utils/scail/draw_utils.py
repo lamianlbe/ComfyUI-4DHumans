@@ -486,10 +486,10 @@ def draw_handpose(canvas, all_hand_peaks):
     return canvas
 
 
-def draw_facepose(canvas, all_lmks, optimized_face=True):
+def draw_facepose(canvas, all_lmks, optimized_face=True, face_scale=1.0):
     H, W, C = canvas.shape
-    stickwidth = min(max(int(min(H, W) / 200), 1), 3)
-    stickwidth_thin = min(max(int(min(H, W) / 300), 1), 2)
+    stickwidth = max(int(min(H, W) / 200 * face_scale), 1)
+    stickwidth_thin = max(int(min(H, W) / 300 * face_scale), 1)
 
     for lmks in all_lmks:
         lmks = np.array(lmks)

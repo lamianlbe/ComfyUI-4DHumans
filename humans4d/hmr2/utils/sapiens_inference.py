@@ -346,7 +346,7 @@ CONF_THRESHOLD = 0.3
 # ---------------------------------------------------------------------------
 
 @torch.inference_mode()
-def run_sapiens_on_bbox(img_np, bbox, sapiens_dict):
+def run_sapiens_on_bbox(img_np, bbox, sapiens_dict, bbox_expand=0.15):
     """
     Run Sapiens pose estimation on a single person crop.
 
@@ -355,12 +355,15 @@ def run_sapiens_on_bbox(img_np, bbox, sapiens_dict):
     img_np : ndarray (H, W, 3) uint8 RGB
     bbox : array-like [x1, y1, x2, y2]
     sapiens_dict : dict from LoadSapiensNode
+    bbox_expand : float, expand bbox by this fraction on each side.
+        Helps detect limbs at screen edges by providing more context.
+        Out-of-image regions are zero-padded.
 
     Returns
     -------
     dict with:
         "goliath_kp"  : ndarray (N, 3)  heatmap-space (x, y, conf)
-        "bbox"        : (x1, y1, x2, y2) int
+        "bbox"        : (x1, y1, x2, y2) int  (expanded bbox, clamped)
         "pixel_kp"    : ndarray (N, 3)  image-space (x, y, conf)
     or None on failure.
     """
@@ -370,15 +373,44 @@ def run_sapiens_on_bbox(img_np, bbox, sapiens_dict):
     dtype = sapiens_dict["dtype"]
     hm_w, hm_h = sapiens_dict["heatmap_size"]
 
+    img_h, img_w = img_np.shape[:2]
     x1, y1, x2, y2 = map(int, bbox[:4])
-    x1 = max(0, x1)
-    y1 = max(0, y1)
-    x2 = min(img_np.shape[1], x2)
-    y2 = min(img_np.shape[0], y2)
-    if x2 <= x1 or y2 <= y1:
+
+    # Expand bbox to give the model more context at edges
+    bw, bh = x2 - x1, y2 - y1
+    pad_x = int(bw * bbox_expand)
+    pad_y = int(bh * bbox_expand)
+    ex1, ey1 = x1 - pad_x, y1 - pad_y
+    ex2, ey2 = x2 + pad_x, y2 + pad_y
+
+    # Clamp to image bounds and compute padding needed
+    cx1 = max(0, ex1)
+    cy1 = max(0, ey1)
+    cx2 = min(img_w, ex2)
+    cy2 = min(img_h, ey2)
+    if cx2 <= cx1 or cy2 <= cy1:
         return None
 
-    cropped = img_np[y1:y2, x1:x2]
+    cropped = img_np[cy1:cy2, cx1:cx2]
+
+    # Zero-pad if expanded bbox went outside image
+    pad_left = cx1 - ex1
+    pad_top = cy1 - ey1
+    pad_right = ex2 - cx2
+    pad_bottom = ey2 - cy2
+    if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
+        cropped = np.pad(
+            cropped,
+            ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+            mode="constant", constant_values=0,
+        )
+
+    # The effective crop region in image coords
+    eff_x1, eff_y1 = ex1, ey1  # may be negative
+    eff_w, eff_h = ex2 - ex1, ey2 - ey1
+    if eff_w <= 0 or eff_h <= 0:
+        return None
+
     tensor = preprocessor(cropped).unsqueeze(0).to(device).to(dtype)
     heatmaps = model(tensor).to(torch.float32)  # (1, K, hm_h, hm_w)
     heatmaps = heatmaps[0].cpu().numpy()         # (K, hm_h, hm_w)
@@ -390,16 +422,15 @@ def run_sapiens_on_bbox(img_np, bbox, sapiens_dict):
         y_hm, x_hm = np.unravel_index(np.argmax(hm), hm.shape)
         goliath_kp[i] = (float(x_hm), float(y_hm), float(hm[y_hm, x_hm]))
 
-    # Scale heatmap coords to image pixel coords
-    bbox_w, bbox_h = x2 - x1, y2 - y1
+    # Scale heatmap coords to image pixel coords (relative to expanded bbox)
     pixel_kp = np.zeros_like(goliath_kp)
-    pixel_kp[:, 0] = goliath_kp[:, 0] * bbox_w / hm_w + x1
-    pixel_kp[:, 1] = goliath_kp[:, 1] * bbox_h / hm_h + y1
+    pixel_kp[:, 0] = goliath_kp[:, 0] * eff_w / hm_w + eff_x1
+    pixel_kp[:, 1] = goliath_kp[:, 1] * eff_h / hm_h + eff_y1
     pixel_kp[:, 2] = goliath_kp[:, 2]
 
     return {
         "goliath_kp": goliath_kp,
-        "bbox": (x1, y1, x2, y2),
+        "bbox": (max(0, ex1), max(0, ey1), min(img_w, ex2), min(img_h, ey2)),
         "pixel_kp": pixel_kp,
     }
 

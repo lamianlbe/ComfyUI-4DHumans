@@ -4,7 +4,7 @@ from PIL import Image
 from .draw_utils import draw_bodypose, draw_bodypose_with_feet, draw_handpose_lr, draw_handpose, draw_facepose, draw_bodypose_augmentation
 
 
-def draw_pose(pose, H, W, show_feet=False, show_body=True, show_hand=True, show_face=True, show_cheek=False, dw_bgr=False, dw_hand=False, aug_body_draw=False, optimized_face=False):
+def draw_pose(pose, H, W, show_feet=False, show_body=True, show_hand=True, show_face=True, show_cheek=False, dw_bgr=False, dw_hand=False, aug_body_draw=False, optimized_face=False, face_scale=1.0):
     final_canvas = np.zeros(shape=(H, W, 3), dtype=np.uint8)
     for i in range(len(pose["bodies"]["candidate"])):
         canvas = np.zeros(shape=(H, W, 3), dtype=np.uint8)
@@ -33,7 +33,7 @@ def draw_pose(pose, H, W, show_feet=False, show_body=True, show_hand=True, show_
             else:
                 canvas = draw_handpose(canvas, hands)
         if show_face:
-            canvas = draw_facepose(canvas, faces, optimized_face=optimized_face)
+            canvas = draw_facepose(canvas, faces, optimized_face=optimized_face, face_scale=face_scale)
         final_canvas = final_canvas + canvas
     return final_canvas
 
