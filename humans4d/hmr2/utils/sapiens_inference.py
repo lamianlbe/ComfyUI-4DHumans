@@ -206,51 +206,62 @@ _COCO_WB_LHAND_TO_SMPLESTX = [12] + list(range(25, 45))  # 21 joints
 _COCO_WB_RHAND_TO_SMPLESTX = [13] + list(range(45, 65))  # 21 joints
 
 
-def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, conf_thr=CONF_THRESHOLD):
+def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
+                          conf_thr=CONF_THRESHOLD, edge_margin=0.02):
     """
     Merge Sapiens 2D keypoints with SMPLest-X 2D projections.
 
-    For each COCO-WB keypoint where Sapiens confidence is below *conf_thr*,
-    substitute with the corresponding SMPLest-X projected 2D coordinate
-    (which comes from 3D model inference and can estimate off-screen joints).
+    A Sapiens keypoint is considered *unreliable* when:
+    - its confidence is below *conf_thr*, OR
+    - it falls within *edge_margin* (fraction) of the image boundary
+      (Sapiens heatmaps clamp off-screen joints to the edge with high conf).
+
+    Unreliable body/hand joints are replaced with SMPLest-X's 3D→2D projection.
 
     Parameters
     ----------
     sapiens_kp : ndarray (133, 3) – Sapiens pixel coords (x, y, confidence)
     sx_kp2d    : ndarray (137, 3) – SMPLest-X pixel coords (x, y, confidence)
-    conf_thr   : float – threshold below which Sapiens keypoints are replaced
+    img_h, img_w : image dimensions
+    conf_thr   : float – confidence threshold
+    edge_margin : float – fraction of image size to consider as edge zone
 
     Returns
     -------
     merged : ndarray (133, 3) – merged keypoints in COCO-WB format.
-        Confidence of substituted keypoints is set to half the threshold
-        to distinguish them from native Sapiens detections.
     """
     merged = sapiens_kp.copy()
-    sub_conf = conf_thr * 0.5  # mark substituted points
+
+    # Edge zone: keypoints within this margin of image boundary are suspect
+    mx = img_w * edge_margin
+    my = img_h * edge_margin
+
+    def _is_unreliable(idx):
+        x, y, c = merged[idx]
+        if c < conf_thr:
+            return True
+        # Near image boundary — likely clamped from off-screen
+        if x <= mx or x >= img_w - mx or y <= my or y >= img_h - my:
+            return True
+        return False
+
+    def _substitute(coco_idx, sx_idx):
+        if _is_unreliable(coco_idx) and sx_kp2d[sx_idx, 2] > 0:
+            merged[coco_idx, 0] = sx_kp2d[sx_idx, 0]
+            merged[coco_idx, 1] = sx_kp2d[sx_idx, 1]
+            merged[coco_idx, 2] = conf_thr  # just above threshold so it renders
 
     # Body joints (0-16)
     for coco_idx, sx_idx in _COCO_WB_BODY_TO_SMPLESTX.items():
-        if merged[coco_idx, 2] < conf_thr and sx_kp2d[sx_idx, 2] > 0:
-            merged[coco_idx, 0] = sx_kp2d[sx_idx, 0]
-            merged[coco_idx, 1] = sx_kp2d[sx_idx, 1]
-            merged[coco_idx, 2] = sub_conf
+        _substitute(coco_idx, sx_idx)
 
     # Left hand (COCO-WB 91-111)
     for i, sx_idx in enumerate(_COCO_WB_LHAND_TO_SMPLESTX):
-        coco_idx = 91 + i
-        if merged[coco_idx, 2] < conf_thr and sx_kp2d[sx_idx, 2] > 0:
-            merged[coco_idx, 0] = sx_kp2d[sx_idx, 0]
-            merged[coco_idx, 1] = sx_kp2d[sx_idx, 1]
-            merged[coco_idx, 2] = sub_conf
+        _substitute(91 + i, sx_idx)
 
     # Right hand (COCO-WB 112-132)
     for i, sx_idx in enumerate(_COCO_WB_RHAND_TO_SMPLESTX):
-        coco_idx = 112 + i
-        if merged[coco_idx, 2] < conf_thr and sx_kp2d[sx_idx, 2] > 0:
-            merged[coco_idx, 0] = sx_kp2d[sx_idx, 0]
-            merged[coco_idx, 1] = sx_kp2d[sx_idx, 1]
-            merged[coco_idx, 2] = sub_conf
+        _substitute(112 + i, sx_idx)
 
     # Face: skip fusion (Sapiens COCO-WB face is already high quality,
     # and SMPLest-X face uses FLAME ordering which needs complex mapping)

@@ -738,7 +738,8 @@ class PHALPPoseControlNetNode:
                                 smplestx["model"], smplestx["cfg"])
                             if sx_result is not None:
                                 raw_kp = fuse_sapiens_smplestx(
-                                    raw_kp, sx_result["kp2d"])
+                                    raw_kp, sx_result["kp2d"],
+                                    img_h, img_w)
 
                         if clip_boundary >= 0:
                             lo_x, hi_x = -clip_boundary, img_w + clip_boundary
