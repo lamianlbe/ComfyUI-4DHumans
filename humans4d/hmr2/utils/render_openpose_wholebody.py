@@ -134,7 +134,7 @@ def render_wholebody_openpose(img, keypoints, threshold=0.1):
             cv2.circle(img, _pt(j), hand_rad, (255, 0, 0), -1, cv2.LINE_AA)
 
     # ── Face ──────────────────────────────────────────────────────────────
-    face_rad = max(1, hand_rad // 2)
+    face_rad = max(1, hand_rad)
     for j in range(65, min(137, keypoints.shape[0])):
         if _valid(j):
             cv2.circle(img, _pt(j), face_rad, FACE_COLOR, -1, cv2.LINE_AA)
