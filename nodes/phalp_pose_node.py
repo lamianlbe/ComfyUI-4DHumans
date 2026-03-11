@@ -480,18 +480,20 @@ class PHALPPoseControlNetNode:
                         best_score = score
                         best_result = result
                 if best_result is not None:
-                    # Convert Goliath pixel keypoints to our flat 137 format
-                    kp137 = goliath_pixel_kp_to_flat137(best_result["pixel_kp"])
-                    # Apply clip_boundary
+                    raw_kp = best_result["pixel_kp"].copy()
+                    # COCO-WB (133) can be stored directly;
+                    # Goliath (308+) needs conversion to flat 137
+                    if raw_kp.shape[0] != 133:
+                        raw_kp = goliath_pixel_kp_to_flat137(raw_kp)
                     if clip_boundary >= 0:
                         lo_x, hi_x = -clip_boundary, img_w + clip_boundary
                         lo_y, hi_y = -clip_boundary, img_h + clip_boundary
                         oob = (
-                            (kp137[:, 0] < lo_x) | (kp137[:, 0] > hi_x) |
-                            (kp137[:, 1] < lo_y) | (kp137[:, 1] > hi_y)
+                            (raw_kp[:, 0] < lo_x) | (raw_kp[:, 0] > hi_x) |
+                            (raw_kp[:, 1] < lo_y) | (raw_kp[:, 1] > hi_y)
                         )
-                        kp137[oob, 2] = 0.0
-                    timeline[t] = kp137
+                        raw_kp[oob, 2] = 0.0
+                    timeline[t] = raw_kp
                     # No 3D data for Sapiens
 
             elif use_smplestx and "__smplestx" in snap:
@@ -727,8 +729,7 @@ class PHALPPoseControlNetNode:
                 if use_sapiens:
                     result = run_sapiens_on_bbox(img_np, whole_bbox, sapiens)
                     if result is not None:
-                        # Store raw Goliath pixel_kp (all 308+ keypoints)
-                        # so the renderer can draw all face points directly
+                        # Store raw pixel_kp (133 for COCO-WB, 308+ for Goliath)
                         raw_kp = result["pixel_kp"].copy()
                         if clip_boundary >= 0:
                             lo_x, hi_x = -clip_boundary, img_w + clip_boundary
@@ -951,10 +952,14 @@ class PHALPPoseControlNetNode:
                     if use_sapiens and "__sapiens" in frame_snap:
                         for _score, result in frame_snap["__sapiens"]:
                             if result is not None:
-                                kp137 = goliath_pixel_kp_to_flat137(
-                                    result["pixel_kp"])
+                                raw_kp = result["pixel_kp"]
+                                # COCO-WB (133) rendered directly;
+                                # Goliath needs flat137 conversion
+                                if raw_kp.shape[0] != 133:
+                                    raw_kp = goliath_pixel_kp_to_flat137(
+                                        raw_kp)
                                 canvas = self._render_kp(
-                                    canvas, kp137, False, use_sapiens=True)
+                                    canvas, raw_kp, False, use_sapiens=True)
                     elif use_smplestx and "__smplestx" in frame_snap:
                         for _score, result in frame_snap["__smplestx"]:
                             if result is not None:

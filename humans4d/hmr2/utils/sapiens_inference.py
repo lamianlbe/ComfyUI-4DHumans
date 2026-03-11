@@ -1,8 +1,12 @@
 """
-Sapiens Goliath pose estimation: inference + conversion to DWPose format.
+Sapiens pose estimation: inference + conversion to DWPose format.
 
-Goliath outputs 308 keypoints (body + hands + dense face).
-We convert them to DWPose-compatible dict format so that the existing
+Supports two Sapiens model variants:
+- **COCO-WholeBody** (133 keypoints): body 0-16, feet 17-22, face 23-90
+  (iBUG 68), left hand 91-111, right hand 112-132.  Recommended.
+- **Goliath** (308+ keypoints): complex layout requiring manual mapping.
+
+Both are converted to DWPose-compatible dict format so that the existing
 ``draw_pose()`` renderer (from ``scail/draw_pose_utils.py``) can be reused.
 """
 
@@ -374,7 +378,6 @@ def run_sapiens_on_bbox(img_np, bbox, sapiens_dict, bbox_expand=0.15):
     preprocessor = sapiens_dict["preprocessor"]
     device = sapiens_dict["device"]
     dtype = sapiens_dict["dtype"]
-    hm_w, hm_h = sapiens_dict["heatmap_size"]
 
     img_h, img_w = img_np.shape[:2]
     x1, y1, x2, y2 = map(int, bbox[:4])
@@ -418,21 +421,21 @@ def run_sapiens_on_bbox(img_np, bbox, sapiens_dict, bbox_expand=0.15):
     heatmaps = model(tensor).to(torch.float32)  # (1, K, hm_h, hm_w)
     heatmaps = heatmaps[0].cpu().numpy()         # (K, hm_h, hm_w)
 
-    num_kp = heatmaps.shape[0]
-    goliath_kp = np.zeros((num_kp, 3), dtype=np.float32)
+    num_kp, hm_h, hm_w = heatmaps.shape
+    heatmap_kp = np.zeros((num_kp, 3), dtype=np.float32)
     for i in range(num_kp):
         hm = heatmaps[i]
         y_hm, x_hm = np.unravel_index(np.argmax(hm), hm.shape)
-        goliath_kp[i] = (float(x_hm), float(y_hm), float(hm[y_hm, x_hm]))
+        heatmap_kp[i] = (float(x_hm), float(y_hm), float(hm[y_hm, x_hm]))
 
     # Scale heatmap coords to image pixel coords (relative to expanded bbox)
-    pixel_kp = np.zeros_like(goliath_kp)
-    pixel_kp[:, 0] = goliath_kp[:, 0] * eff_w / hm_w + eff_x1
-    pixel_kp[:, 1] = goliath_kp[:, 1] * eff_h / hm_h + eff_y1
-    pixel_kp[:, 2] = goliath_kp[:, 2]
+    pixel_kp = np.zeros_like(heatmap_kp)
+    pixel_kp[:, 0] = heatmap_kp[:, 0] * eff_w / hm_w + eff_x1
+    pixel_kp[:, 1] = heatmap_kp[:, 1] * eff_h / hm_h + eff_y1
+    pixel_kp[:, 2] = heatmap_kp[:, 2]
 
     return {
-        "goliath_kp": goliath_kp,
+        "goliath_kp": heatmap_kp,  # legacy key name
         "bbox": (max(0, ex1), max(0, ey1), min(img_w, ex2), min(img_h, ey2)),
         "pixel_kp": pixel_kp,
     }
@@ -500,6 +503,108 @@ def goliath_to_dwpose(pixel_kp, img_h, img_w, conf_thr=CONF_THRESHOLD):
         else:
             # Contour points (0-16) — not mapped, skip rendering
             face.append([-1.0, -1.0])
+
+    return {
+        "bodies": {
+            "candidate": [candidate],
+            "subset": [subset_row],
+        },
+        "faces": [face],
+        "hands": [left_hand, right_hand],
+    }
+
+
+# ---------------------------------------------------------------------------
+# COCO-WholeBody 133 → DWPose mapping
+# COCO-WB: 0-16 body (COCO-17), 17-22 feet, 23-90 face (iBUG 68),
+#           91-111 left hand (21), 112-132 right hand (21)
+# ---------------------------------------------------------------------------
+
+# COCO-17 body → DWPose-18 body (neck is synthesized)
+_COCO17_TO_DW18 = [
+    0,    # DW 0  = COCO 0  nose
+    None, # DW 1  = neck (synthesized from shoulders)
+    6,    # DW 2  = COCO 6  R_shoulder
+    8,    # DW 3  = COCO 8  R_elbow
+    10,   # DW 4  = COCO 10 R_wrist
+    5,    # DW 5  = COCO 5  L_shoulder
+    7,    # DW 6  = COCO 7  L_elbow
+    9,    # DW 7  = COCO 9  L_wrist
+    12,   # DW 8  = COCO 12 R_hip
+    14,   # DW 9  = COCO 14 R_knee
+    16,   # DW 10 = COCO 16 R_ankle
+    11,   # DW 11 = COCO 11 L_hip
+    13,   # DW 12 = COCO 13 L_knee
+    15,   # DW 13 = COCO 15 L_ankle
+    2,    # DW 14 = COCO 2  R_eye
+    1,    # DW 15 = COCO 1  L_eye
+    4,    # DW 16 = COCO 4  R_ear
+    3,    # DW 17 = COCO 3  L_ear
+]
+
+
+def coco_wb_to_dwpose(pixel_kp, img_h, img_w, conf_thr=CONF_THRESHOLD):
+    """
+    Convert COCO-WholeBody 133-keypoint pixel coords to DWPose dict format.
+
+    Parameters
+    ----------
+    pixel_kp : ndarray (133, 3) with (x, y, confidence) in image pixel coords
+    img_h, img_w : output image dimensions
+    conf_thr : minimum confidence threshold
+
+    Returns
+    -------
+    dict compatible with ``draw_pose()``:
+        bodies:  {candidate: [[18×2]], subset: [[18 indices]]}
+        faces:   [[68×2]]
+        hands:   [[21×2], [21×2]]  (left, right)
+    All coordinates are normalised to [0, 1].
+    """
+    def _get(idx):
+        if idx >= pixel_kp.shape[0]:
+            return -1.0, -1.0, 0.0
+        x, y, c = pixel_kp[idx]
+        if c < conf_thr:
+            return -1.0, -1.0, 0.0
+        return x / img_w, y / img_h, float(c)
+
+    # --- Body (DWPose 18) ---
+    candidate = []
+    subset_row = []
+    for dw_idx, coco_idx in enumerate(_COCO17_TO_DW18):
+        if coco_idx is None:
+            # Synthesize neck as midpoint of L_shoulder (5) and R_shoulder (6)
+            lx, ly, lc = _get(5)
+            rx, ry, rc = _get(6)
+            if lc >= conf_thr and rc >= conf_thr:
+                nx, ny = (lx + rx) / 2, (ly + ry) / 2
+                candidate.append([nx, ny])
+                subset_row.append(dw_idx)
+            else:
+                candidate.append([-1.0, -1.0])
+                subset_row.append(-1)
+        else:
+            nx, ny, c = _get(coco_idx)
+            candidate.append([nx, ny])
+            subset_row.append(dw_idx if c >= conf_thr else -1)
+
+    # --- Face (iBUG 68) — COCO-WB indices 23-90, already in iBUG order ---
+    face = []
+    for i in range(68):
+        nx, ny, c = _get(23 + i)
+        face.append([nx, ny])
+
+    # --- Hands (21 joints each) — already in standard order ---
+    left_hand = []
+    for i in range(21):
+        nx, ny, c = _get(91 + i)
+        left_hand.append([nx, ny])
+
+    right_hand = []
+    for i in range(21):
+        nx, ny, c = _get(112 + i)
+        right_hand.append([nx, ny])
 
     return {
         "bodies": {
