@@ -727,16 +727,18 @@ class PHALPPoseControlNetNode:
                 if use_sapiens:
                     result = run_sapiens_on_bbox(img_np, whole_bbox, sapiens)
                     if result is not None:
-                        kp137 = goliath_pixel_kp_to_flat137(result["pixel_kp"])
+                        # Store raw Goliath pixel_kp (all 308+ keypoints)
+                        # so the renderer can draw all face points directly
+                        raw_kp = result["pixel_kp"].copy()
                         if clip_boundary >= 0:
                             lo_x, hi_x = -clip_boundary, img_w + clip_boundary
                             lo_y, hi_y = -clip_boundary, img_h + clip_boundary
                             oob = (
-                                (kp137[:, 0] < lo_x) | (kp137[:, 0] > hi_x) |
-                                (kp137[:, 1] < lo_y) | (kp137[:, 1] > hi_y)
+                                (raw_kp[:, 0] < lo_x) | (raw_kp[:, 0] > hi_x) |
+                                (raw_kp[:, 1] < lo_y) | (raw_kp[:, 1] > hi_y)
                             )
-                            kp137[oob, 2] = 0.0
-                        timeline[t] = kp137
+                            raw_kp[oob, 2] = 0.0
+                        timeline[t] = raw_kp
                 elif use_smplestx:
                     result = _run_smplestx_on_bbox(
                         img_np, whole_bbox, smplestx["model"], smplestx["cfg"])
