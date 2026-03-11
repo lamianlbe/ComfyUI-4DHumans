@@ -37,8 +37,8 @@ def render_sapiens_dwpose(canvas, kp137_or_dwpose, img_h, img_w):
         show_body=True,
         show_hand=True,
         show_face=True,
-        optimized_face=True,
-        face_scale=1.5,
+        optimized_face=False,
+        face_scale=0.75,
     )
 
     # Overlay rendered skeleton onto canvas (non-zero pixels)
