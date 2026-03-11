@@ -159,6 +159,79 @@ def interpolate_timeline(timeline, timeline_3d=None, cfg=None):
             }
 
 
+def resample_keypoints(timeline, fps_in, target_fps=30.0):
+    """
+    Resample a single-person keypoint timeline from fps_in to target_fps
+    using linear interpolation between adjacent frames.
+
+    Parameters
+    ----------
+    timeline : list of (K, 3) arrays or None
+    fps_in : float
+    target_fps : float
+
+    Returns
+    -------
+    resampled : list of (K, 3) arrays or None
+    src_indices : list of int, nearest source frame index per output frame
+    """
+    n_in = len(timeline)
+    if n_in < 2:
+        return list(timeline), list(range(n_in))
+
+    duration = (n_in - 1) / fps_in
+    n_out = max(1, int(round(duration * target_fps)) + 1)
+
+    resampled = []
+    src_indices = []
+    for i in range(n_out):
+        t_sec = i / target_fps
+        t_in = t_sec * fps_in
+
+        j0 = min(int(t_in), n_in - 1)
+        j1 = min(j0 + 1, n_in - 1)
+        alpha = t_in - j0
+
+        src_indices.append(min(int(round(t_in)), n_in - 1))
+
+        if j0 == j1 or alpha < 1e-6:
+            resampled.append(
+                timeline[j0].copy() if timeline[j0] is not None else None)
+        elif timeline[j0] is not None and timeline[j1] is not None:
+            resampled.append(
+                timeline[j0] * (1 - alpha) + timeline[j1] * alpha)
+        elif timeline[j0] is not None:
+            resampled.append(timeline[j0].copy())
+        elif timeline[j1] is not None:
+            resampled.append(timeline[j1].copy())
+        else:
+            resampled.append(None)
+
+    return resampled, src_indices
+
+
+def compute_resampled_indices(n_in, fps_in, target_fps=30.0):
+    """
+    Compute nearest source frame indices for resampling from fps_in to
+    target_fps. Works for both upsampling and downsampling.
+
+    Returns list of source frame indices (length = output frame count).
+    """
+    if n_in < 2:
+        return list(range(n_in))
+
+    duration = (n_in - 1) / fps_in
+    n_out = max(1, int(round(duration * target_fps)) + 1)
+
+    indices = []
+    for i in range(n_out):
+        t_sec = i / target_fps
+        j = min(int(round(t_sec * fps_in)), n_in - 1)
+        indices.append(j)
+
+    return indices
+
+
 def fill_nearest(timeline):
     """Fill remaining None gaps with nearest-neighbour copy."""
     B = len(timeline)
