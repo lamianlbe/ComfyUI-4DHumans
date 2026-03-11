@@ -654,11 +654,13 @@ class PHALPPoseControlNetNode:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _render_kp(canvas, kp, use_wholebody, use_sapiens=False):
+    def _render_kp(canvas, kp, use_wholebody, use_sapiens=False,
+                   substituted=None):
         """Draw keypoints on canvas using the appropriate renderer."""
         if use_sapiens:
             H, W = canvas.shape[:2]
-            return render_sapiens_dwpose(canvas, kp, H, W)
+            return render_sapiens_dwpose(canvas, kp, H, W,
+                                         substituted=substituted)
         if use_wholebody:
             return render_wholebody_openpose(canvas, kp)
         return render_openpose(canvas, kp)
@@ -724,6 +726,7 @@ class PHALPPoseControlNetNode:
 
             timeline = [None] * B
             timeline_3d = [None] * B
+            timeline_sub = [None] * B  # substituted indices per frame
             for t in range(B):
                 img_np = (images_nchw[t].permute(1, 2, 0) * 255).byte().numpy()
                 if use_sapiens:
@@ -737,9 +740,10 @@ class PHALPPoseControlNetNode:
                                 img_np, whole_bbox,
                                 smplestx["model"], smplestx["cfg"])
                             if sx_result is not None:
-                                raw_kp = fuse_sapiens_smplestx(
+                                raw_kp, sub = fuse_sapiens_smplestx(
                                     raw_kp, sx_result["kp2d"],
                                     img_h, img_w)
+                                timeline_sub[t] = sub
 
                         if clip_boundary >= 0:
                             lo_x, hi_x = -clip_boundary, img_w + clip_boundary
@@ -819,9 +823,11 @@ class PHALPPoseControlNetNode:
                     else:
                         canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
                     if timeline[t] is not None:
+                        sub_t = timeline_sub[min(t, len(timeline_sub) - 1)] if use_3d_fallback else None
                         canvas = self._render_kp(
                             canvas, timeline[t], use_wholebody,
-                            use_sapiens=use_sapiens)
+                            use_sapiens=use_sapiens,
+                            substituted=sub_t)
                     pose_images.append(
                         torch.from_numpy(canvas.astype(np.float32) / 255.0))
                     pbar.update(1)

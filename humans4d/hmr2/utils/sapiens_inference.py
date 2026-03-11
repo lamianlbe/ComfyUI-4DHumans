@@ -245,9 +245,7 @@ def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
             return True
         return False
 
-    # Reasonable bounds: accept SMPLest-X points within 50% outside image
-    bound_lo_x, bound_hi_x = -img_w * 0.5, img_w * 1.5
-    bound_lo_y, bound_hi_y = -img_h * 0.5, img_h * 1.5
+    substituted = set()  # track which COCO-WB indices were substituted
 
     def _substitute(coco_idx, sx_idx):
         if not _is_unreliable(coco_idx):
@@ -255,12 +253,10 @@ def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
         sx, sy, sc = sx_kp2d[sx_idx]
         if sc <= 0:
             return
-        # Reject wildly out-of-range SMPLest-X predictions
-        if sx < bound_lo_x or sx > bound_hi_x or sy < bound_lo_y or sy > bound_hi_y:
-            return
         merged[coco_idx, 0] = sx
         merged[coco_idx, 1] = sy
         merged[coco_idx, 2] = conf_thr  # just above threshold so it renders
+        substituted.add(coco_idx)
 
     # Body joints (0-16)
     for coco_idx, sx_idx in _COCO_WB_BODY_TO_SMPLESTX.items():
@@ -277,4 +273,4 @@ def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
     # Face: skip fusion (Sapiens COCO-WB face is already high quality,
     # and SMPLest-X face uses FLAME ordering which needs complex mapping)
 
-    return merged
+    return merged, substituted
