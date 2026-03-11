@@ -293,12 +293,13 @@ _GOLIATH_TO_IBUG68 = {
     28: 73,   # midpoint_1_of_nose_bridge
     29: 74,   # midpoint_2_of_nose_bridge
     30: 72,   # tip_of_nose_bridge
-    # --- Nose bottom (31-35) left→right ---
-    31: 181,  # l_outer_corner_of_nose
-    32: 185,  # inner_corner_of_l_nostril
+    # --- Nose bottom (31-35) subject's right → left ---
+    # iBUG convention: 31=subject's right, 35=subject's left
+    31: 180,  # r_outer_corner_of_nose
+    32: 182,  # inner_corner_of_r_nostril
     33: 178,  # tip_of_nose
-    34: 182,  # inner_corner_of_r_nostril
-    35: 180,  # r_outer_corner_of_nose
+    34: 185,  # inner_corner_of_l_nostril
+    35: 181,  # l_outer_corner_of_nose
     # --- Right eye (36-41) clockwise from inner corner ---
     36: 120,  # r_inner_end_of_upper_lash_line
     37: 124,  # r_midpoint_2_of_upper_lash_line
@@ -314,18 +315,20 @@ _GOLIATH_TO_IBUG68 = {
     46: 150,  # l_midpoint_5_of_lower_lash_line
     47: 147,  # l_midpoint_2_of_lower_lash_line
     # --- Outer mouth (48-59) clockwise from right corner ---
+    # Goliath convention: odd midpoints=right side, even=left side
+    # Pairs (1,2)=near corners, (3,4)=middle, (5,6)=near center
     48: 188,  # r_outer_corner_of_mouth
-    49: 192,  # midpoint_1_of_upper_outer_lip
-    50: 196,  # midpoint_3_of_upper_outer_lip
+    49: 192,  # midpoint_1_of_upper_outer_lip (right, near corner)
+    50: 196,  # midpoint_3_of_upper_outer_lip (right, near center)
     51: 190,  # center_of_cupid_bow
-    52: 198,  # midpoint_5_of_upper_outer_lip
-    53: 193,  # midpoint_2_of_upper_outer_lip
+    52: 197,  # midpoint_4_of_upper_outer_lip (left, near center)
+    53: 193,  # midpoint_2_of_upper_outer_lip (left, near corner)
     54: 189,  # l_outer_corner_of_mouth
-    55: 195,  # midpoint_2_of_lower_outer_lip
-    56: 202,  # midpoint_5_of_lower_outer_lip
+    55: 195,  # midpoint_2_of_lower_outer_lip (left, near corner)
+    56: 201,  # midpoint_4_of_lower_outer_lip (left, near center)
     57: 191,  # center_of_lower_outer_lip
-    58: 200,  # midpoint_3_of_lower_outer_lip
-    59: 194,  # midpoint_1_of_lower_outer_lip
+    58: 200,  # midpoint_3_of_lower_outer_lip (right, near center)
+    59: 194,  # midpoint_1_of_lower_outer_lip (right, near corner)
     # --- Inner mouth (60-67) clockwise from right corner ---
     60: 204,  # r_inner_corner_of_mouth
     61: 208,  # midpoint_1_of_upper_inner_lip

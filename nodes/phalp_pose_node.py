@@ -255,7 +255,6 @@ class PHALPPoseControlNetNode:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "phalp": ("PHALP",),
                 "single_person_mode": (
                     "BOOLEAN",
                     {
@@ -354,6 +353,7 @@ class PHALPPoseControlNetNode:
                 ),
             },
             "optional": {
+                "phalp": ("PHALP",),
                 "smplestx": ("SMPLESTX",),
                 "sapiens": ("SAPIENS",),
             },
@@ -668,14 +668,9 @@ class PHALPPoseControlNetNode:
     # main entry point
     # ------------------------------------------------------------------
 
-    def render_pose(self, images, phalp, single_person_mode, clip_boundary,
+    def render_pose(self, images, single_person_mode, clip_boundary,
                     smooth_sigma, debug, double_frame, scail_pose=False,
-                    pose_model="sapiens", smplestx=None, sapiens=None):
-        if not _ensure_phalp_importable():
-            raise RuntimeError("phalp package not found. See 'Load PHALP' node.")
-
-        tracker = phalp["tracker"]
-        tracker.setup_deepsort()
+                    pose_model="sapiens", phalp=None, smplestx=None, sapiens=None):
 
         # Determine which pose model to use
         use_smplestx = False
@@ -700,6 +695,18 @@ class PHALPPoseControlNetNode:
         use_wholebody = use_smplestx  # SMPLest-X 137 → wholebody renderer
         # Sapiens uses its own DWPose-style renderer
 
+        # In single-person mode with a pose model, skip PHALP entirely
+        skip_phalp = (single_person_mode
+                      and (use_sapiens or use_smplestx))
+
+        # Validate PHALP is available when needed
+        if not skip_phalp and phalp is None:
+            raise RuntimeError(
+                "PHALP model is required for multi-person mode or when no "
+                "pose model (sapiens/smplestx) is connected. "
+                "Please connect a 'Load PHALP' node."
+            )
+
         images_nchw = images.permute(0, 3, 1, 2)   # (B, C, H, W)
         B, C, img_h, img_w = images_nchw.shape
 
@@ -707,6 +714,113 @@ class PHALPPoseControlNetNode:
         left         = (new_size - img_w) // 2
         top          = (new_size - img_h) // 2
         measurements = [img_h, img_w, new_size, left, top]
+
+        # ── Fast path: single-person without PHALP ────────────────────
+        if skip_phalp:
+            pbar = comfy.utils.ProgressBar(2 * B)
+            whole_bbox = np.array([0, 0, img_w, img_h], dtype=np.float32)
+
+            timeline = [None] * B
+            timeline_3d = [None] * B
+            for t in range(B):
+                img_np = (images_nchw[t].permute(1, 2, 0) * 255).byte().numpy()
+                if use_sapiens:
+                    result = run_sapiens_on_bbox(img_np, whole_bbox, sapiens)
+                    if result is not None:
+                        kp137 = goliath_pixel_kp_to_flat137(result["pixel_kp"])
+                        if clip_boundary >= 0:
+                            lo_x, hi_x = -clip_boundary, img_w + clip_boundary
+                            lo_y, hi_y = -clip_boundary, img_h + clip_boundary
+                            oob = (
+                                (kp137[:, 0] < lo_x) | (kp137[:, 0] > hi_x) |
+                                (kp137[:, 1] < lo_y) | (kp137[:, 1] > hi_y)
+                            )
+                            kp137[oob, 2] = 0.0
+                        timeline[t] = kp137
+                elif use_smplestx:
+                    result = _run_smplestx_on_bbox(
+                        img_np, whole_bbox, smplestx["model"], smplestx["cfg"])
+                    if result is not None:
+                        best_kp = result["kp2d"].copy()
+                        if clip_boundary >= 0:
+                            lo_x, hi_x = -clip_boundary, img_w + clip_boundary
+                            lo_y, hi_y = -clip_boundary, img_h + clip_boundary
+                            oob = (
+                                (best_kp[:, 0] < lo_x) | (best_kp[:, 0] > hi_x) |
+                                (best_kp[:, 1] < lo_y) | (best_kp[:, 1] > hi_y)
+                            )
+                            best_kp[oob, 2] = 0.0
+                        timeline[t] = best_kp
+                        timeline_3d[t] = {
+                            "joint_cam": result["joint_cam"],
+                            "root_cam": result["root_cam"],
+                            "inv_trans": result["inv_trans"],
+                        }
+                pbar.update(1)
+
+            sx_cfg = smplestx["cfg"] if use_smplestx else None
+            if smooth_sigma > 0:
+                self._smooth_timeline(timeline, smooth_sigma,
+                                      timeline_3d=timeline_3d, cfg=sx_cfg)
+            self._interpolate_timeline(timeline,
+                                       timeline_3d=timeline_3d, cfg=sx_cfg)
+            self._fill_nearest(timeline)
+
+            if double_frame:
+                timeline = _double_frames_kp(timeline)
+
+            # Render
+            if scail_pose and use_wholebody:
+                tl_3d_for_render = timeline_3d
+                if double_frame and timeline_3d is not None:
+                    tl_3d_doubled = []
+                    for t in range(len(timeline)):
+                        src_t = min(t // 2, len(timeline_3d) - 1)
+                        tl_3d_doubled.append(timeline_3d[src_t])
+                    tl_3d_for_render = tl_3d_doubled
+                scail_frames = render_scail_pose_batch(
+                    timeline, tl_3d_for_render, img_h, img_w, cfg=sx_cfg)
+                pose_images = []
+                n_out = len(timeline)
+                for t in range(n_out):
+                    if debug:
+                        src_t = min(t * B // n_out, B - 1) if double_frame else t
+                        bg = (images_nchw[src_t].permute(1, 2, 0) * 255).byte().numpy()
+                        canvas = bg.copy()
+                        scail_img = scail_frames[t]
+                        mask = scail_img > 0
+                        canvas[mask] = scail_img[mask]
+                    else:
+                        canvas = scail_frames[t]
+                    pose_images.append(
+                        torch.from_numpy(canvas.astype(np.float32) / 255.0))
+                    pbar.update(1)
+            else:
+                pose_images = []
+                n_out = len(timeline)
+                for t in range(n_out):
+                    if debug:
+                        src_t = min(t * B // n_out, B - 1) if double_frame else t
+                        bg = (images_nchw[src_t].permute(1, 2, 0) * 255).byte().numpy()
+                        canvas = bg.copy()
+                    else:
+                        canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+                    if timeline[t] is not None:
+                        canvas = self._render_kp(
+                            canvas, timeline[t], use_wholebody,
+                            use_sapiens=use_sapiens)
+                    pose_images.append(
+                        torch.from_numpy(canvas.astype(np.float32) / 255.0))
+                    pbar.update(1)
+
+            return (torch.stack(pose_images),)
+
+        # ── Standard path: use PHALP tracking ─────────────────────────
+        if not _ensure_phalp_importable():
+            raise RuntimeError("phalp package not found. See 'Load PHALP' node.")
+
+        tracker = phalp["tracker"]
+        tracker.setup_deepsort()
 
         # single_person_mode → draw_predicted=True, interpolate_missing=True
         # multi-person       → draw_predicted=False, interpolate_missing=False
