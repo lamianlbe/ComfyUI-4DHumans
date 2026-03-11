@@ -9,8 +9,12 @@ Converts to DWPose-compatible dict format so that the existing
 ``draw_pose()`` renderer (from ``scail/draw_pose_utils.py``) can be reused.
 """
 
+import logging
+
 import numpy as np
 import torch
+
+_logger = logging.getLogger(__name__)
 
 # Minimum confidence to consider a keypoint valid
 CONF_THRESHOLD = 0.3
@@ -207,7 +211,8 @@ _COCO_WB_RHAND_TO_SMPLESTX = [13] + list(range(45, 65))  # 21 joints
 
 
 def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
-                          conf_thr=CONF_THRESHOLD, edge_margin=0.02):
+                          conf_thr=CONF_THRESHOLD, edge_margin=0.02,
+                          outlier_fraction=0.15, frame_idx=None):
     """
     Merge Sapiens 2D keypoints with SMPLest-X 2D projections.
 
@@ -216,7 +221,12 @@ def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
     - it falls within *edge_margin* (fraction) of the image boundary
       (Sapiens heatmaps clamp off-screen joints to the edge with high conf).
 
-    Unreliable body/hand joints are replaced with SMPLest-X's 3D→2D projection.
+    Additionally, a Sapiens keypoint is considered an *outlier* when its
+    distance from the corresponding SMPLest-X prediction exceeds
+    *outlier_fraction* of the image diagonal.
+
+    Unreliable/outlier body/hand joints are replaced with SMPLest-X's
+    3D→2D projection.
 
     Parameters
     ----------
@@ -225,16 +235,23 @@ def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
     img_h, img_w : image dimensions
     conf_thr   : float – confidence threshold
     edge_margin : float – fraction of image size to consider as edge zone
+    outlier_fraction : float – max allowed distance as fraction of image diagonal
+    frame_idx  : int or None – frame number for logging
 
     Returns
     -------
     merged : ndarray (133, 3) – merged keypoints in COCO-WB format.
+    substituted : set – COCO-WB indices that were replaced.
     """
     merged = sapiens_kp.copy()
 
     # Edge zone: keypoints within this margin of image boundary are suspect
     mx = img_w * edge_margin
     my = img_h * edge_margin
+
+    # Outlier distance threshold (pixels)
+    diag = np.sqrt(img_h ** 2 + img_w ** 2)
+    outlier_dist = diag * outlier_fraction
 
     def _is_unreliable(idx):
         x, y, c = merged[idx]
@@ -245,13 +262,36 @@ def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
             return True
         return False
 
+    def _is_outlier(coco_idx, sx_idx):
+        """Check if Sapiens keypoint is too far from SMPLest-X prediction."""
+        sx, sy, sc = sx_kp2d[sx_idx]
+        if sc <= 0:
+            return False  # no SMPLest-X reference to compare against
+        sap_x, sap_y, sap_c = sapiens_kp[coco_idx]
+        if sap_c < conf_thr:
+            return False  # already unreliable, will be handled by _substitute
+        dist = np.sqrt((sap_x - sx) ** 2 + (sap_y - sy) ** 2)
+        if dist > outlier_dist:
+            frame_str = f"frame {frame_idx}" if frame_idx is not None else "frame ?"
+            _logger.warning(
+                "Sapiens outlier rejected: %s, kp=%d, conf=%.3f, "
+                "sapiens=(%.1f, %.1f), smplestx=(%.1f, %.1f), dist=%.1f",
+                frame_str, coco_idx, sap_c, sap_x, sap_y, sx, sy, dist)
+            return True
+        return False
+
     substituted = set()  # track which COCO-WB indices were substituted
 
     def _substitute(coco_idx, sx_idx):
-        if not _is_unreliable(coco_idx):
+        unreliable = _is_unreliable(coco_idx)
+        outlier = (not unreliable) and _is_outlier(coco_idx, sx_idx)
+        if not unreliable and not outlier:
             return
         sx, sy, sc = sx_kp2d[sx_idx]
         if sc <= 0:
+            if outlier:
+                # No SMPLest-X fallback — zero out the outlier keypoint
+                merged[coco_idx, 2] = 0.0
             return
         merged[coco_idx, 0] = sx
         merged[coco_idx, 1] = sy

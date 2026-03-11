@@ -742,7 +742,7 @@ class PHALPPoseControlNetNode:
                             if sx_result is not None:
                                 raw_kp, sub = fuse_sapiens_smplestx(
                                     raw_kp, sx_result["kp2d"],
-                                    img_h, img_w)
+                                    img_h, img_w, frame_idx=t)
                                 timeline_sub[t] = sub
 
                         if clip_boundary >= 0:
