@@ -212,7 +212,7 @@ _COCO_WB_RHAND_TO_SMPLESTX = [13] + list(range(45, 65))  # 21 joints
 
 def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
                           conf_thr=CONF_THRESHOLD, edge_margin=0.02,
-                          outlier_fraction=0.15, frame_idx=None):
+                          outlier_fraction=0.25, frame_idx=None):
     """
     Merge Sapiens 2D keypoints with SMPLest-X 2D projections.
 
@@ -280,6 +280,13 @@ def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
             return True
         return False
 
+    def _sx_is_onscreen(sx_idx):
+        """Check if SMPLest-X keypoint is within the image bounds."""
+        sx, sy, sc = sx_kp2d[sx_idx]
+        if sc <= 0:
+            return False
+        return 0 <= sx < img_w and 0 <= sy < img_h
+
     substituted = set()  # track which COCO-WB indices were substituted
 
     def _substitute(coco_idx, sx_idx):
@@ -287,15 +294,34 @@ def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
         outlier = (not unreliable) and _is_outlier(coco_idx, sx_idx)
         if not unreliable and not outlier:
             return
+
         sx, sy, sc = sx_kp2d[sx_idx]
-        if sc <= 0:
-            if outlier:
-                # No SMPLest-X fallback — zero out the outlier keypoint
+
+        if outlier:
+            # Sapiens outlier: replace with SMPLest-X if available, else zero
+            if sc <= 0:
                 merged[coco_idx, 2] = 0.0
+                return
+            merged[coco_idx, 0] = sx
+            merged[coco_idx, 1] = sy
+            merged[coco_idx, 2] = conf_thr
+            substituted.add(coco_idx)
+            return
+
+        # Sapiens unreliable (low conf / edge-clamped):
+        # If SMPLest-X says the point is on-screen, it's likely occluded
+        # in 2D — don't draw it at all.
+        if _sx_is_onscreen(sx_idx):
+            merged[coco_idx, 2] = 0.0
+            return
+
+        # SMPLest-X also off-screen or unavailable — use SMPLest-X coords
+        # (limb extends beyond frame edge)
+        if sc <= 0:
             return
         merged[coco_idx, 0] = sx
         merged[coco_idx, 1] = sy
-        merged[coco_idx, 2] = conf_thr  # just above threshold so it renders
+        merged[coco_idx, 2] = conf_thr
         substituted.add(coco_idx)
 
     # Body joints (0-16)
