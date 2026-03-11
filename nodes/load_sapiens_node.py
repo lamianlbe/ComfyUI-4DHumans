@@ -88,15 +88,25 @@ class LoadSapiensNode:
         device = comfy.model_management.get_torch_device()
         torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float32
 
-        is_torchscript = path.endswith(".pt2") or "torchscript" in path
-        if is_torchscript:
-            model = torch.jit.load(path)
-            model.eval()
-            model.to(device).to(torch_dtype)
-        else:
-            model = torch.load(path, map_location="cpu")
-            model.eval()
-            model.to(device).to(torch_dtype)
+        # Try TorchScript first (works for .pt2 and many .pth files)
+        model = None
+        try:
+            model = torch.jit.load(path, map_location="cpu")
+            _logger.info("Loaded as TorchScript: %s", checkpoint)
+        except Exception:
+            obj = torch.load(path, map_location="cpu", weights_only=False)
+            if isinstance(obj, dict):
+                raise RuntimeError(
+                    f"'{checkpoint}' is a state-dict / checkpoint, not a "
+                    f"loadable model. Please use the TorchScript (.pt2) "
+                    f"version instead, or export with: "
+                    f"torch.jit.save(torch.jit.trace(model, dummy), path)"
+                )
+            model = obj
+            _logger.info("Loaded as nn.Module: %s", checkpoint)
+
+        model.eval()
+        model.to(device).to(torch_dtype)
 
         preprocessor = _build_preprocessor()
 
