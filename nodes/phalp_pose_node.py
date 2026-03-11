@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import torch
 import comfy.model_management
@@ -6,6 +7,12 @@ import comfy.utils
 from ..humans4d.hmr2.utils.render_openpose import render_openpose
 from ..humans4d.hmr2.utils.render_openpose_wholebody import render_wholebody_openpose
 from ..humans4d.hmr2.utils.render_openpose_scail import render_scail_pose_batch
+from ..humans4d.hmr2.utils.render_sapiens import render_sapiens_dwpose
+from ..humans4d.hmr2.utils.sapiens_inference import (
+    run_sapiens_on_bbox,
+    goliath_pixel_kp_to_flat137,
+    flat137_to_dwpose,
+)
 from .load_phalp_node import _ensure_phalp_importable
 
 
@@ -330,9 +337,25 @@ class PHALPPoseControlNetNode:
                         ),
                     },
                 ),
+                "pose_model": (
+                    ["sapiens", "smplestx"],
+                    {
+                        "default": "sapiens",
+                        "tooltip": (
+                            "Which pose estimation model to use.\n"
+                            "• sapiens: Goliath 308-joint whole-body via Sapiens "
+                            "(body + hands + face). Best 2D accuracy. "
+                            "Requires the Sapiens model to be loaded and connected.\n"
+                            "• smplestx: 137-joint whole-body via SMPLest-X "
+                            "(body + hands + face). Required for SCAIL 3D rendering. "
+                            "Requires the SMPLest-X model to be loaded and connected."
+                        ),
+                    },
+                ),
             },
             "optional": {
                 "smplestx": ("SMPLESTX",),
+                "sapiens": ("SAPIENS",),
             },
         }
 
@@ -346,14 +369,15 @@ class PHALPPoseControlNetNode:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _run_tracking(tracker, images_nchw, measurements, smplestx=None, pbar=None):
+    def _run_tracking(tracker, images_nchw, measurements,
+                      smplestx=None, sapiens=None, pbar=None):
         """
-        Run PHALP tracking on all frames.  Optionally run SMPLest-X on each
-        detection to produce 137-joint keypoints per frame.
+        Run PHALP tracking on all frames.  Optionally run SMPLest-X or
+        Sapiens pose estimation on each detection.
 
-        Returns a list of per-frame snapshot dicts.  When smplestx is provided
-        each snapshot also contains a ``"__smplestx"`` key with a list of
-        ``(score, result)`` tuples — one per detection.
+        Returns a list of per-frame snapshot dicts.  When a pose model is
+        active each snapshot also contains a ``"__smplestx"`` or
+        ``"__sapiens"`` key with a list of ``(score, result)`` tuples.
         """
         snapshots = []
         for t, img_tensor in enumerate(images_nchw):
@@ -377,6 +401,16 @@ class PHALPPoseControlNetNode:
                     )
                     score = float(pred_scores[i]) if i < len(pred_scores) else 0.0
                     frame_smplestx.append((score, result))
+
+            # ── Optional Sapiens inference on each detected bbox ──────────
+            frame_sapiens = []
+            if sapiens is not None and len(pred_bbox) > 0:
+                for i in range(len(pred_bbox)):
+                    result = run_sapiens_on_bbox(
+                        img_np, pred_bbox[i], sapiens,
+                    )
+                    score = float(pred_scores[i]) if i < len(pred_scores) else 0.0
+                    frame_sapiens.append((score, result))
 
             extra_data = tracker.run_additional_models(
                 img_np, pred_bbox, pred_masks, pred_scores,
@@ -403,6 +437,8 @@ class PHALPPoseControlNetNode:
 
             if frame_smplestx:
                 frame_snap["__smplestx"] = frame_smplestx
+            if frame_sapiens:
+                frame_snap["__sapiens"] = frame_sapiens
 
             snapshots.append(frame_snap)
             if pbar is not None:
@@ -417,16 +453,16 @@ class PHALPPoseControlNetNode:
     @staticmethod
     def _build_single_person_timeline(snapshots, eventually_confirmed,
                                       img_h, img_w, clip_boundary,
-                                      use_smplestx=False):
+                                      use_smplestx=False, use_sapiens=False):
         """
         Build a per-frame keypoint timeline for single-person mode.
 
-        When *use_smplestx* is True, uses the highest-scoring SMPLest-X
-        detection per frame (137 joints) instead of PHALP's 25-joint output.
+        Uses the highest-scoring detection per frame from whichever model
+        is active (Sapiens, SMPLest-X, or PHALP body-only fallback).
 
         Returns (timeline, timeline_3d):
-            timeline   : list of (137,3) or (25,3) 2D keypoints (or None)
-            timeline_3d: list of dicts {"joint_cam": (137,3), "inv_trans": (2,3)} or None
+            timeline   : list of (K,3) 2D keypoints (or None)
+            timeline_3d: list of dicts or None (only for SMPLest-X)
         """
         B = len(snapshots)
         timeline = [None] * B
@@ -435,7 +471,30 @@ class PHALPPoseControlNetNode:
         for t in range(B):
             snap = snapshots[t]
 
-            if use_smplestx and "__smplestx" in snap:
+            if use_sapiens and "__sapiens" in snap:
+                # Pick the highest-confidence Sapiens detection
+                best_result = None
+                best_score = -1.0
+                for score, result in snap["__sapiens"]:
+                    if result is not None and score > best_score:
+                        best_score = score
+                        best_result = result
+                if best_result is not None:
+                    # Convert Goliath pixel keypoints to our flat 137 format
+                    kp137 = goliath_pixel_kp_to_flat137(best_result["pixel_kp"])
+                    # Apply clip_boundary
+                    if clip_boundary >= 0:
+                        lo_x, hi_x = -clip_boundary, img_w + clip_boundary
+                        lo_y, hi_y = -clip_boundary, img_h + clip_boundary
+                        oob = (
+                            (kp137[:, 0] < lo_x) | (kp137[:, 0] > hi_x) |
+                            (kp137[:, 1] < lo_y) | (kp137[:, 1] > hi_y)
+                        )
+                        kp137[oob, 2] = 0.0
+                    timeline[t] = kp137
+                    # No 3D data for Sapiens
+
+            elif use_smplestx and "__smplestx" in snap:
                 # Pick the highest-confidence detection's SMPLest-X result
                 best_result = None
                 best_score = -1.0
@@ -467,7 +526,7 @@ class PHALPPoseControlNetNode:
 
                 for tid, tdata in snap.items():
                     if isinstance(tid, str):
-                        continue  # skip __smplestx key
+                        continue
                     if not tdata["is_confirmed"] and tid not in eventually_confirmed:
                         continue
                     if tdata["joints_2d"] is None:
@@ -596,8 +655,11 @@ class PHALPPoseControlNetNode:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _render_kp(canvas, kp, use_wholebody):
+    def _render_kp(canvas, kp, use_wholebody, use_sapiens=False):
         """Draw keypoints on canvas using the appropriate renderer."""
+        if use_sapiens:
+            H, W = canvas.shape[:2]
+            return render_sapiens_dwpose(canvas, kp, H, W)
         if use_wholebody:
             return render_wholebody_openpose(canvas, kp)
         return render_openpose(canvas, kp)
@@ -608,15 +670,35 @@ class PHALPPoseControlNetNode:
 
     def render_pose(self, images, phalp, single_person_mode, clip_boundary,
                     smooth_sigma, debug, double_frame, scail_pose=False,
-                    smplestx=None):
+                    pose_model="sapiens", smplestx=None, sapiens=None):
         if not _ensure_phalp_importable():
             raise RuntimeError("phalp package not found. See 'Load PHALP' node.")
 
         tracker = phalp["tracker"]
         tracker.setup_deepsort()
 
-        use_smplestx = smplestx is not None
-        use_wholebody = use_smplestx  # 137 joints → wholebody renderer
+        # Determine which pose model to use
+        use_smplestx = False
+        use_sapiens = False
+        if pose_model == "sapiens":
+            if sapiens is not None:
+                use_sapiens = True
+            else:
+                logging.warning(
+                    "pose_model='sapiens' but no Sapiens model connected. "
+                    "Falling back to PHALP body-only 25 joints."
+                )
+        elif pose_model == "smplestx":
+            if smplestx is not None:
+                use_smplestx = True
+            else:
+                logging.warning(
+                    "pose_model='smplestx' but no SMPLest-X model connected. "
+                    "Falling back to PHALP body-only 25 joints."
+                )
+
+        use_wholebody = use_smplestx  # SMPLest-X 137 → wholebody renderer
+        # Sapiens uses its own DWPose-style renderer
 
         images_nchw = images.permute(0, 3, 1, 2)   # (B, C, H, W)
         B, C, img_h, img_w = images_nchw.shape
@@ -631,8 +713,9 @@ class PHALPPoseControlNetNode:
         draw_predicted     = single_person_mode
         interpolate_missing = single_person_mode
 
-        # Always use two-pass when smoothing, single-person, or SMPLest-X
-        use_two_pass = single_person_mode or smooth_sigma > 0 or use_smplestx
+        # Always use two-pass when smoothing, single-person, or external model
+        use_two_pass = (single_person_mode or smooth_sigma > 0
+                        or use_smplestx or use_sapiens)
 
         # Progress: tracking frames + rendering frames
         pbar = comfy.utils.ProgressBar(2 * B if use_two_pass else B)
@@ -641,7 +724,8 @@ class PHALPPoseControlNetNode:
             # ── Pass 1: full tracking ──────────────────────────────────
             snapshots = self._run_tracking(
                 tracker, images_nchw, measurements,
-                smplestx=smplestx,
+                smplestx=smplestx if use_smplestx else None,
+                sapiens=sapiens if use_sapiens else None,
                 pbar=pbar,
             )
 
@@ -658,6 +742,7 @@ class PHALPPoseControlNetNode:
                     snapshots, eventually_confirmed,
                     img_h, img_w, clip_boundary,
                     use_smplestx=use_smplestx,
+                    use_sapiens=use_sapiens,
                 )
 
                 sx_cfg = smplestx["cfg"] if use_smplestx else None
@@ -720,7 +805,10 @@ class PHALPPoseControlNetNode:
                             canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
 
                         if timeline[t] is not None:
-                            canvas = self._render_kp(canvas, timeline[t], use_wholebody)
+                            canvas = self._render_kp(
+                                canvas, timeline[t], use_wholebody,
+                                use_sapiens=use_sapiens,
+                            )
 
                         pose_images.append(
                             torch.from_numpy(canvas.astype(np.float32) / 255.0)
@@ -743,8 +831,15 @@ class PHALPPoseControlNetNode:
                     else:
                         canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
 
-                    # If SMPLest-X is active, draw all detections' wholebody poses
-                    if use_smplestx and "__smplestx" in frame_snap:
+                    # Draw all detections from the active pose model
+                    if use_sapiens and "__sapiens" in frame_snap:
+                        for _score, result in frame_snap["__sapiens"]:
+                            if result is not None:
+                                kp137 = goliath_pixel_kp_to_flat137(
+                                    result["pixel_kp"])
+                                canvas = self._render_kp(
+                                    canvas, kp137, False, use_sapiens=True)
+                    elif use_smplestx and "__smplestx" in frame_snap:
                         for _score, result in frame_snap["__smplestx"]:
                             if result is not None:
                                 canvas = self._render_kp(
