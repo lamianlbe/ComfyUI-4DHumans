@@ -16,7 +16,9 @@ from .nodes.load_phalp_node import LoadPHALPNode
 from .nodes.phalp_pose_node import PHALPPoseControlNetNode
 from .nodes.load_smplestx_node import LoadSMPLestXNode
 from .nodes.load_sapiens_node import LoadSapiensNode
-# from .nodes.select_human_node import SelectHumanNode
+from .nodes.sapiens_single_pose_node import SapiensSinglePoseNode
+from .nodes.sapiens_multi_pose_node import SapiensMultiPoseNode
+from .nodes.smplestx_pose_node import SMPLestXPoseNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -28,7 +30,9 @@ NODE_CLASS_MAPPINGS = {
     'PHALPPoseControlNet': PHALPPoseControlNetNode,
     'LoadSMPLestX': LoadSMPLestXNode,
     'LoadSapiens': LoadSapiensNode,
-    # 'SelectHuman': SelectHumanNode,
+    'SapiensSinglePose': SapiensSinglePoseNode,
+    'SapiensMultiPose': SapiensMultiPoseNode,
+    'SMPLestXPose': SMPLestXPoseNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -40,5 +44,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'PHALPPoseControlNet': '4D Human Pose Tracking (ControlNet)',
     'LoadSMPLestX': 'Load SMPLest-X',
     'LoadSapiens': 'Load Sapiens Pose',
-    # 'SelectHuman': 'Select 4D Human'
+    'SapiensSinglePose': 'Sapiens Single Person Pose Tracking',
+    'SapiensMultiPose': 'Sapiens Multiple Person Pose Tracking',
+    'SMPLestXPose': 'SMPLest-X Human Pose Tracking',
 }
