@@ -100,7 +100,8 @@ class SapiensSinglePoseNode:
                     if sx_result is not None:
                         raw_kp, sub = fuse_sapiens_smplestx(
                             raw_kp, sx_result["kp2d"],
-                            img_h, img_w, frame_idx=t)
+                            img_h, img_w, frame_idx=t,
+                            debug=debug)
 
                 timeline[t] = raw_kp
                 timeline_sub[t] = sub
@@ -129,7 +130,7 @@ class SapiensSinglePoseNode:
             if timeline[t] is not None:
                 canvas = render_sapiens_dwpose(
                     canvas, timeline[t], img_h, img_w,
-                    substituted=timeline_sub[t])
+                    substituted=timeline_sub[t], debug=debug)
 
             pose_images.append(
                 torch.from_numpy(canvas.astype(np.float32) / 255.0))

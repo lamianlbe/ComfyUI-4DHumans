@@ -12,7 +12,8 @@ from .sapiens_inference import coco_wb_to_dwpose
 from .scail.draw_pose_utils import draw_pose
 
 
-def render_sapiens_dwpose(canvas, kp_data, img_h, img_w, substituted=None):
+def render_sapiens_dwpose(canvas, kp_data, img_h, img_w, substituted=None,
+                          debug=False):
     """
     Render a single person's Sapiens keypoints on *canvas*.
 
@@ -49,7 +50,7 @@ def render_sapiens_dwpose(canvas, kp_data, img_h, img_w, substituted=None):
     canvas[mask] = rendered[mask]
 
     # Debug: draw large white dots for SMPLest-X substituted points
-    if substituted and not isinstance(kp_data, dict):
+    if debug and substituted and not isinstance(kp_data, dict):
         radius = max(int(min(img_h, img_w) / 80), 4)
         for idx in substituted:
             x, y = int(kp_data[idx, 0]), int(kp_data[idx, 1])

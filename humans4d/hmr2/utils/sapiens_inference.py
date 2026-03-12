@@ -212,7 +212,8 @@ _COCO_WB_RHAND_TO_SMPLESTX = [13] + list(range(45, 65))  # 21 joints
 
 def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
                           conf_thr=CONF_THRESHOLD, edge_margin=0.02,
-                          outlier_fraction=0.25, frame_idx=None):
+                          outlier_fraction=0.25, frame_idx=None,
+                          debug=False):
     """
     Merge Sapiens 2D keypoints with SMPLest-X 2D projections.
 
@@ -272,11 +273,12 @@ def fuse_sapiens_smplestx(sapiens_kp, sx_kp2d, img_h, img_w,
             return False  # already unreliable, will be handled by _substitute
         dist = np.sqrt((sap_x - sx) ** 2 + (sap_y - sy) ** 2)
         if dist > outlier_dist:
-            frame_str = f"frame {frame_idx}" if frame_idx is not None else "frame ?"
-            _logger.warning(
-                "Sapiens outlier rejected: %s, kp=%d, conf=%.3f, "
-                "sapiens=(%.1f, %.1f), smplestx=(%.1f, %.1f), dist=%.1f",
-                frame_str, coco_idx, sap_c, sap_x, sap_y, sx, sy, dist)
+            if debug:
+                frame_str = f"frame {frame_idx}" if frame_idx is not None else "frame ?"
+                _logger.warning(
+                    "Sapiens outlier rejected: %s, kp=%d, conf=%.3f, "
+                    "sapiens=(%.1f, %.1f), smplestx=(%.1f, %.1f), dist=%.1f",
+                    frame_str, coco_idx, sap_c, sap_x, sap_y, sx, sy, dist)
             return True
         return False
 
