@@ -58,7 +58,11 @@ def _transform_j3d_to_nlf_camera(j3d, cam_int, scale, offset, K_nlf):
     For NLF rendering at pixel_original:
       pixel_original = K_nlf @ (P_nlf / Z_nlf)
 
-    We keep Z_nlf = Z and solve for X_nlf, Y_nlf.
+    We solve for X_nlf, Y_nlf keeping Z, then apply a **uniform scale**
+    k = f_nlf / f_modified to bring depth into NLF's expected range.
+    A uniform scale of all 3 coordinates preserves 2D projection
+    (since projection depends only on X/Z and Y/Z) while adjusting the
+    absolute depth — this controls how thick the cylinders appear.
 
     Parameters
     ----------
@@ -91,6 +95,14 @@ def _transform_j3d_to_nlf_camera(j3d, cam_int, scale, offset, K_nlf):
     Y_nlf = (v_orig - cy_nlf) * Z / f_nlf
 
     j3d_nlf = np.stack([X_nlf, Y_nlf, Z], axis=-1).astype(np.float32)
+
+    # Uniform depth scale: PromptHMR decoded depth using f_modified,
+    # which is typically larger than f_nlf.  Without this correction the
+    # person appears too far away and cylinders render too thin.
+    # Uniform scaling preserves the 2D projection (X/Z, Y/Z unchanged).
+    depth_scale = float(f_nlf / f_m)
+    j3d_nlf *= depth_scale
+
     # Convert from metres (SMPL convention) to millimetres (NLF convention)
     j3d_nlf *= METRES_TO_MM
     return j3d_nlf
