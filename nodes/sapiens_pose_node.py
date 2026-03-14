@@ -84,8 +84,8 @@ class SapiensPoseNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("pose_images",)
+    RETURN_TYPES = ("IMAGE", "FLOAT")
+    RETURN_NAMES = ("pose_images", "fps")
     FUNCTION = "render_pose"
     CATEGORY = "4dhumans"
 
@@ -157,6 +157,8 @@ class SapiensPoseNode:
                        and fps > 0
                        and abs(fps - target_fps) > 0.1)
 
+        output_fps = float(target_fps) if do_resample else float(fps)
+
         if do_resample:
             # Convert frame_kps[t][p] → per-person timelines for interpolation
             per_person = []
@@ -210,4 +212,4 @@ class SapiensPoseNode:
                 torch.from_numpy(canvas.astype(np.float32) / 255.0))
             pbar.update(1)
 
-        return (torch.stack(pose_images),)
+        return (torch.stack(pose_images), output_fps)
