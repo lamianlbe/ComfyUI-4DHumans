@@ -15,6 +15,7 @@ from .nodes.load_sapiens_node import LoadSapiensNode
 from .nodes.sapiens_single_pose_node import SapiensSinglePoseNode
 from .nodes.sapiens_multi_pose_node import SapiensMultiPoseNode
 from .nodes.smplestx_pose_node import SMPLestXPoseNode
+from .nodes.sapiens_goliath_pose_node import SapiensGoliathPoseNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -25,6 +26,7 @@ NODE_CLASS_MAPPINGS = {
     'SapiensSinglePose': SapiensSinglePoseNode,
     'SapiensMultiPose': SapiensMultiPoseNode,
     'SMPLestXPose': SMPLestXPoseNode,
+    'SapiensGoliathPose': SapiensGoliathPoseNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -35,4 +37,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'SapiensSinglePose': 'Sapiens Single Person Pose Tracking',
     'SapiensMultiPose': 'Sapiens Multiple Person Pose Tracking',
     'SMPLestXPose': 'SMPLest-X Human Pose Tracking',
+    'SapiensGoliathPose': 'Sapiens Single Person Pose Tracking (Goliath)',
 }
