@@ -216,15 +216,20 @@ def openpose25_to_dwpose_body(op_kp2d, img_w, img_h):
     return candidate, subset
 
 
-def coco_wb133_to_dwpose_face_hands(coco_wb, img_w, img_h):
+def coco_wb133_to_dwpose_face_hands(coco_wb, img_w, img_h, conf_thr=0.3):
     """
     Extract face (68 pts) and hands (left 21 + right 21) from
     COCO WholeBody 133-format keypoints in DWPose format.
+
+    Keypoints with confidence below *conf_thr* are zeroed out so the
+    renderer's ``x > eps`` check will skip them (avoids spurious lines
+    from noisy heatmap argmax positions).
 
     Parameters
     ----------
     coco_wb : (133, 3) ndarray – pixel coords + confidence
     img_w, img_h : int
+    conf_thr : float – minimum confidence to keep a keypoint
 
     Returns
     -------
@@ -233,21 +238,21 @@ def coco_wb133_to_dwpose_face_hands(coco_wb, img_w, img_h):
     left_hand : (21, 2) float32 – normalised [0, 1]
     """
     # COCO-WB: face = 23..90 (68 pts), left hand = 91..111, right hand = 112..132
-    face_raw = coco_wb[23:91, :2].copy()  # (68, 2)
-    left_hand_raw = coco_wb[91:112, :2].copy()  # (21, 2)
-    right_hand_raw = coco_wb[112:133, :2].copy()  # (21, 2)
+    face_slice = coco_wb[23:91]        # (68, 3)
+    left_hand_slice = coco_wb[91:112]  # (21, 3)
+    right_hand_slice = coco_wb[112:133]  # (21, 3)
 
-    face = np.zeros((68, 2), dtype=np.float32)
-    face[:, 0] = face_raw[:, 0] / img_w
-    face[:, 1] = face_raw[:, 1] / img_h
+    def _normalise(kp_slice, n, w, h):
+        out = np.zeros((n, 2), dtype=np.float32)
+        for i in range(n):
+            if kp_slice[i, 2] >= conf_thr:
+                out[i, 0] = kp_slice[i, 0] / w
+                out[i, 1] = kp_slice[i, 1] / h
+        return out
 
-    left_hand = np.zeros((21, 2), dtype=np.float32)
-    left_hand[:, 0] = left_hand_raw[:, 0] / img_w
-    left_hand[:, 1] = left_hand_raw[:, 1] / img_h
-
-    right_hand = np.zeros((21, 2), dtype=np.float32)
-    right_hand[:, 0] = right_hand_raw[:, 0] / img_w
-    right_hand[:, 1] = right_hand_raw[:, 1] / img_h
+    face = _normalise(face_slice, 68, img_w, img_h)
+    left_hand = _normalise(left_hand_slice, 21, img_w, img_h)
+    right_hand = _normalise(right_hand_slice, 21, img_w, img_h)
 
     return face, right_hand, left_hand
 
