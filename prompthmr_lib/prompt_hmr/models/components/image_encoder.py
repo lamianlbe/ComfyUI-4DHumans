@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from .common import LayerNorm2d
-from ..dinov2.vision_transformer import vit_giant2, vit_large
+from ..dinov2.vision_transformer import vit_base, vit_giant2, vit_large
     
 
 class ImageEncoder(nn.Module):
@@ -98,16 +98,12 @@ class Dinov2Backbone(nn.Module):
     def __init__(self, name='dinov2_vitb14', pretrained=True, *args, **kwargs):
         super().__init__()
         
+        # Architecture only – pretrained weights are loaded later via
+        # PHMR.load_state_dict(), so skip the redundant download.
         if name == 'dinov2_vitb14':
-            vit = torch.hub.load('facebookresearch/dinov2', name, pretrained=pretrained)
+            vit = vit_base(patch_size=14, img_size=518, init_values=1.0, block_chunks=0)
         elif name == 'dinov2_vitl14':
             vit = vit_large(patch_size=14, img_size=518, init_values=1.0, block_chunks=0)
-            ckpt = 'data/dinov2_vitl14_pretrain.pth'
-            if os.path.exists(ckpt):
-                ckpt = torch.load(ckpt, weights_only=True)
-                _ = vit.load_state_dict(ckpt, strict=True)
-            else:
-                print('Not using DINOv2 weight')
         else:
             raise Exception('Backbone not implemented.')
 

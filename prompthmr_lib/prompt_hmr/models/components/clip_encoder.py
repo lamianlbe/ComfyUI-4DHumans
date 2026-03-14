@@ -7,8 +7,10 @@ import open_clip
 class ClipEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder = open_clip.create_model('ViT-L-14-quickgelu', 
-                                              pretrained='metaclip_fullcc')
+        # Architecture only – pretrained weights are loaded later via
+        # PHMR.load_state_dict(), so skip the redundant download.
+        self.encoder = open_clip.create_model('ViT-L-14-quickgelu',
+                                              pretrained='')
         # self.encoder = open_clip.create_model('ViT-B-32-quickgelu', 
         #                                     pretrained='metaclip_400m')
         self.encoder.visual = None
