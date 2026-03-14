@@ -11,7 +11,7 @@ import math
 import numpy as np
 from typing import Tuple, Type
 from einops import rearrange
-from xformers.ops import memory_efficient_attention
+import torch.nn.functional as F
 
 from .common import MLPBlock
 
@@ -317,11 +317,11 @@ class Attention(nn.Module):
         k = self.k_proj(k)
         v = self.v_proj(v)
 
-        # Memory-efficient attention
+        # Scaled dot-product attention (PyTorch native, no xFormers needed)
         B, N, C = q.shape
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b n h d", h=self.num_heads), [q, k, v])
-        x = memory_efficient_attention(q, k, v, attn_bias=None)
-        x = x.reshape([B, N, C])
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.num_heads), [q, k, v])
+        x = F.scaled_dot_product_attention(q, k, v)
+        x = rearrange(x, "b h n d -> b n (h d)")
 
         # Get output
         out = self.out_proj(x)

@@ -3,7 +3,7 @@ import torch
 from einops import rearrange
 from torch import Tensor, nn
 
-from xformers.ops import memory_efficient_attention, unbind
+import torch.nn.functional as F
     
 
 class FeedForward(nn.Module):
@@ -66,10 +66,10 @@ class MemEffAttention(Attention):
         v = self.to_v(v)
 
         B, N, C = q.shape
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b n h d", h=self.heads), [q, k, v])
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), [q, k, v])
 
-        x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
-        x = x.reshape([B, N, self.inner_dim])
+        x = F.scaled_dot_product_attention(q, k, v)
+        x = rearrange(x, "b h n d -> b n (h d)")
         x = self.proj(x)
         x = self.proj_drop(x)
 
