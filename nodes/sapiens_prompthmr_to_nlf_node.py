@@ -11,6 +11,10 @@ Outputs:
     format for 2D overlay rendering.
 
 Internally runs Sapiens 2D inference and interpolates all results to 16fps.
+
+Camera transform: PromptHMR's 3D joints are in the model's padded/scaled
+camera space. This node transforms them to the NLF camera space (55 deg FOV)
+so that 3D rendering projects correctly onto the original image.
 """
 
 import numpy as np
@@ -21,11 +25,70 @@ from ..humans4d.hmr2.utils.sapiens_inference import run_sapiens_on_bbox
 from ._pose_utils import (
     openpose25_to_dwpose_body,
     coco_wb133_to_dwpose_face_hands,
-    fuse_3d_body_with_sapiens,
     resample_keypoints,
 )
 
 TARGET_FPS = 16.0
+NLF_FOV_DEGREES = 55.0
+
+
+def _nlf_intrinsic(img_h, img_w):
+    """Compute NLF's default intrinsic matrix (55 deg FOV)."""
+    larger = max(img_h, img_w)
+    focal = larger / (2.0 * np.tan(NLF_FOV_DEGREES * np.pi / 360.0))
+    return np.array([
+        [focal, 0, img_w / 2.0],
+        [0, focal, img_h / 2.0],
+        [0, 0, 1],
+    ], dtype=np.float64)
+
+
+def _transform_j3d_to_nlf_camera(j3d, cam_int, scale, offset, K_nlf):
+    """
+    Transform 3D joints from PromptHMR's padded/scaled camera space
+    to NLF's camera space.
+
+    For a 3D point P = (X, Y, Z) in PromptHMR's modified camera:
+      pixel_modified = K_phmr @ (P / Z)
+      pixel_original = (pixel_modified - offset) / scale
+
+    For NLF rendering at pixel_original:
+      pixel_original = K_nlf @ (P_nlf / Z_nlf)
+
+    We keep Z_nlf = Z and solve for X_nlf, Y_nlf.
+
+    Parameters
+    ----------
+    j3d : (24, 3) ndarray
+    cam_int : (3, 3) ndarray – PromptHMR modified cam intrinsic
+    scale : float
+    offset : (2,) ndarray
+    K_nlf : (3, 3) ndarray – NLF intrinsic matrix
+
+    Returns
+    -------
+    j3d_nlf : (24, 3) ndarray
+    """
+    f_m = cam_int[0, 0]
+    cx_m = cam_int[0, 2]
+    cy_m = cam_int[1, 2]
+
+    f_nlf = K_nlf[0, 0]
+    cx_nlf = K_nlf[0, 2]
+    cy_nlf = K_nlf[1, 2]
+
+    X, Y, Z = j3d[:, 0], j3d[:, 1], j3d[:, 2]
+
+    # Project to 2D in modified space, then unscale to original image coords
+    u_orig = (f_m * X / Z + cx_m - offset[0]) / scale
+    v_orig = (f_m * Y / Z + cy_m - offset[1]) / scale
+
+    # Back-project from original image coords using NLF camera, keeping Z
+    X_nlf = (u_orig - cx_nlf) * Z / f_nlf
+    Y_nlf = (v_orig - cy_nlf) * Z / f_nlf
+
+    j3d_nlf = np.stack([X_nlf, Y_nlf, Z], axis=-1).astype(np.float32)
+    return j3d_nlf
 
 
 class SapiensPromptHMRToNLFNode:
@@ -63,14 +126,14 @@ class SapiensPromptHMRToNLFNode:
         n_persons = pose_3d["n_persons"]
         whole_bbox = np.array([0, 0, img_w, img_h], dtype=np.float32)
 
+        # NLF camera intrinsic (55 deg FOV)
+        K_nlf = _nlf_intrinsic(img_h, img_w)
+
         pbar = comfy.utils.ProgressBar(B)
 
         # ----- Per-person timelines (source fps) -----
-        # NLF 3D: per_person_3d[p][t] = (24, 3) ndarray or None
         per_person_3d = [[None] * B for _ in range(n_persons)]
-        # DW body: per_person_body[p][t] = (candidate, subset) or None
         per_person_body = [[None] * B for _ in range(n_persons)]
-        # DW face/hands: per_person_fh[p][t] = (face, rhand, lhand) or None
         per_person_fh = [[None] * B for _ in range(n_persons)]
 
         for t in range(B):
@@ -81,15 +144,23 @@ class SapiensPromptHMRToNLFNode:
             sapiens_kp = (
                 sapiens_result["pixel_kp"] if sapiens_result is not None
                 else None
-            )  # (133, 3) or None
+            )
+
+            # Camera info for this frame
+            cam_int_t = pose_3d["cam_int"][t]
+            scale_t = pose_3d["scale"][t]
+            offset_t = pose_3d["offset"][t]
 
             for p_idx in range(n_persons):
                 person = pose_3d["persons"][p_idx]
 
-                # --- NLF 3D (SMPL 24 joints) ---
+                # --- NLF 3D (SMPL 24 joints, transformed to NLF camera) ---
                 j3d_smpl = person["smpl_j3d"][t]
-                if j3d_smpl is not None:
-                    per_person_3d[p_idx][t] = j3d_smpl  # (24, 3)
+                if j3d_smpl is not None and cam_int_t is not None:
+                    j3d_nlf = _transform_j3d_to_nlf_camera(
+                        j3d_smpl, cam_int_t, scale_t, offset_t, K_nlf
+                    )
+                    per_person_3d[p_idx][t] = j3d_nlf
 
                 # --- DW body (from PromptHMR 2D) ---
                 j2d = person["body_joints2d"][t]
@@ -112,7 +183,6 @@ class SapiensPromptHMRToNLFNode:
         do_resample = fps > 0 and abs(fps - TARGET_FPS) > 0.1
 
         if do_resample:
-            # Resample NLF 3D
             resampled_3d = []
             src_indices = None
             for p in range(n_persons):
@@ -122,40 +192,23 @@ class SapiensPromptHMRToNLFNode:
                     src_indices = idx
             n_out = len(src_indices)
 
-            # Resample DW body candidates
             resampled_body_cand = []
             resampled_body_sub = []
             for p in range(n_persons):
-                cand_timeline = [
-                    x[0] if x is not None else None
-                    for x in per_person_body[p]
-                ]
-                sub_timeline = [
-                    x[1] if x is not None else None
-                    for x in per_person_body[p]
-                ]
-                r_c, _ = resample_keypoints(cand_timeline, fps, TARGET_FPS)
-                r_s, _ = resample_keypoints(sub_timeline, fps, TARGET_FPS)
+                cand_tl = [x[0] if x is not None else None for x in per_person_body[p]]
+                sub_tl = [x[1] if x is not None else None for x in per_person_body[p]]
+                r_c, _ = resample_keypoints(cand_tl, fps, TARGET_FPS)
+                r_s, _ = resample_keypoints(sub_tl, fps, TARGET_FPS)
                 resampled_body_cand.append(r_c)
                 resampled_body_sub.append(r_s)
 
-            # Resample DW face/hands
             resampled_face = []
             resampled_rhand = []
             resampled_lhand = []
             for p in range(n_persons):
-                face_tl = [
-                    x[0] if x is not None else None
-                    for x in per_person_fh[p]
-                ]
-                rhand_tl = [
-                    x[1] if x is not None else None
-                    for x in per_person_fh[p]
-                ]
-                lhand_tl = [
-                    x[2] if x is not None else None
-                    for x in per_person_fh[p]
-                ]
+                face_tl = [x[0] if x is not None else None for x in per_person_fh[p]]
+                rhand_tl = [x[1] if x is not None else None for x in per_person_fh[p]]
+                lhand_tl = [x[2] if x is not None else None for x in per_person_fh[p]]
                 r_f, _ = resample_keypoints(face_tl, fps, TARGET_FPS)
                 r_r, _ = resample_keypoints(rhand_tl, fps, TARGET_FPS)
                 r_l, _ = resample_keypoints(lhand_tl, fps, TARGET_FPS)
@@ -202,7 +255,7 @@ class SapiensPromptHMRToNLFNode:
                     frame_joints.append(
                         torch.zeros((24, 3), dtype=torch.float32)
                     )
-            nlf_poses.append(torch.stack(frame_joints, dim=0))  # (n_persons, 24, 3)
+            nlf_poses.append(torch.stack(frame_joints, dim=0))
 
         # ----- Build DW output -----
         dw_frames = []
@@ -215,31 +268,21 @@ class SapiensPromptHMRToNLFNode:
             candidates = []
             subsets = []
             faces = []
-            hands = []  # interleaved: rhand_p0, lhand_p0, rhand_p1, lhand_p1, ...
+            hands = []
 
             for p in range(n_persons):
                 cand = resampled_body_cand[p][t]
                 sub = resampled_body_sub[p][t]
-                candidates.append(
-                    cand if cand is not None else zero_body.copy()
-                )
-                subsets.append(
-                    sub if sub is not None else zero_subset.copy()
-                )
+                candidates.append(cand if cand is not None else zero_body.copy())
+                subsets.append(sub if sub is not None else zero_subset.copy())
 
                 face = resampled_face[p][t]
-                faces.append(
-                    face if face is not None else zero_face.copy()
-                )
+                faces.append(face if face is not None else zero_face.copy())
 
                 rhand = resampled_rhand[p][t]
                 lhand = resampled_lhand[p][t]
-                hands.append(
-                    rhand if rhand is not None else zero_hand.copy()
-                )
-                hands.append(
-                    lhand if lhand is not None else zero_hand.copy()
-                )
+                hands.append(rhand if rhand is not None else zero_hand.copy())
+                hands.append(lhand if lhand is not None else zero_hand.copy())
 
             dw_frames.append({
                 "bodies": {

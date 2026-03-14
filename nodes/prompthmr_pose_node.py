@@ -73,6 +73,11 @@ class PromptHMRPoseNode:
 
         pbar = comfy.utils.ProgressBar(B)
 
+        # Per-frame camera info (for 3D coordinate transforms)
+        cam_int_per_frame = [None] * B    # (3, 3) modified cam intrinsic
+        scale_per_frame = [None] * B      # scalar
+        offset_per_frame = [None] * B     # (2,) array
+
         # Per-person storage: list of n_persons lists, each with B frames
         persons = []
         for _ in range(n_persons):
@@ -130,14 +135,20 @@ class PromptHMRPoseNode:
             joints_3d = output["body_joints"].detach().cpu().numpy()    # (N, 25, 3)
             smpl_j3d = output["smpl_j3d"].detach().cpu().numpy()        # (N, 24, 3)
 
-            # Unscale 2D joints from padded/scaled model space to original image coords
-            scale = batch[0]["image_scale"]
-            offset = batch[0]["image_offset"]
-            if isinstance(offset, torch.Tensor):
-                offset = offset.numpy()
-            offset = np.array(offset)
+            # Camera parameters for this frame
+            scale_val = batch[0]["image_scale"]
+            offset_val = batch[0]["image_offset"]
+            if isinstance(offset_val, torch.Tensor):
+                offset_val = offset_val.numpy()
+            offset_val = np.array(offset_val)
 
-            joints_2d_orig = (joints_2d - offset[None, None, :]) / scale
+            cam_int_val = output["cam_int"].detach().cpu().numpy()  # (N, 3, 3)
+            cam_int_per_frame[t] = cam_int_val[0]  # (3, 3) – same for all persons
+            scale_per_frame[t] = float(scale_val)
+            offset_per_frame[t] = offset_val.copy()
+
+            # Unscale 2D joints from padded/scaled model space to original image coords
+            joints_2d_orig = (joints_2d - offset_val[None, None, :]) / scale_val
 
             # Store per-person results
             for i, p_idx in enumerate(person_indices):
@@ -153,6 +164,9 @@ class PromptHMRPoseNode:
             "img_h": img_h,
             "img_w": img_w,
             "persons": persons,
+            "cam_int": cam_int_per_frame,    # (3, 3) per frame
+            "scale": scale_per_frame,        # scalar per frame
+            "offset": offset_per_frame,      # (2,) per frame
         }
 
         return (pose_3d,)
