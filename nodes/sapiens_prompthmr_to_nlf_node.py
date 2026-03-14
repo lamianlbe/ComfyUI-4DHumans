@@ -30,6 +30,9 @@ from ._pose_utils import (
 
 TARGET_FPS = 16.0
 NLF_FOV_DEGREES = 55.0
+# PromptHMR outputs SMPL joints in metres; NLF's cylinder renderer expects
+# millimetres (default cylinder radius=21.5, zfar up to 25 000).
+METRES_TO_MM = 1000.0
 
 
 def _nlf_intrinsic(img_h, img_w):
@@ -88,6 +91,8 @@ def _transform_j3d_to_nlf_camera(j3d, cam_int, scale, offset, K_nlf):
     Y_nlf = (v_orig - cy_nlf) * Z / f_nlf
 
     j3d_nlf = np.stack([X_nlf, Y_nlf, Z], axis=-1).astype(np.float32)
+    # Convert from metres (SMPL convention) to millimetres (NLF convention)
+    j3d_nlf *= METRES_TO_MM
     return j3d_nlf
 
 
