@@ -79,6 +79,7 @@ class PromptHMRPoseNode:
             persons.append({
                 "body_joints2d": [None] * B,  # (25, 2) per frame
                 "body_joints": [None] * B,    # (25, 3) per frame
+                "smpl_j3d": [None] * B,       # (24, 3) per frame – SMPL 24-joint 3D
             })
 
         for t in range(B):
@@ -124,9 +125,10 @@ class PromptHMRPoseNode:
                 batch = prepare_batch(inputs, img_size=img_size, interaction=False)
                 output = model(batch, use_mean_hands=True)[0]
 
-            # Extract results: body_joints2d (N, 25, 2), body_joints (N, 25, 3)
+            # Extract results
             joints_2d = output["body_joints2d"].detach().cpu().numpy()  # (N, 25, 2)
             joints_3d = output["body_joints"].detach().cpu().numpy()    # (N, 25, 3)
+            smpl_j3d = output["smpl_j3d"].detach().cpu().numpy()        # (N, 24, 3)
 
             # Unscale 2D joints from padded/scaled model space to original image coords
             scale = batch[0]["image_scale"]
@@ -141,6 +143,7 @@ class PromptHMRPoseNode:
             for i, p_idx in enumerate(person_indices):
                 persons[p_idx]["body_joints2d"][t] = joints_2d_orig[i]  # (25, 2)
                 persons[p_idx]["body_joints"][t] = joints_3d[i]          # (25, 3)
+                persons[p_idx]["smpl_j3d"][t] = smpl_j3d[i]              # (24, 3)
 
             pbar.update(1)
 

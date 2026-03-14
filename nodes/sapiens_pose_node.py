@@ -27,15 +27,6 @@ from ._pose_utils import (
 )
 
 
-# Target FPS lookup
-_FPS_MAP = {
-    "source": None,
-    "16fps": 16.0,
-    "24fps": 24.0,
-    "30fps": 30.0,
-}
-
-
 class SapiensPoseNode:
     """Sapiens 2D whole-body pose estimation (single or multi person)."""
 
@@ -54,13 +45,16 @@ class SapiensPoseNode:
                         ),
                     },
                 ),
-                "frame_rate": (
-                    ["source", "16fps", "24fps", "30fps"],
+                "target_fps": (
+                    "FLOAT",
                     {
-                        "default": "source",
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 30.0,
+                        "step": 0.1,
                         "tooltip": (
-                            "Output frame rate. 'source' keeps original. "
-                            "Other options resample to the target FPS."
+                            "Output frame rate. 0 keeps source fps. "
+                            "Any value 1-30 resamples with interpolation."
                         ),
                     },
                 ),
@@ -75,10 +69,7 @@ class SapiensPoseNode:
                         "min": 1.0,
                         "max": 120.0,
                         "step": 0.001,
-                        "tooltip": (
-                            "Source video FPS. Required when frame_rate "
-                            "is not 'source'."
-                        ),
+                        "tooltip": "Source video FPS.",
                     },
                 ),
             },
@@ -89,7 +80,7 @@ class SapiensPoseNode:
     FUNCTION = "render_pose"
     CATEGORY = "4dhumans"
 
-    def render_pose(self, images, debug, frame_rate,
+    def render_pose(self, images, debug, target_fps,
                     sapiens=None, pose_3d=None, fps=24.0):
         if sapiens is None and pose_3d is None:
             raise ValueError(
@@ -152,8 +143,7 @@ class SapiensPoseNode:
         # -----------------------------------------------------------
         # Frame rate resampling (per-person linear interpolation)
         # -----------------------------------------------------------
-        target_fps = _FPS_MAP.get(frame_rate)
-        do_resample = (target_fps is not None
+        do_resample = (target_fps >= 1.0
                        and fps > 0
                        and abs(fps - target_fps) > 0.1)
 

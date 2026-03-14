@@ -14,6 +14,7 @@ from .nodes.load_sapiens_node import LoadSapiensNode
 from .nodes.sapiens_pose_node import SapiensPoseNode
 from .nodes.load_prompthmr_node import LoadPromptHMRNode
 from .nodes.prompthmr_pose_node import PromptHMRPoseNode
+from .nodes.sapiens_prompthmr_to_nlf_node import SapiensPromptHMRToNLFNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -23,6 +24,7 @@ NODE_CLASS_MAPPINGS = {
     'SapiensPose': SapiensPoseNode,
     'LoadPromptHMR': LoadPromptHMRNode,
     'PromptHMRPose': PromptHMRPoseNode,
+    'SapiensPromptHMRToNLF': SapiensPromptHMRToNLFNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -32,4 +34,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'SapiensPose': 'Sapiens 2D Human Pose',
     'LoadPromptHMR': 'Load PromptHMR',
     'PromptHMRPose': 'PromptHMR 3D Human Pose',
+    'SapiensPromptHMRToNLF': 'Sapiens PromptHMR to NLF Poses',
 }

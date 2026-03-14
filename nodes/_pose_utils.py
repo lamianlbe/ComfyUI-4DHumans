@@ -150,6 +150,108 @@ def resample_keypoints(timeline, fps_in, target_fps=30.0):
     return resampled, src_indices
 
 
+# ---------------------------------------------------------------------------
+# OpenPose 25 -> DWPose 18-body mapping (for SCAIL compatibility)
+# ---------------------------------------------------------------------------
+# DWPose body 18 joints: Nose, Neck, R_Shoulder, R_Elbow, R_Wrist,
+# L_Shoulder, L_Elbow, L_Wrist, R_Hip, R_Knee, R_Ankle,
+# L_Hip, L_Knee, L_Ankle, R_Eye, L_Eye, R_Ear, L_Ear
+
+_OP25_TO_DW18 = {
+    0: 0,    # Nose
+    # 1: Neck -> synthesise from (R_Shoulder + L_Shoulder) / 2
+    2: 2,    # R_Shoulder
+    3: 3,    # R_Elbow
+    4: 4,    # R_Wrist
+    5: 5,    # L_Shoulder
+    6: 6,    # L_Elbow
+    7: 7,    # L_Wrist
+    9: 8,    # R_Hip
+    10: 9,   # R_Knee
+    11: 10,  # R_Ankle
+    12: 11,  # L_Hip
+    13: 12,  # L_Knee
+    14: 13,  # L_Ankle
+    15: 14,  # R_Eye
+    16: 15,  # L_Eye
+    17: 16,  # R_Ear
+    18: 17,  # L_Ear
+}
+
+
+def openpose25_to_dwpose_body(op_kp2d, img_w, img_h):
+    """
+    Convert OpenPose 25-joint 2D keypoints to DWPose 18-joint body format.
+
+    Parameters
+    ----------
+    op_kp2d : (25, 2) or (25, 3) ndarray  – pixel coordinates
+    img_w, img_h : int – image dimensions for normalisation
+
+    Returns
+    -------
+    candidate : (18, 2) float32 – normalised [0, 1]
+    subset : (18,) float32 – joint index if valid, -1 if missing
+    """
+    candidate = np.zeros((18, 2), dtype=np.float32)
+    subset = np.full(18, -1.0, dtype=np.float32)
+
+    for op_idx, dw_idx in _OP25_TO_DW18.items():
+        x, y = op_kp2d[op_idx, 0], op_kp2d[op_idx, 1]
+        if abs(x) < 1e-6 and abs(y) < 1e-6:
+            continue
+        candidate[dw_idx, 0] = x / img_w
+        candidate[dw_idx, 1] = y / img_h
+        subset[dw_idx] = dw_idx
+
+    # Neck = midpoint of R_Shoulder and L_Shoulder
+    r_sh = op_kp2d[2]
+    l_sh = op_kp2d[5]
+    if not (abs(r_sh[0]) < 1e-6 and abs(r_sh[1]) < 1e-6) and \
+       not (abs(l_sh[0]) < 1e-6 and abs(l_sh[1]) < 1e-6):
+        candidate[1, 0] = (r_sh[0] + l_sh[0]) / 2 / img_w
+        candidate[1, 1] = (r_sh[1] + l_sh[1]) / 2 / img_h
+        subset[1] = 1.0
+
+    return candidate, subset
+
+
+def coco_wb133_to_dwpose_face_hands(coco_wb, img_w, img_h):
+    """
+    Extract face (68 pts) and hands (left 21 + right 21) from
+    COCO WholeBody 133-format keypoints in DWPose format.
+
+    Parameters
+    ----------
+    coco_wb : (133, 3) ndarray – pixel coords + confidence
+    img_w, img_h : int
+
+    Returns
+    -------
+    face : (68, 2) float32 – normalised [0, 1]
+    right_hand : (21, 2) float32 – normalised [0, 1]
+    left_hand : (21, 2) float32 – normalised [0, 1]
+    """
+    # COCO-WB: face = 23..90 (68 pts), left hand = 91..111, right hand = 112..132
+    face_raw = coco_wb[23:91, :2].copy()  # (68, 2)
+    left_hand_raw = coco_wb[91:112, :2].copy()  # (21, 2)
+    right_hand_raw = coco_wb[112:133, :2].copy()  # (21, 2)
+
+    face = np.zeros((68, 2), dtype=np.float32)
+    face[:, 0] = face_raw[:, 0] / img_w
+    face[:, 1] = face_raw[:, 1] / img_h
+
+    left_hand = np.zeros((21, 2), dtype=np.float32)
+    left_hand[:, 0] = left_hand_raw[:, 0] / img_w
+    left_hand[:, 1] = left_hand_raw[:, 1] / img_h
+
+    right_hand = np.zeros((21, 2), dtype=np.float32)
+    right_hand[:, 0] = right_hand_raw[:, 0] / img_w
+    right_hand[:, 1] = right_hand_raw[:, 1] / img_h
+
+    return face, right_hand, left_hand
+
+
 def compute_resampled_indices(n_in, fps_in, target_fps=30.0):
     """
     Compute nearest source frame indices for resampling from fps_in to
