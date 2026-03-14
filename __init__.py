@@ -16,6 +16,8 @@ from .nodes.sapiens_single_pose_node import SapiensSinglePoseNode
 from .nodes.sapiens_multi_pose_node import SapiensMultiPoseNode
 from .nodes.smplestx_pose_node import SMPLestXPoseNode
 from .nodes.sapiens_goliath_pose_node import SapiensGoliathPoseNode
+from .nodes.load_prompthmr_node import LoadPromptHMRNode
+from .nodes.prompthmr_pose_node import PromptHMRPoseNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -27,6 +29,8 @@ NODE_CLASS_MAPPINGS = {
     'SapiensMultiPose': SapiensMultiPoseNode,
     'SMPLestXPose': SMPLestXPoseNode,
     'SapiensGoliathPose': SapiensGoliathPoseNode,
+    'LoadPromptHMR': LoadPromptHMRNode,
+    'PromptHMRPose': PromptHMRPoseNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -38,4 +42,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'SapiensMultiPose': 'Sapiens Multiple Person Pose Tracking',
     'SMPLestXPose': 'SMPLest-X Human Pose Tracking',
     'SapiensGoliathPose': 'Sapiens Single Person Pose Tracking (Goliath)',
+    'LoadPromptHMR': 'Load PromptHMR',
+    'PromptHMRPose': 'PromptHMR 3D Human Pose',
 }
