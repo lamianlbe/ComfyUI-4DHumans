@@ -46,6 +46,19 @@ class SapiensGoliathPoseNode:
                         ),
                     },
                 ),
+                "confidence_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 0.3,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "tooltip": (
+                            "Minimum heatmap confidence to draw a keypoint. "
+                            "Official default is 0.3."
+                        ),
+                    },
+                ),
                 "interpolate_30fps": (
                     "BOOLEAN",
                     {
@@ -80,7 +93,8 @@ class SapiensGoliathPoseNode:
     CATEGORY = "4dhumans"
 
     def render_pose(self, images, sapiens, debug, show_face,
-                    interpolate_30fps=False, fps=24.0):
+                    confidence_threshold=0.3, interpolate_30fps=False,
+                    fps=24.0):
         images_nchw = images.permute(0, 3, 1, 2)
         B, _C, img_h, img_w = images_nchw.shape
         whole_bbox = np.array([0, 0, img_w, img_h], dtype=np.float32)
@@ -118,7 +132,8 @@ class SapiensGoliathPoseNode:
             if timeline[t] is not None:
                 canvas = render_goliath(
                     canvas, timeline[t], img_h, img_w,
-                    show_face=show_face)
+                    show_face=show_face,
+                    conf_thr=confidence_threshold)
 
             pose_images.append(
                 torch.from_numpy(canvas.astype(np.float32) / 255.0))
