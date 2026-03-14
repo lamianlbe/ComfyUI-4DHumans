@@ -1,9 +1,9 @@
 """
 PromptHMR 3D Human Pose Estimation node.
 
-Accepts an image batch with per-frame masks and runs PromptHMR to recover
-3D human mesh (SMPL-X). Renders the projected 2D body joints as an
-OpenPose-style skeleton overlay.
+Accepts an RGBA image batch (alpha channel = mask) and runs PromptHMR to
+recover 3D human mesh (SMPL-X). Renders the projected 2D body joints as
+an OpenPose-style skeleton overlay.
 """
 
 import numpy as np
@@ -24,14 +24,13 @@ def _mask_to_bbox(mask_np):
 
 
 class PromptHMRPoseNode:
-    """PromptHMR single-person 3D pose estimation with mask prompt."""
+    """PromptHMR single-person 3D pose estimation from RGBA image batch."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
-                "masks": ("MASK",),
+                "rgba_images": ("IMAGE",),
                 "prompthmr": ("PROMPTHMR",),
                 "debug": (
                     "BOOLEAN",
@@ -51,7 +50,7 @@ class PromptHMRPoseNode:
     FUNCTION = "render_pose"
     CATEGORY = "4dhumans"
 
-    def render_pose(self, images, masks, prompthmr, debug):
+    def render_pose(self, rgba_images, prompthmr, debug):
         from .load_prompthmr_node import _ensure_lib_importable
         _ensure_lib_importable()
 
@@ -61,12 +60,16 @@ class PromptHMRPoseNode:
         model = prompthmr["model"]
         img_size = prompthmr["img_size"]
 
-        images_nchw = images.permute(0, 3, 1, 2)
-        B, _C, img_h, img_w = images_nchw.shape
+        # rgba_images: (B, H, W, 4) — split into RGB + Alpha
+        B, img_h, img_w, C = rgba_images.shape
+        if C < 4:
+            raise ValueError(
+                f"PromptHMR Pose node expects RGBA images (4 channels), "
+                f"got {C} channels. Please connect an RGBA image batch."
+            )
 
-        # Ensure masks shape is (B, H, W)
-        if masks.dim() == 4:
-            masks = masks[:, 0]
+        rgb = rgba_images[..., :3]          # (B, H, W, 3)
+        alpha = rgba_images[..., 3]         # (B, H, W)
 
         pbar = comfy.utils.ProgressBar(2 * B)
 
@@ -74,8 +77,8 @@ class PromptHMRPoseNode:
         body_joints_2d_list = [None] * B
 
         for t in range(B):
-            img_np = (images_nchw[t].permute(1, 2, 0) * 255).byte().cpu().numpy()
-            mask_np = masks[t].cpu().numpy()
+            img_np = (rgb[t] * 255).byte().cpu().numpy()
+            mask_np = alpha[t].cpu().numpy()
 
             # Derive bbox from mask
             bbox = _mask_to_bbox(mask_np)
@@ -127,9 +130,7 @@ class PromptHMRPoseNode:
         pose_images = []
         for t in range(B):
             if debug:
-                canvas = (
-                    images_nchw[t].permute(1, 2, 0) * 255
-                ).byte().cpu().numpy().copy()
+                canvas = (rgb[t] * 255).byte().cpu().numpy().copy()
             else:
                 canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
 
