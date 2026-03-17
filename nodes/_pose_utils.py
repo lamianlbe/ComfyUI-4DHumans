@@ -66,7 +66,8 @@ def openpose25_to_coco_wholebody(op_kp2d):
     return coco_wb
 
 
-def fuse_3d_body_with_sapiens(op_kp2d, sapiens_kp):
+def fuse_3d_body_with_sapiens(op_kp2d, sapiens_kp,
+                              show_face=True, show_hand_foot=True):
     """
     Fuse PromptHMR 3D body+feet with Sapiens face+hands.
 
@@ -79,6 +80,10 @@ def fuse_3d_body_with_sapiens(op_kp2d, sapiens_kp):
         OpenPose 25-joint 2D keypoints from PromptHMR.
     sapiens_kp : (133, 3) ndarray or None
         Sapiens COCO-WholeBody keypoints. If None, face/hands are zero.
+    show_face : bool
+        Include face keypoints (23-90) from Sapiens.
+    show_hand_foot : bool
+        Include hand keypoints (91-132) from Sapiens.
 
     Returns
     -------
@@ -89,8 +94,10 @@ def fuse_3d_body_with_sapiens(op_kp2d, sapiens_kp):
 
     # Fill face + hands from Sapiens
     if sapiens_kp is not None:
-        coco_wb[23:91] = sapiens_kp[23:91]    # face (68 keypoints)
-        coco_wb[91:133] = sapiens_kp[91:133]  # hands (42 keypoints)
+        if show_face:
+            coco_wb[23:91] = sapiens_kp[23:91]    # face (68 keypoints)
+        if show_hand_foot:
+            coco_wb[91:133] = sapiens_kp[91:133]  # hands (42 keypoints)
 
     return coco_wb
 

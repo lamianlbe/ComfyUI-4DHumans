@@ -58,6 +58,26 @@ class SapiensPoseNode:
                         ),
                     },
                 ),
+                "show_face": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Show face keypoints from Sapiens. "
+                            "When False only PromptHMR body keypoints are shown."
+                        ),
+                    },
+                ),
+                "show_hand_foot": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Show hand & foot keypoints from Sapiens. "
+                            "When False only PromptHMR body keypoints are shown."
+                        ),
+                    },
+                ),
             },
             "optional": {
                 "sapiens": ("SAPIENS",),
@@ -80,7 +100,7 @@ class SapiensPoseNode:
     FUNCTION = "render_pose"
     CATEGORY = "4dhumans"
 
-    def render_pose(self, images, debug, target_fps,
+    def render_pose(self, images, debug, target_fps, show_face, show_hand_foot,
                     sapiens=None, pose_3d=None, fps=24.0):
         if sapiens is None and pose_3d is None:
             raise ValueError(
@@ -120,7 +140,11 @@ class SapiensPoseNode:
                 for p_idx in range(n_persons):
                     j2d = pose_3d["persons"][p_idx]["body_joints2d"][t]
                     if j2d is not None:
-                        kp = fuse_3d_body_with_sapiens(j2d, sapiens_kp)
+                        kp = fuse_3d_body_with_sapiens(
+                            j2d, sapiens_kp,
+                            show_face=show_face,
+                            show_hand_foot=show_hand_foot,
+                        )
                         frame_kps[t].append(kp)
                     elif sapiens_kp is not None:
                         frame_kps[t].append(sapiens_kp.copy())
