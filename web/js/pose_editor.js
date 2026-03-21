@@ -32,9 +32,9 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
     if (idx >= 0) node.widgets.splice(idx, 1);
     node._poseEditorWidget = null;
   }
-  if (node._poseEditorTimerId) {
-    clearTimeout(node._poseEditorTimerId);
-    node._poseEditorTimerId = null;
+  if (node._poseEditorRAF) {
+    cancelAnimationFrame(node._poseEditorRAF);
+    node._poseEditorRAF = null;
   }
 
   const totalFrames = frames.length;
@@ -153,40 +153,43 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
   // --- Playback state ---
   let currentFrame = 0;
   let playing = false;
+  let lastFrameTime = 0;
+  const frameDuration = 1000 / fps;
 
   function updateDisplay() {
     const img = images[currentFrame];
     if (img && img.complete && img.naturalWidth > 0) {
+      // Force browser to treat as new image by resetting src
+      imgEl.src = "";
       imgEl.src = img.src;
     }
     scrubber.value = currentFrame;
     frameLabel.textContent = `${currentFrame + 1}/${totalFrames}`;
   }
 
-  function scheduleNextFrame() {
-    node._poseEditorTimerId = setTimeout(() => {
-      if (!playing) return;
+  function animationLoop(timestamp) {
+    if (!playing) return;
+    if (timestamp - lastFrameTime >= frameDuration) {
+      lastFrameTime = timestamp;
       currentFrame = (currentFrame + 1) % totalFrames;
       updateDisplay();
-      scheduleNextFrame();
-    }, 1000 / fps);
+    }
+    node._poseEditorRAF = requestAnimationFrame(animationLoop);
   }
 
   function play() {
     playing = true;
     playBtn.textContent = "⏸";
-    // Advance immediately to next frame, then schedule
-    currentFrame = (currentFrame + 1) % totalFrames;
-    updateDisplay();
-    scheduleNextFrame();
+    lastFrameTime = performance.now();
+    node._poseEditorRAF = requestAnimationFrame(animationLoop);
   }
 
   function pause() {
     playing = false;
     playBtn.textContent = "▶";
-    if (node._poseEditorTimerId) {
-      clearTimeout(node._poseEditorTimerId);
-      node._poseEditorTimerId = null;
+    if (node._poseEditorRAF) {
+      cancelAnimationFrame(node._poseEditorRAF);
+      node._poseEditorRAF = null;
     }
   }
 
