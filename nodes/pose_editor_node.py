@@ -106,8 +106,7 @@ class PoseEditorNode:
             },
         }
 
-    RETURN_TYPES = ("POSES",)
-    RETURN_NAMES = ("poses",)
+    RETURN_TYPES = ()
     OUTPUT_NODE = True
     FUNCTION = "edit"
     CATEGORY = "4dhumans"
@@ -207,4 +206,4 @@ class PoseEditorNode:
             "node_id": [node_id],
         }
 
-        return {"ui": ui_data, "result": (poses_edit,)}
+        return {"ui": ui_data}
