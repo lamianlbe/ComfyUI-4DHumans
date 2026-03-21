@@ -43,12 +43,12 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
   const container = document.createElement("div");
   container.style.cssText =
     "display:flex;flex-direction:column;gap:6px;padding:6px;" +
-    "width:100%;box-sizing:border-box;overflow:hidden;";
+    "width:100%;height:100%;box-sizing:border-box;overflow:hidden;";
 
   // --- Playback controls ---
   const controlsRow = document.createElement("div");
   controlsRow.style.cssText =
-    "display:flex;align-items:center;gap:6px;width:100%;box-sizing:border-box;overflow:hidden;";
+    "display:flex;align-items:center;gap:6px;width:100%;box-sizing:border-box;overflow:hidden;flex-shrink:0;";
 
   const playBtn = document.createElement("button");
   playBtn.textContent = "▶";
@@ -75,13 +75,13 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
   // --- Image display ---
   const imgEl = document.createElement("img");
   imgEl.style.cssText =
-    "width:100%;max-height:100%;object-fit:contain;border-radius:4px;" +
+    "width:100%;flex:1;min-height:0;object-fit:contain;border-radius:4px;" +
     "background:#000;display:block;";
 
   // --- Person toggles ---
   const personsRow = document.createElement("div");
   personsRow.style.cssText =
-    "display:flex;flex-wrap:wrap;align-items:center;gap:4px;width:100%;box-sizing:border-box;";
+    "display:flex;flex-wrap:wrap;align-items:center;gap:4px;width:100%;box-sizing:border-box;flex-shrink:0;";
 
   const personsLabel = document.createElement("span");
   personsLabel.textContent = "Persons:";
@@ -120,7 +120,7 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
   downloadBtn.textContent = "📥 Download NPZ";
   downloadBtn.style.cssText =
     "padding:4px 14px;font-size:12px;cursor:pointer;border:1px solid #555;" +
-    "background:#2a5a2a;color:#fff;border-radius:4px;align-self:flex-start;";
+    "background:#2a5a2a;color:#fff;border-radius:4px;align-self:center;flex-shrink:0;";
   downloadBtn.addEventListener("click", () => {
     window.open(
       `/pose_editor/download_npz?node_id=${encodeURIComponent(nodeId)}`,
