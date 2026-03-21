@@ -9,13 +9,15 @@ Output masks have shape (B * N, H, W) where B = number of frames and
 N = number of detected persons.  Every frame has exactly N mask slots;
 frames where a person is not visible get a zero mask.
 
-Compatible with the checkpoint from ComfyUI-RMBG (``models/sam3/sam3.pt``).
-The same ``sam3.pt`` works for both image and video modes.
+The sam3 Python package is bundled in ``sam3/`` (copied from
+ComfyUI-RMBG).  Model checkpoint (``sam3.pt``) is loaded from
+ComfyUI's ``models/sam3/`` directory.
 """
 
 import glob
 import logging
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -25,12 +27,23 @@ import comfy.model_management
 import comfy.utils
 from folder_paths import models_dir
 
-SAM3_DIR = os.path.join(models_dir, "sam3")
-os.makedirs(SAM3_DIR, exist_ok=True)
+# --- SAM3 Python code lives in <repo>/sam3/ ---
+# Internal imports use ``from sam3.model.xxx``, so we put the *parent*
+# of sam3 on sys.path and rename-alias it via the package __init__.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SAM3_LIB = os.path.join(_REPO_ROOT, "sam3")
+if _SAM3_LIB not in sys.path:
+    sys.path.insert(0, _SAM3_LIB)
+# sam3 itself acts as the ``sam3`` package (same structure as RMBG)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-# BPE vocabulary file required by SAM3's text encoder.
-# ComfyUI-RMBG stores it at models/sam3/assets/bpe_simple_vocab_16e6.txt.gz
-SAM3_BPE_PATH = Path(SAM3_DIR) / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+# Checkpoint directory under ComfyUI models/
+SAM3_CKPT_DIR = os.path.join(models_dir, "sam3")
+os.makedirs(SAM3_CKPT_DIR, exist_ok=True)
+
+# BPE vocabulary file bundled with the code
+SAM3_BPE_PATH = Path(_SAM3_LIB) / "assets" / "bpe_simple_vocab_16e6.txt.gz"
 
 _logger = logging.getLogger(__name__)
 
@@ -40,7 +53,7 @@ def _list_checkpoints():
     patterns = ["*.pt", "*.pth", "*.safetensors"]
     files = []
     for pat in patterns:
-        files.extend(glob.glob(os.path.join(SAM3_DIR, pat)))
+        files.extend(glob.glob(os.path.join(SAM3_CKPT_DIR, pat)))
     basenames = sorted(set(os.path.basename(f) for f in files))
     if not basenames:
         basenames = ["(no checkpoints found)"]
@@ -67,28 +80,19 @@ class LoadSAM3Node:
     CATEGORY = "4dhumans"
 
     def load(self, checkpoint):
-        try:
-            from sam3.model_builder import build_sam3_video_predictor
-        except ImportError:
-            raise ImportError(
-                "SAM3 is not installed. Please install it with:\n"
-                "  pip install sam3\n"
-                "or follow the instructions at "
-                "https://github.com/facebookresearch/sam3"
-            )
+        from sam3.model_builder import build_sam3_video_predictor
 
-        path = os.path.join(SAM3_DIR, checkpoint)
+        path = os.path.join(SAM3_CKPT_DIR, checkpoint)
         if not os.path.isfile(path):
             raise FileNotFoundError(
                 f"SAM3 checkpoint not found: {path}\n"
-                f"Please place model files in {SAM3_DIR}/"
+                f"Please place sam3.pt in {SAM3_CKPT_DIR}/\n"
+                f"(download from https://huggingface.co/1038lab/sam3)"
             )
 
         device = comfy.model_management.get_torch_device()
         device_str = str(device)
 
-        # Build video predictor.  Pass bpe_path if the BPE vocab file
-        # exists (installed by ComfyUI-RMBG in models/sam3/assets/).
         kwargs = dict(
             checkpoint_path=path,
             load_from_HF=False,
