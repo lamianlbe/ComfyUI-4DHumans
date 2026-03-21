@@ -12,20 +12,21 @@ app.registerExtension({
       origExecuted?.apply(this, arguments);
       if (!data) return;
 
+      const videoInfo = data.video && data.video[0];
       const nPersons = (data.n_persons && data.n_persons[0]) || 0;
       const personVisibility =
         (data.person_visibility && data.person_visibility[0]) || [];
       const nodeId = (data.node_id && data.node_id[0]) || "";
 
-      if (nPersons === 0) return;
+      if (!videoInfo || nPersons === 0) return;
 
-      initEditorControls(this, nPersons, personVisibility, nodeId);
+      initEditorUI(this, videoInfo, nPersons, personVisibility, nodeId);
     };
   },
 });
 
-function initEditorControls(node, nPersons, personVisibility, nodeId) {
-  // Remove previous controls widget if any
+function initEditorUI(node, videoInfo, nPersons, personVisibility, nodeId) {
+  // Remove previous widget
   if (node._poseEditorWidget) {
     const idx = node.widgets?.indexOf(node._poseEditorWidget);
     if (idx >= 0) node.widgets.splice(idx, 1);
@@ -35,12 +36,26 @@ function initEditorControls(node, nPersons, personVisibility, nodeId) {
   const container = document.createElement("div");
   container.style.cssText =
     "display:flex;flex-direction:column;gap:6px;padding:6px;" +
-    "width:100%;box-sizing:border-box;";
+    "width:100%;height:100%;box-sizing:border-box;overflow:hidden;";
+
+  // --- Video player ---
+  const videoEl = document.createElement("video");
+  videoEl.controls = true;
+  videoEl.loop = true;
+  videoEl.autoplay = true;
+  videoEl.muted = true;
+  videoEl.style.cssText =
+    "width:100%;flex:1;min-height:0;object-fit:contain;" +
+    "border-radius:4px;background:#000;display:block;";
+
+  const videoUrl = `/view?filename=${encodeURIComponent(videoInfo.filename)}&type=${videoInfo.type}&subfolder=${encodeURIComponent(videoInfo.subfolder || "")}`;
+  videoEl.src = videoUrl;
 
   // --- Person toggles ---
   const personsRow = document.createElement("div");
   personsRow.style.cssText =
-    "display:flex;flex-wrap:wrap;align-items:center;gap:4px;width:100%;box-sizing:border-box;";
+    "display:flex;flex-wrap:wrap;align-items:center;gap:4px;" +
+    "width:100%;box-sizing:border-box;flex-shrink:0;";
 
   const personsLabel = document.createElement("span");
   personsLabel.textContent = "Persons:";
@@ -79,7 +94,7 @@ function initEditorControls(node, nPersons, personVisibility, nodeId) {
   downloadBtn.textContent = "📥 Download NPZ";
   downloadBtn.style.cssText =
     "padding:4px 14px;font-size:12px;cursor:pointer;border:1px solid #555;" +
-    "background:#2a5a2a;color:#fff;border-radius:4px;align-self:center;";
+    "background:#2a5a2a;color:#fff;border-radius:4px;align-self:center;flex-shrink:0;";
   downloadBtn.addEventListener("click", () => {
     window.open(
       `/pose_editor/download_npz?node_id=${encodeURIComponent(nodeId)}`,
@@ -87,17 +102,24 @@ function initEditorControls(node, nPersons, personVisibility, nodeId) {
     );
   });
 
+  // Assemble
+  container.appendChild(videoEl);
   container.appendChild(personsRow);
   container.appendChild(downloadBtn);
 
-  // Add as DOM widget (below the native animated preview)
+  // Add as DOM widget
   const widget = node.addDOMWidget(
-    "pose_editor_controls",
+    "pose_editor",
     "customwidget",
     container,
-    { getMinHeight: () => 60 }
+    { getMinHeight: () => 300 }
   );
   node._poseEditorWidget = widget;
+
+  node.setSize([
+    Math.max(node.size[0], 380),
+    Math.max(node.size[1], 450),
+  ]);
 }
 
 function updateToggleBtn(btn, personId, visible) {

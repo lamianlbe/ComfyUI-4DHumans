@@ -1,16 +1,17 @@
 """
 Interactive Pose Editor node.
 
-Displays an animated preview of detected poses with person IDs (using
-ComfyUI's native animated WebP preview).  Users can toggle person
-visibility and download the edited POSES as an NPZ file from the browser.
+Displays a video preview of detected poses with person IDs using an
+HTML5 <video> element with H.264 MP4.  Users can scrub to any frame,
+toggle person visibility, and download the edited POSES as NPZ.
 
 Backend:
   - Renders debug frames with person ID labels
-  - Saves as animated WebP (ComfyUI handles playback natively)
+  - Encodes as H.264 MP4 via cv2.VideoWriter
   - Caches POSES data for API endpoints
 
 Frontend (web/js/pose_editor.js):
+  - <video> element with native controls (play/pause/scrub)
   - Per-person toggle buttons
   - Download NPZ button
 """
@@ -22,7 +23,6 @@ import random
 
 import numpy as np
 import cv2
-from PIL import Image
 
 import folder_paths
 import comfy.utils
@@ -89,7 +89,7 @@ _register_routes()
 
 
 class PoseEditorNode:
-    """Interactive pose editor with animated preview and person toggles."""
+    """Interactive pose editor with H.264 video preview and person toggles."""
 
     def __init__(self):
         self.output_dir = folder_paths.get_temp_directory()
@@ -131,8 +131,22 @@ class PoseEditorNode:
 
         pbar = comfy.utils.ProgressBar(B)
 
-        # Build PIL frames for animated WebP
-        pil_frames = []
+        # Prepare output path
+        filename_prefix = "PoseEditor" + self.prefix_append
+        full_output_folder, filename, counter, subfolder, _ = (
+            folder_paths.get_save_image_path(
+                filename_prefix, self.output_dir
+            )
+        )
+
+        mp4_filename = f"{filename}_{counter:05}_.mp4"
+        mp4_path = os.path.join(full_output_folder, mp4_filename)
+
+        # Encode as H.264 MP4 via OpenCV
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            mp4_path, fourcc, max(fps, 1.0), (img_w, img_h)
+        )
 
         for t in range(B):
             canvas = images_np[t].copy()  # (H, W, 3) RGB
@@ -171,43 +185,14 @@ class PoseEditorNode:
                     )
                     canvas = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB)
 
-            pil_frames.append(
-                Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8))
-            )
+            # Write frame (BGR for OpenCV)
+            writer.write(cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
             pbar.update(1)
+
+        writer.release()
 
         # Cache for API access
         _EDITOR_CACHE[node_id] = poses_edit
-
-        # Save as animated WebP (same approach as KJNodes PreviewAnimation)
-        filename_prefix = "PoseEditor"
-        full_output_folder, filename, counter, subfolder, _ = (
-            folder_paths.get_save_image_path(
-                filename_prefix, self.output_dir
-            )
-        )
-
-        file = f"{filename}_{counter:05}_.webp"
-        filepath = os.path.join(full_output_folder, file)
-
-        duration_ms = int(1000.0 / max(fps, 1.0))
-        pil_frames[0].save(
-            filepath,
-            save_all=True,
-            duration=duration_ms,
-            append_images=pil_frames[1:],
-            lossless=False,
-            quality=50,
-            method=0,
-        )
-
-        results = [{
-            "filename": file,
-            "subfolder": subfolder,
-            "type": self.type,
-        }]
-
-        animated = len(pil_frames) > 1
 
         # Build visibility list
         person_visibility = [
@@ -216,11 +201,15 @@ class PoseEditorNode:
         ]
 
         ui_data = {
-            "images": results,
-            "animated": [animated],
+            "video": [{
+                "filename": mp4_filename,
+                "subfolder": subfolder,
+                "type": self.type,
+            }],
             "n_persons": [n_persons],
             "person_visibility": [person_visibility],
             "node_id": [node_id],
+            "fps": [fps],
         }
 
         return {"ui": ui_data}
