@@ -91,13 +91,8 @@ class LoadSAM3Node:
             )
 
         device = comfy.model_management.get_torch_device()
-        device_str = str(device)
 
-        kwargs = dict(
-            checkpoint_path=path,
-            load_from_HF=False,
-            device=device_str,
-        )
+        kwargs = dict(checkpoint_path=path)
         if SAM3_BPE_PATH.is_file():
             kwargs["bpe_path"] = str(SAM3_BPE_PATH)
 
