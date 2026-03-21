@@ -94,10 +94,7 @@ class LoadPoseDataNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "file": (
-                    _list_npz_files(),
-                    {"image_upload": True},
-                ),
+                "file": (_list_npz_files(),),
             },
         }
 
