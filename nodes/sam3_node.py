@@ -17,14 +17,12 @@ ComfyUI's ``models/sam3/`` directory.
 import glob
 import logging
 import os
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
-import cv2
 import numpy as np
 import torch
+from PIL import Image
 
 import comfy.model_management
 import comfy.utils
@@ -142,58 +140,52 @@ class SAM3VideoSegmentationNode:
         pbar = comfy.utils.ProgressBar(B + 2)
 
         # ------------------------------------------------------------------
-        # Write frames to a temp directory as JPEG files (SAM3 expects this)
+        # Convert tensor frames to PIL Image list (SAM3 accepts this
+        # directly via load_resource_as_video_frames, no temp files needed)
         # ------------------------------------------------------------------
-        tmp_dir = tempfile.mkdtemp(prefix="sam3_frames_")
-        try:
-            for t in range(B):
-                frame = (images[t] * 255).byte().cpu().numpy()  # (H, W, 3) RGB
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(
-                    os.path.join(tmp_dir, f"{t:06d}.jpg"), frame_bgr
-                )
+        pil_frames = []
+        for t in range(B):
+            frame_np = (images[t] * 255).byte().cpu().numpy()  # (H, W, 3) RGB uint8
+            pil_frames.append(Image.fromarray(frame_np))
+        pbar.update(1)
+
+        # ------------------------------------------------------------------
+        # Start session, add text prompt, propagate
+        # ------------------------------------------------------------------
+        result = predictor.start_session(resource_path=pil_frames)
+        session_id = result["session_id"]
+
+        predictor.add_prompt(
+            session_id=session_id,
+            frame_idx=0,
+            text=text_prompt,
+        )
+        pbar.update(1)
+
+        # ------------------------------------------------------------------
+        # Propagate through video and collect per-frame results
+        # ------------------------------------------------------------------
+        per_frame_masks = {}  # frame_idx -> {obj_id: mask_np}
+
+        for result in predictor.propagate_in_video(
+            session_id=session_id,
+            propagation_direction="both",
+            start_frame_idx=None,
+            max_frame_num_to_track=None,
+        ):
+            frame_idx = result["frame_index"]
+            outputs = result["outputs"]
+            obj_ids = outputs["out_obj_ids"]          # (N,) int
+            binary_masks = outputs["out_binary_masks"]  # (N, H, W) bool
+
+            frame_dict = {}
+            for i, oid in enumerate(obj_ids):
+                frame_dict[int(oid)] = binary_masks[i]
+            per_frame_masks[frame_idx] = frame_dict
             pbar.update(1)
 
-            # ------------------------------------------------------------------
-            # Start session, add text prompt, propagate
-            # ------------------------------------------------------------------
-            result = predictor.start_session(resource_path=tmp_dir)
-            session_id = result["session_id"]
-
-            predictor.add_prompt(
-                session_id=session_id,
-                frame_idx=0,
-                text=text_prompt,
-            )
-            pbar.update(1)
-
-            # ------------------------------------------------------------------
-            # Propagate through video and collect per-frame results
-            # ------------------------------------------------------------------
-            per_frame_masks = {}  # frame_idx -> {obj_id: mask_np}
-
-            for result in predictor.propagate_in_video(
-                session_id=session_id,
-                propagation_direction="both",
-                start_frame_idx=None,
-                max_frame_num_to_track=None,
-            ):
-                frame_idx = result["frame_index"]
-                outputs = result["outputs"]
-                obj_ids = outputs["out_obj_ids"]          # (N,) int
-                binary_masks = outputs["out_binary_masks"]  # (N, H, W) bool
-
-                frame_dict = {}
-                for i, oid in enumerate(obj_ids):
-                    frame_dict[int(oid)] = binary_masks[i]
-                per_frame_masks[frame_idx] = frame_dict
-                pbar.update(1)
-
-            # Close session
-            predictor.close_session(session_id)
-
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Close session
+        predictor.close_session(session_id)
 
         # ------------------------------------------------------------------
         # Alignment: ensure every frame has the same N person slots
