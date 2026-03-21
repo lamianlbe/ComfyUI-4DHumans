@@ -191,7 +191,6 @@ class PoseEditorNode:
             mp4_path,
             fps=max(fps, 1.0),
             codec="libx264",
-            quality=None,
             output_params=["-crf", "23", "-preset", "fast",
                            "-pix_fmt", "yuv420p"],
         )
