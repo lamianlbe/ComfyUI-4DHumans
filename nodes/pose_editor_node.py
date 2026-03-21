@@ -1,37 +1,34 @@
 """
 Interactive Pose Editor node.
 
-Displays a video preview of detected poses with person IDs.  Users can
-toggle person visibility and download the edited POSES as an NPZ file
-directly from the browser.
+Displays an animated preview of detected poses with person IDs (using
+ComfyUI's native animated WebP preview).  Users can toggle person
+visibility and download the edited POSES as an NPZ file from the browser.
 
-Backend responsibilities:
-  - Render debug frames with person ID labels and save to temp dir
-  - Cache POSES data keyed by node unique_id
-  - Provide API endpoints for visibility toggling and NPZ download
+Backend:
+  - Renders debug frames with person ID labels
+  - Saves as animated WebP (ComfyUI handles playback natively)
+  - Caches POSES data for API endpoints
 
 Frontend (web/js/pose_editor.js):
-  - Video playback with scrubber
   - Per-person toggle buttons
   - Download NPZ button
 """
 
-import io
+import io as _io
 import os
-import json
 import copy
+import random
 
 import numpy as np
 import cv2
-import torch
+from PIL import Image
 
 import folder_paths
 import comfy.utils
 
 from ..humans4d.hmr2.utils.render_sapiens import render_sapiens_dwpose
-from ._pose_utils import (
-    fuse_3d_body_with_sapiens,
-)
+from ._pose_utils import fuse_3d_body_with_sapiens
 from .save_pose_node import poses_to_npz_dict
 
 # Global cache: node_id -> poses dict (mutable, edited in-place)
@@ -75,7 +72,7 @@ def _register_routes():
         poses = _EDITOR_CACHE[node_id]
         data = poses_to_npz_dict(poses)
 
-        buf = io.BytesIO()
+        buf = _io.BytesIO()
         np.savez_compressed(buf, **data)
         buf.seek(0)
 
@@ -92,7 +89,14 @@ _register_routes()
 
 
 class PoseEditorNode:
-    """Interactive pose editor with video preview and person toggles."""
+    """Interactive pose editor with animated preview and person toggles."""
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.prefix_append = "_temp_" + ''.join(
+            random.choice("abcdefghijklmnopqrstupvxyz") for _ in range(5)
+        )
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -127,17 +131,12 @@ class PoseEditorNode:
 
         pbar = comfy.utils.ProgressBar(B)
 
-        temp_dir = folder_paths.get_temp_directory()
-        subfolder = f"pose_editor_{node_id}"
-        frame_dir = os.path.join(temp_dir, subfolder)
-        os.makedirs(frame_dir, exist_ok=True)
-
-        frame_files = []
+        # Build PIL frames for animated WebP
+        pil_frames = []
 
         for t in range(B):
             canvas = images_np[t].copy()  # (H, W, 3) RGB
 
-            # Render all persons (even invisible) so user can see who to toggle
             for p_idx in range(n_persons):
                 person = poses_edit["persons"][p_idx]
                 j2d = person["body_joints2d"][t]
@@ -151,10 +150,9 @@ class PoseEditorNode:
                         canvas, sapiens_kp, img_h, img_w
                     )
 
-                # Draw person ID label near nose (COCO-WB index 0)
+                # Draw person ID label near nose
                 label_pos = None
                 if j2d is not None:
-                    # OpenPose25 index 0 = nose
                     nx, ny = float(j2d[0, 0]), float(j2d[0, 1])
                     if nx > 1 or ny > 1:
                         label_pos = (int(nx), int(ny) - 20)
@@ -164,9 +162,7 @@ class PoseEditorNode:
                         label_pos = (int(nx), int(ny) - 20)
 
                 if label_pos is not None:
-                    vis_tag = "" if person.get("visible", True) else " [hidden]"
-                    label = f"P{p_idx}{vis_tag}"
-                    # BGR for cv2
+                    label = f"P{p_idx}"
                     canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
                     cv2.putText(
                         canvas_bgr, label, label_pos,
@@ -175,22 +171,43 @@ class PoseEditorNode:
                     )
                     canvas = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB)
 
-            # Save frame as JPEG
-            fname = f"frame_{t:05d}.jpg"
-            fpath = os.path.join(frame_dir, fname)
-            canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
-            cv2.imencode(".jpg", canvas_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tofile(fpath)
-
-            frame_files.append({
-                "filename": fname,
-                "type": "temp",
-                "subfolder": subfolder,
-            })
-
+            pil_frames.append(
+                Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8))
+            )
             pbar.update(1)
 
         # Cache for API access
         _EDITOR_CACHE[node_id] = poses_edit
+
+        # Save as animated WebP (same approach as KJNodes PreviewAnimation)
+        filename_prefix = "PoseEditor"
+        full_output_folder, filename, counter, subfolder, _ = (
+            folder_paths.get_save_image_path(
+                filename_prefix, self.output_dir
+            )
+        )
+
+        file = f"{filename}_{counter:05}_.webp"
+        filepath = os.path.join(full_output_folder, file)
+
+        duration_ms = int(1000.0 / max(fps, 1.0))
+        pil_frames[0].save(
+            filepath,
+            save_all=True,
+            duration=duration_ms,
+            append_images=pil_frames[1:],
+            lossless=False,
+            quality=50,
+            method=0,
+        )
+
+        results = [{
+            "filename": file,
+            "subfolder": subfolder,
+            "type": self.type,
+        }]
+
+        animated = len(pil_frames) > 1
 
         # Build visibility list
         person_visibility = [
@@ -199,8 +216,8 @@ class PoseEditorNode:
         ]
 
         ui_data = {
-            "frames": frame_files,
-            "fps": [fps],
+            "images": results,
+            "animated": [animated],
             "n_persons": [n_persons],
             "person_visibility": [person_visibility],
             "node_id": [node_id],
