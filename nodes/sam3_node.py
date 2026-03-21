@@ -94,7 +94,9 @@ class LoadSAM3Node:
         if SAM3_BPE_PATH.is_file():
             kwargs["bpe_path"] = str(SAM3_BPE_PATH)
 
-        predictor = Sam3VideoPredictor(**kwargs)
+        import torch
+        with torch.amp.autocast("cuda", enabled=False):
+            predictor = Sam3VideoPredictor(**kwargs)
         _logger.info("Loaded SAM3 video model: %s", checkpoint)
 
         return ({"predictor": predictor},)
@@ -132,7 +134,11 @@ class SAM3VideoSegmentationNode:
     CATEGORY = "4dhumans"
 
     def segment(self, images, sam3, text_prompt):
+        import torch
         predictor = sam3["predictor"]
+        # Cast model to float32 to prevent bfloat16 mismatch on some GPUs
+        if hasattr(predictor, 'model'):
+            predictor.model.float()
 
         # images: (B, H, W, 3) float [0, 1]
         B, H, W, _C = images.shape
