@@ -1,7 +1,10 @@
 """
 PromptHMR 3D Human Pose Estimation node.
 
-Accepts an RGB image batch and 1-8 mask batches (one per person).
+Accepts an RGB image batch and a mask batch.  Masks are frame-grouped:
+for B frames and N persons the mask tensor has shape (B*N, H, W) with
+frame 1's N person masks first, then frame 2's, etc.
+
 Runs PromptHMR to recover 3D human mesh (SMPL-X) and outputs raw
 3D pose data as a POSE_3D type for downstream processing.
 """
@@ -30,16 +33,7 @@ class PromptHMRPoseNode:
             "required": {
                 "images": ("IMAGE",),
                 "prompthmr": ("PROMPTHMR",),
-                "mask_1": ("MASK",),
-            },
-            "optional": {
-                "mask_2": ("MASK",),
-                "mask_3": ("MASK",),
-                "mask_4": ("MASK",),
-                "mask_5": ("MASK",),
-                "mask_6": ("MASK",),
-                "mask_7": ("MASK",),
-                "mask_8": ("MASK",),
+                "masks": ("MASK",),
             },
         }
 
@@ -48,10 +42,7 @@ class PromptHMRPoseNode:
     FUNCTION = "estimate_pose"
     CATEGORY = "4dhumans"
 
-    def estimate_pose(self, images, prompthmr, mask_1,
-                      mask_2=None, mask_3=None, mask_4=None,
-                      mask_5=None, mask_6=None, mask_7=None,
-                      mask_8=None):
+    def estimate_pose(self, images, prompthmr, masks):
         from .load_prompthmr_node import _ensure_lib_importable
         _ensure_lib_importable()
 
@@ -61,15 +52,21 @@ class PromptHMRPoseNode:
         model = prompthmr["model"]
         img_size = prompthmr["img_size"]
 
-        # Collect all connected masks
-        all_masks = [mask_1]
-        for m in [mask_2, mask_3, mask_4, mask_5, mask_6, mask_7, mask_8]:
-            if m is not None:
-                all_masks.append(m)
-        n_persons = len(all_masks)
-
         B, img_h, img_w, C = images.shape
         rgb = images[..., :3]  # (B, H, W, 3)
+
+        # masks: (M, H, W) frame-grouped: frame1's N persons, frame2's N, ...
+        M = masks.shape[0]
+        if M % B != 0:
+            raise ValueError(
+                f"PromptHMR 3D Human Pose: mask count ({M}) must be a "
+                f"multiple of frame count ({B}). Got {M} masks for {B} frames."
+            )
+        n_persons = M // B
+        # Reshape to (B, n_persons, H, W)
+        if masks.dim() == 4:
+            masks = masks[..., 0]  # drop trailing channel dim if present
+        masks = masks.reshape(B, n_persons, masks.shape[-2], masks.shape[-1])
 
         pbar = comfy.utils.ProgressBar(B)
 
@@ -95,12 +92,8 @@ class PromptHMRPoseNode:
             masks_uint8 = []
             person_indices = []  # which person index each valid detection belongs to
 
-            for p_idx, mask_batch in enumerate(all_masks):
-                # mask_batch shape: (B, H, W) or (B, H, W, 1)
-                if mask_batch.dim() == 4:
-                    mask_frame = mask_batch[t, ..., 0].cpu().numpy()
-                else:
-                    mask_frame = mask_batch[t].cpu().numpy()
+            for p_idx in range(n_persons):
+                mask_frame = masks[t, p_idx].cpu().numpy()
 
                 bbox = _mask_to_bbox(mask_frame)
                 if bbox is None:
