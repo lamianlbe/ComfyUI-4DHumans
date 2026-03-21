@@ -190,7 +190,7 @@ class PoseEditorNode:
         with iio.imopen(mp4_path, "w", plugin="pyav") as out_file:
             out_file.init_video_stream("libx264", fps=max(fps, 1.0))
             for frame in rendered_frames:
-                out_file.write_frame(frame, pixel_format="yuv420p")
+                out_file.write_frame(frame)
 
         # Cache for API access
         _EDITOR_CACHE[node_id] = poses_edit
