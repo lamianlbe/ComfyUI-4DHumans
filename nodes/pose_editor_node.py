@@ -182,9 +182,9 @@ class PoseEditorNode:
             cv2.imencode(".jpg", canvas_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tofile(fpath)
 
             frame_files.append({
-                "filename": f"{subfolder}/{fname}",
+                "filename": fname,
                 "type": "temp",
-                "subfolder": "",
+                "subfolder": subfolder,
             })
 
             pbar.update(1)

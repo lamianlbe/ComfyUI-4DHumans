@@ -173,9 +173,7 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
   for (let i = 0; i < totalFrames; i++) {
     const img = new Image();
     const f = frames[i];
-    img.src = api.apiURL(
-      `/view?filename=${encodeURIComponent(f.filename)}&type=${f.type}&subfolder=${encodeURIComponent(f.subfolder || "")}`
-    );
+    img.src = `/view?filename=${encodeURIComponent(f.filename)}&type=${f.type}&subfolder=${encodeURIComponent(f.subfolder || "")}`;
     img.onload = () => {
       loadedCount++;
       if (loadedCount === 1) updateDisplay();
