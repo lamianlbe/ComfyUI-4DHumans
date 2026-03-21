@@ -13,10 +13,10 @@ app.registerExtension({
       if (!data) return;
 
       const frames = data.frames || [];
-      const fps = data.fps || 24;
-      const nPersons = data.n_persons || 0;
-      const personVisibility = data.person_visibility || [];
-      const nodeId = data.node_id || "";
+      const fps = (data.fps && data.fps[0]) || 24;
+      const nPersons = (data.n_persons && data.n_persons[0]) || 0;
+      const personVisibility = (data.person_visibility && data.person_visibility[0]) || [];
+      const nodeId = (data.node_id && data.node_id[0]) || "";
 
       if (frames.length === 0) return;
 

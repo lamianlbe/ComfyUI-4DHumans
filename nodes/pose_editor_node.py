@@ -201,10 +201,10 @@ class PoseEditorNode:
 
         ui_data = {
             "frames": frame_files,
-            "fps": fps,
-            "n_persons": n_persons,
-            "person_visibility": person_visibility,
-            "node_id": node_id,
+            "fps": [fps],
+            "n_persons": [n_persons],
+            "person_visibility": [person_visibility],
+            "node_id": [node_id],
         }
 
         return {"ui": ui_data, "result": (poses_edit,)}
