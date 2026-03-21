@@ -1,11 +1,11 @@
 """
 Sapiens PromptHMR to NLF Poses node.
 
-Converts PromptHMR 3D pose (POSE_3D) and Sapiens 2D pose (POSE_2D) into
-formats compatible with SCAIL-Pose's "Render NLF Poses" node.
+Converts unified POSES data into formats compatible with SCAIL-Pose's
+"Render NLF Poses" node.  Only processes visible persons.
 
 Outputs:
-  - nlf_poses (NLFPRED): list of per-frame tensors (n_persons, 24, 3)
+  - nlf_poses (NLFPRED): list of per-frame tensors (n_visible, 24, 3)
     in SMPL 24-joint format for 3D skeleton rendering.
   - dw_poses (DWPOSES): dict with per-frame body/face/hands in DWPose
     format for 2D overlay rendering.
@@ -50,30 +50,8 @@ def _transform_j3d_to_nlf_camera(j3d, cam_int, scale, offset, K_nlf):
     Transform 3D joints from PromptHMR's padded/scaled camera space
     to NLF's camera space.
 
-    For a 3D point P = (X, Y, Z) in PromptHMR's modified camera:
-      pixel_modified = K_phmr @ (P / Z)
-      pixel_original = (pixel_modified - offset) / scale
-
-    For NLF rendering at pixel_original:
-      pixel_original = K_nlf @ (P_nlf / Z_nlf)
-
-    We solve for X_nlf, Y_nlf keeping Z, then apply a **uniform scale**
+    We solve for X_nlf, Y_nlf keeping Z, then apply a uniform scale
     k = f_nlf / f_modified to bring depth into NLF's expected range.
-    A uniform scale of all 3 coordinates preserves 2D projection
-    (since projection depends only on X/Z and Y/Z) while adjusting the
-    absolute depth — this controls how thick the cylinders appear.
-
-    Parameters
-    ----------
-    j3d : (24, 3) ndarray
-    cam_int : (3, 3) ndarray – PromptHMR modified cam intrinsic
-    scale : float
-    offset : (2,) ndarray
-    K_nlf : (3, 3) ndarray – NLF intrinsic matrix
-
-    Returns
-    -------
-    j3d_nlf : (24, 3) ndarray
     """
     f_m = cam_int[0, 0]
     cx_m = cam_int[0, 2]
@@ -85,47 +63,29 @@ def _transform_j3d_to_nlf_camera(j3d, cam_int, scale, offset, K_nlf):
 
     X, Y, Z = j3d[:, 0], j3d[:, 1], j3d[:, 2]
 
-    # Project to 2D in modified space, then unscale to original image coords
     u_orig = (f_m * X / Z + cx_m - offset[0]) / scale
     v_orig = (f_m * Y / Z + cy_m - offset[1]) / scale
 
-    # Back-project from original image coords using NLF camera, keeping Z
     X_nlf = (u_orig - cx_nlf) * Z / f_nlf
     Y_nlf = (v_orig - cy_nlf) * Z / f_nlf
 
     j3d_nlf = np.stack([X_nlf, Y_nlf, Z], axis=-1).astype(np.float32)
 
-    # Uniform depth scale: PromptHMR decoded depth using f_modified,
-    # which is typically larger than f_nlf.  Without this correction the
-    # person appears too far away and cylinders render too thin.
-    # Uniform scaling preserves the 2D projection (X/Z, Y/Z unchanged).
     depth_scale = float(f_nlf / f_m)
     j3d_nlf *= depth_scale
 
-    # Convert from metres (SMPL convention) to millimetres (NLF convention)
     j3d_nlf *= METRES_TO_MM
     return j3d_nlf
 
 
 class SapiensPromptHMRToNLFNode:
-    """Convert POSE_2D + POSE_3D to SCAIL-Pose NLF/DW format."""
+    """Convert unified POSES to SCAIL-Pose NLF/DW format."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pose_2d": ("POSE_2D",),
-                "pose_3d": ("POSE_3D",),
-                "fps": (
-                    "FLOAT",
-                    {
-                        "default": 24.0,
-                        "min": 1.0,
-                        "max": 120.0,
-                        "step": 0.001,
-                        "tooltip": "Source video FPS.",
-                    },
-                ),
+                "poses": ("POSES",),
             },
         }
 
@@ -134,54 +94,60 @@ class SapiensPromptHMRToNLFNode:
     FUNCTION = "convert"
     CATEGORY = "4dhumans"
 
-    def convert(self, pose_2d, pose_3d, fps):
-        n_persons = pose_3d["n_persons"]
-        B = pose_3d["n_frames"]
-        img_h = pose_3d["img_h"]
-        img_w = pose_3d["img_w"]
+    def convert(self, poses):
+        n_persons = poses["n_persons"]
+        B = poses["n_frames"]
+        img_h = poses["img_h"]
+        img_w = poses["img_w"]
+        fps = poses["fps"]
 
-        # NLF camera intrinsic (55 deg FOV)
+        # Only process visible persons
+        visible_indices = [
+            p for p in range(n_persons)
+            if poses["persons"][p].get("visible", True)
+        ]
+        n_visible = len(visible_indices)
+
         K_nlf = _nlf_intrinsic(img_h, img_w)
 
         pbar = comfy.utils.ProgressBar(B)
 
         # ----- Per-person timelines (source fps) -----
-        per_person_3d = [[None] * B for _ in range(n_persons)]
-        per_person_body = [[None] * B for _ in range(n_persons)]
-        per_person_fh = [[None] * B for _ in range(n_persons)]
+        per_person_3d = [[None] * B for _ in range(n_visible)]
+        per_person_body = [[None] * B for _ in range(n_visible)]
+        per_person_fh = [[None] * B for _ in range(n_visible)]
 
         for t in range(B):
-            # Camera info for this frame
-            cam_int_t = pose_3d["cam_int"][t]
-            scale_t = pose_3d["scale"][t]
-            offset_t = pose_3d["offset"][t]
+            cam_int_t = poses["cam_int"][t]
+            scale_t = poses["scale"][t]
+            offset_t = poses["offset"][t]
 
-            for p_idx in range(n_persons):
-                person_3d = pose_3d["persons"][p_idx]
+            for vi, p_idx in enumerate(visible_indices):
+                person = poses["persons"][p_idx]
 
-                # --- NLF 3D (SMPL 24 joints, transformed to NLF camera) ---
-                j3d_smpl = person_3d["smpl_j3d"][t]
+                # --- NLF 3D ---
+                j3d_smpl = person["smpl_j3d"][t]
                 if j3d_smpl is not None and cam_int_t is not None:
                     j3d_nlf = _transform_j3d_to_nlf_camera(
                         j3d_smpl, cam_int_t, scale_t, offset_t, K_nlf
                     )
-                    per_person_3d[p_idx][t] = j3d_nlf
+                    per_person_3d[vi][t] = j3d_nlf
 
-                # --- DW body (from PromptHMR 2D) ---
-                j2d = person_3d["body_joints2d"][t]
+                # --- DW body ---
+                j2d = person["body_joints2d"][t]
                 if j2d is not None:
                     candidate, subset = openpose25_to_dwpose_body(
                         j2d, img_w, img_h
                     )
-                    per_person_body[p_idx][t] = (candidate, subset)
+                    per_person_body[vi][t] = (candidate, subset)
 
-                # --- DW face + hands (from POSE_2D) ---
-                sapiens_kp = pose_2d["persons"][p_idx]["keypoints"][t]
+                # --- DW face + hands ---
+                sapiens_kp = person["keypoints"][t]
                 if sapiens_kp is not None:
                     face, rhand, lhand = coco_wb133_to_dwpose_face_hands(
                         sapiens_kp, img_w, img_h
                     )
-                    per_person_fh[p_idx][t] = (face, rhand, lhand)
+                    per_person_fh[vi][t] = (face, rhand, lhand)
 
             pbar.update(1)
 
@@ -191,8 +157,8 @@ class SapiensPromptHMRToNLFNode:
         if do_resample:
             resampled_3d = []
             src_indices = None
-            for p in range(n_persons):
-                r, idx = resample_keypoints(per_person_3d[p], fps, TARGET_FPS)
+            for vi in range(n_visible):
+                r, idx = resample_keypoints(per_person_3d[vi], fps, TARGET_FPS)
                 resampled_3d.append(r)
                 if src_indices is None:
                     src_indices = idx
@@ -200,9 +166,9 @@ class SapiensPromptHMRToNLFNode:
 
             resampled_body_cand = []
             resampled_body_sub = []
-            for p in range(n_persons):
-                cand_tl = [x[0] if x is not None else None for x in per_person_body[p]]
-                sub_tl = [x[1] if x is not None else None for x in per_person_body[p]]
+            for vi in range(n_visible):
+                cand_tl = [x[0] if x is not None else None for x in per_person_body[vi]]
+                sub_tl = [x[1] if x is not None else None for x in per_person_body[vi]]
                 r_c, _ = resample_keypoints(cand_tl, fps, TARGET_FPS)
                 r_s, _ = resample_keypoints(sub_tl, fps, TARGET_FPS)
                 resampled_body_cand.append(r_c)
@@ -211,10 +177,10 @@ class SapiensPromptHMRToNLFNode:
             resampled_face = []
             resampled_rhand = []
             resampled_lhand = []
-            for p in range(n_persons):
-                face_tl = [x[0] if x is not None else None for x in per_person_fh[p]]
-                rhand_tl = [x[1] if x is not None else None for x in per_person_fh[p]]
-                lhand_tl = [x[2] if x is not None else None for x in per_person_fh[p]]
+            for vi in range(n_visible):
+                face_tl = [x[0] if x is not None else None for x in per_person_fh[vi]]
+                rhand_tl = [x[1] if x is not None else None for x in per_person_fh[vi]]
+                lhand_tl = [x[2] if x is not None else None for x in per_person_fh[vi]]
                 r_f, _ = resample_keypoints(face_tl, fps, TARGET_FPS)
                 r_r, _ = resample_keypoints(rhand_tl, fps, TARGET_FPS)
                 r_l, _ = resample_keypoints(lhand_tl, fps, TARGET_FPS)
@@ -225,32 +191,32 @@ class SapiensPromptHMRToNLFNode:
             n_out = B
             resampled_3d = per_person_3d
             resampled_body_cand = [
-                [x[0] if x is not None else None for x in per_person_body[p]]
-                for p in range(n_persons)
+                [x[0] if x is not None else None for x in per_person_body[vi]]
+                for vi in range(n_visible)
             ]
             resampled_body_sub = [
-                [x[1] if x is not None else None for x in per_person_body[p]]
-                for p in range(n_persons)
+                [x[1] if x is not None else None for x in per_person_body[vi]]
+                for vi in range(n_visible)
             ]
             resampled_face = [
-                [x[0] if x is not None else None for x in per_person_fh[p]]
-                for p in range(n_persons)
+                [x[0] if x is not None else None for x in per_person_fh[vi]]
+                for vi in range(n_visible)
             ]
             resampled_rhand = [
-                [x[1] if x is not None else None for x in per_person_fh[p]]
-                for p in range(n_persons)
+                [x[1] if x is not None else None for x in per_person_fh[vi]]
+                for vi in range(n_visible)
             ]
             resampled_lhand = [
-                [x[2] if x is not None else None for x in per_person_fh[p]]
-                for p in range(n_persons)
+                [x[2] if x is not None else None for x in per_person_fh[vi]]
+                for vi in range(n_visible)
             ]
 
-        # ----- Build NLF output: list of (n_persons, 24, 3) tensors -----
+        # ----- Build NLF output -----
         nlf_poses = []
         for t in range(n_out):
             frame_joints = []
-            for p in range(n_persons):
-                j = resampled_3d[p][t]
+            for vi in range(n_visible):
+                j = resampled_3d[vi][t]
                 if j is not None:
                     frame_joints.append(
                         torch.from_numpy(j).float()
@@ -261,7 +227,10 @@ class SapiensPromptHMRToNLFNode:
                     frame_joints.append(
                         torch.zeros((24, 3), dtype=torch.float32)
                     )
-            nlf_poses.append(torch.stack(frame_joints, dim=0))
+            if frame_joints:
+                nlf_poses.append(torch.stack(frame_joints, dim=0))
+            else:
+                nlf_poses.append(torch.zeros((1, 24, 3), dtype=torch.float32))
 
         # ----- Build DW output -----
         dw_frames = []
@@ -276,27 +245,27 @@ class SapiensPromptHMRToNLFNode:
             faces = []
             hands = []
 
-            for p in range(n_persons):
-                cand = resampled_body_cand[p][t]
-                sub = resampled_body_sub[p][t]
+            for vi in range(n_visible):
+                cand = resampled_body_cand[vi][t]
+                sub = resampled_body_sub[vi][t]
                 candidates.append(cand if cand is not None else zero_body.copy())
                 subsets.append(sub if sub is not None else zero_subset.copy())
 
-                face = resampled_face[p][t]
+                face = resampled_face[vi][t]
                 faces.append(face if face is not None else zero_face.copy())
 
-                rhand = resampled_rhand[p][t]
-                lhand = resampled_lhand[p][t]
+                rhand = resampled_rhand[vi][t]
+                lhand = resampled_lhand[vi][t]
                 hands.append(rhand if rhand is not None else zero_hand.copy())
                 hands.append(lhand if lhand is not None else zero_hand.copy())
 
             dw_frames.append({
                 "bodies": {
-                    "candidate": np.array(candidates, dtype=np.float32),
-                    "subset": np.array(subsets, dtype=np.float32),
+                    "candidate": np.array(candidates, dtype=np.float32) if candidates else np.zeros((1, 18, 2), dtype=np.float32),
+                    "subset": np.array(subsets, dtype=np.float32) if subsets else np.full((1, 18), -1.0, dtype=np.float32),
                 },
-                "hands": np.array(hands, dtype=np.float32),
-                "faces": np.array(faces, dtype=np.float32),
+                "hands": np.array(hands, dtype=np.float32) if hands else np.zeros((2, 21, 2), dtype=np.float32),
+                "faces": np.array(faces, dtype=np.float32) if faces else np.zeros((1, 68, 2), dtype=np.float32),
             })
 
         dw_poses = {"poses": dw_frames, "swap_hands": False}

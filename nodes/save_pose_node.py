@@ -1,8 +1,9 @@
 """
 Save Pose Data node.
 
-Serialises POSE_2D + POSE_3D + fps to a compressed .npz file in ComfyUI's
-output directory.  The file can later be reloaded by the Load Pose Data node.
+Serialises unified POSES to a compressed .npz file in ComfyUI's output
+directory.  All persons are saved (including invisible ones) with their
+visibility flags preserved for non-destructive editing.
 """
 
 import os
@@ -22,24 +23,58 @@ def _next_filename(directory, prefix, ext=".npz"):
         counter += 1
 
 
+def poses_to_npz_dict(poses):
+    """Convert a POSES dict to a flat dict suitable for np.savez_compressed."""
+    n_persons = poses["n_persons"]
+    n_frames = poses["n_frames"]
+
+    data = {
+        "n_persons": np.int32(n_persons),
+        "n_frames": np.int32(n_frames),
+        "img_h": np.int32(poses["img_h"]),
+        "img_w": np.int32(poses["img_w"]),
+        "fps": np.float32(poses["fps"]),
+    }
+
+    for i in range(n_persons):
+        person = poses["persons"][i]
+        data[f"person_{i}_visible"] = np.bool_(person.get("visible", True))
+
+        for j in range(n_frames):
+            # Sapiens 2D keypoints
+            kp = person["keypoints"][j]
+            if kp is not None:
+                data[f"p2d_p{i}_f{j}"] = np.asarray(kp, dtype=np.float32)
+
+            # PromptHMR 3D data
+            for key in ("body_joints2d", "body_joints", "smpl_j3d"):
+                val = person[key][j]
+                if val is not None:
+                    data[f"p3d_p{i}_{key}_f{j}"] = np.asarray(
+                        val, dtype=np.float32
+                    )
+
+    # Camera data
+    for j in range(n_frames):
+        cam_int = poses["cam_int"][j]
+        if cam_int is not None:
+            data[f"cam_int_f{j}"] = np.asarray(cam_int, dtype=np.float64)
+            data[f"scale_f{j}"] = np.float64(poses["scale"][j])
+            data[f"offset_f{j}"] = np.asarray(
+                poses["offset"][j], dtype=np.float64
+            )
+
+    return data
+
+
 class SavePoseDataNode:
-    """Save POSE_2D + POSE_3D + fps to a .npz file."""
+    """Save unified POSES to a .npz file."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pose_2d": ("POSE_2D",),
-                "pose_3d": ("POSE_3D",),
-                "fps": (
-                    "FLOAT",
-                    {
-                        "default": 24.0,
-                        "min": 1.0,
-                        "max": 120.0,
-                        "step": 0.001,
-                    },
-                ),
+                "poses": ("POSES",),
                 "filename_prefix": (
                     "STRING",
                     {"default": "pose_data"},
@@ -52,52 +87,14 @@ class SavePoseDataNode:
     FUNCTION = "save"
     CATEGORY = "4dhumans"
 
-    def save(self, pose_2d, pose_3d, fps, filename_prefix):
+    def save(self, poses, filename_prefix):
         output_dir = folder_paths.get_output_directory()
         os.makedirs(output_dir, exist_ok=True)
 
         filename = _next_filename(output_dir, filename_prefix)
         path = os.path.join(output_dir, filename)
 
-        n_persons = pose_3d["n_persons"]
-        n_frames = pose_3d["n_frames"]
-
-        data = {
-            "n_persons": np.int32(n_persons),
-            "n_frames": np.int32(n_frames),
-            "img_h": np.int32(pose_3d["img_h"]),
-            "img_w": np.int32(pose_3d["img_w"]),
-            "fps": np.float32(fps),
-        }
-
-        # ----- POSE_2D persons -----
-        for i in range(n_persons):
-            for j in range(n_frames):
-                kp = pose_2d["persons"][i]["keypoints"][j]
-                if kp is not None:
-                    data[f"p2d_p{i}_f{j}"] = np.asarray(kp, dtype=np.float32)
-
-        # ----- POSE_3D persons -----
-        for i in range(n_persons):
-            person = pose_3d["persons"][i]
-            for j in range(n_frames):
-                for key in ("body_joints2d", "body_joints", "smpl_j3d"):
-                    val = person[key][j]
-                    if val is not None:
-                        data[f"p3d_p{i}_{key}_f{j}"] = np.asarray(
-                            val, dtype=np.float32
-                        )
-
-        # ----- Camera data -----
-        for j in range(n_frames):
-            cam_int = pose_3d["cam_int"][j]
-            if cam_int is not None:
-                data[f"cam_int_f{j}"] = np.asarray(cam_int, dtype=np.float64)
-                data[f"scale_f{j}"] = np.float64(pose_3d["scale"][j])
-                data[f"offset_f{j}"] = np.asarray(
-                    pose_3d["offset"][j], dtype=np.float64
-                )
-
+        data = poses_to_npz_dict(poses)
         np.savez_compressed(path, **data)
 
         return {"ui": {"text": [f"Saved: {filename}"]}}

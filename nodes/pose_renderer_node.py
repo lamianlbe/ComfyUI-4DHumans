@@ -1,9 +1,10 @@
 """
 Sapiens PromptHMR Pose Renderer node.
 
-Fuses body keypoints from POSE_3D with face/hand keypoints from POSE_2D
-and renders DWPose-style skeleton images.  Supports debug overlay,
-frame rate resampling, and toggling face / hand+foot visibility.
+Fuses body keypoints from 3D data with face/hand keypoints from 2D data
+within a unified POSES dict and renders DWPose-style skeleton images.
+Supports debug overlay, frame rate resampling, and toggling face /
+hand+foot visibility.  Only renders persons with visible=True.
 """
 
 import numpy as np
@@ -25,18 +26,7 @@ class PoseRendererNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pose_2d": ("POSE_2D",),
-                "pose_3d": ("POSE_3D",),
-                "fps": (
-                    "FLOAT",
-                    {
-                        "default": 24.0,
-                        "min": 1.0,
-                        "max": 120.0,
-                        "step": 0.001,
-                        "tooltip": "Source video FPS.",
-                    },
-                ),
+                "poses": ("POSES",),
                 "debug": (
                     "BOOLEAN",
                     {
@@ -91,13 +81,14 @@ class PoseRendererNode:
     FUNCTION = "render"
     CATEGORY = "4dhumans"
 
-    def render(self, pose_2d, pose_3d, fps, debug, target_fps,
+    def render(self, poses, debug, target_fps,
                show_face, show_hand_foot, images=None):
 
-        n_persons = pose_3d["n_persons"]
-        B = pose_3d["n_frames"]
-        img_h = pose_3d["img_h"]
-        img_w = pose_3d["img_w"]
+        n_persons = poses["n_persons"]
+        B = poses["n_frames"]
+        img_h = poses["img_h"]
+        img_w = poses["img_w"]
+        fps = poses["fps"]
 
         if debug and images is None:
             raise ValueError(
@@ -107,6 +98,12 @@ class PoseRendererNode:
         if images is not None:
             images_nchw = images.permute(0, 3, 1, 2)
 
+        # Collect visible person indices
+        visible_indices = [
+            p for p in range(n_persons) if poses["persons"][p].get("visible", True)
+        ]
+        n_visible = len(visible_indices)
+
         pbar = comfy.utils.ProgressBar(2 * B)
 
         # -----------------------------------------------------------
@@ -115,12 +112,10 @@ class PoseRendererNode:
         frame_kps = [[] for _ in range(B)]
 
         for t in range(B):
-            for p_idx in range(n_persons):
-                # Body from POSE_3D (OpenPose 25 2D joints)
-                j2d = pose_3d["persons"][p_idx]["body_joints2d"][t]
-
-                # Face/hands from POSE_2D (COCO-WB 133)
-                sapiens_kp = pose_2d["persons"][p_idx]["keypoints"][t]
+            for p_idx in visible_indices:
+                person = poses["persons"][p_idx]
+                j2d = person["body_joints2d"][t]
+                sapiens_kp = person["keypoints"][t]
 
                 if j2d is not None:
                     kp = fuse_3d_body_with_sapiens(
@@ -130,7 +125,6 @@ class PoseRendererNode:
                     )
                     frame_kps[t].append(kp)
                 elif sapiens_kp is not None and show_face and show_hand_foot:
-                    # Fallback: use full Sapiens prediction
                     frame_kps[t].append(sapiens_kp.copy())
 
             pbar.update(1)
@@ -146,20 +140,20 @@ class PoseRendererNode:
 
         if do_resample:
             per_person = []
-            for p in range(n_persons):
+            for vp in range(n_visible):
                 timeline = []
                 for t in range(B):
-                    if p < len(frame_kps[t]):
-                        timeline.append(frame_kps[t][p])
+                    if vp < len(frame_kps[t]):
+                        timeline.append(frame_kps[t][vp])
                     else:
                         timeline.append(None)
                 per_person.append(timeline)
 
             resampled_persons = []
             src_indices = None
-            for p in range(n_persons):
+            for vp in range(n_visible):
                 resampled, s_idx = resample_keypoints(
-                    per_person[p], fps, target_fps)
+                    per_person[vp], fps, target_fps)
                 resampled_persons.append(resampled)
                 if src_indices is None:
                     src_indices = s_idx
@@ -167,9 +161,9 @@ class PoseRendererNode:
             n_out = len(src_indices)
             frame_kps_out = [[] for _ in range(n_out)]
             for t in range(n_out):
-                for p in range(n_persons):
-                    if resampled_persons[p][t] is not None:
-                        frame_kps_out[t].append(resampled_persons[p][t])
+                for vp in range(n_visible):
+                    if resampled_persons[vp][t] is not None:
+                        frame_kps_out[t].append(resampled_persons[vp][t])
         else:
             frame_kps_out = frame_kps
             src_indices = list(range(B))
