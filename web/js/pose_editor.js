@@ -26,41 +26,46 @@ app.registerExtension({
 });
 
 function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
-  // Remove previous editor widget if any
+  // Clean up previous editor
   if (node._poseEditorWidget) {
     const idx = node.widgets?.indexOf(node._poseEditorWidget);
     if (idx >= 0) node.widgets.splice(idx, 1);
     node._poseEditorWidget = null;
   }
+  if (node._poseEditorTimerId) {
+    clearTimeout(node._poseEditorTimerId);
+    node._poseEditorTimerId = null;
+  }
 
-  // Preload frame images
-  const images = [];
-  let loadedCount = 0;
   const totalFrames = frames.length;
 
+  // --- Container ---
   const container = document.createElement("div");
   container.style.cssText =
-    "display:flex;flex-direction:column;align-items:center;gap:8px;padding:8px;width:100%;";
+    "display:flex;flex-direction:column;gap:6px;padding:6px;" +
+    "width:100%;box-sizing:border-box;overflow:hidden;";
 
   // --- Playback controls ---
   const controlsRow = document.createElement("div");
   controlsRow.style.cssText =
-    "display:flex;align-items:center;gap:8px;width:100%;";
+    "display:flex;align-items:center;gap:6px;width:100%;box-sizing:border-box;overflow:hidden;";
 
   const playBtn = document.createElement("button");
   playBtn.textContent = "▶";
   playBtn.style.cssText =
-    "width:36px;height:28px;font-size:14px;cursor:pointer;border:1px solid #555;background:#333;color:#fff;border-radius:4px;";
+    "width:32px;height:26px;font-size:13px;cursor:pointer;border:1px solid #555;" +
+    "background:#333;color:#fff;border-radius:4px;flex-shrink:0;";
 
   const scrubber = document.createElement("input");
   scrubber.type = "range";
   scrubber.min = 0;
   scrubber.max = totalFrames - 1;
   scrubber.value = 0;
-  scrubber.style.cssText = "flex:1;cursor:pointer;";
+  scrubber.style.cssText = "flex:1;min-width:0;cursor:pointer;";
 
   const frameLabel = document.createElement("span");
-  frameLabel.style.cssText = "color:#ccc;font-size:12px;min-width:60px;text-align:right;";
+  frameLabel.style.cssText =
+    "color:#ccc;font-size:11px;white-space:nowrap;flex-shrink:0;";
   frameLabel.textContent = `1/${totalFrames}`;
 
   controlsRow.appendChild(playBtn);
@@ -69,25 +74,27 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
 
   // --- Image display ---
   const imgEl = document.createElement("img");
-  imgEl.style.cssText = "width:100%;image-rendering:auto;border-radius:4px;background:#000;";
+  imgEl.style.cssText =
+    "width:100%;max-height:100%;object-fit:contain;border-radius:4px;" +
+    "background:#000;display:block;";
 
   // --- Person toggles ---
   const personsRow = document.createElement("div");
   personsRow.style.cssText =
-    "display:flex;flex-wrap:wrap;gap:6px;width:100%;";
+    "display:flex;flex-wrap:wrap;align-items:center;gap:4px;width:100%;box-sizing:border-box;";
 
   const personsLabel = document.createElement("span");
   personsLabel.textContent = "Persons:";
-  personsLabel.style.cssText = "color:#aaa;font-size:12px;margin-right:4px;";
+  personsLabel.style.cssText = "color:#aaa;font-size:11px;flex-shrink:0;";
   personsRow.appendChild(personsLabel);
 
   const visibility = [...personVisibility];
-  const toggleBtns = [];
 
   for (let p = 0; p < nPersons; p++) {
     const btn = document.createElement("button");
     btn.style.cssText =
-      "padding:2px 10px;font-size:12px;cursor:pointer;border:1px solid #555;border-radius:4px;";
+      "padding:1px 8px;font-size:11px;cursor:pointer;border:1px solid #555;" +
+      "border-radius:3px;min-width:28px;";
     updateToggleBtn(btn, p, visibility[p]);
 
     btn.addEventListener("click", async () => {
@@ -105,7 +112,6 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
       });
     });
 
-    toggleBtns.push(btn);
     personsRow.appendChild(btn);
   }
 
@@ -113,9 +119,13 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
   const downloadBtn = document.createElement("button");
   downloadBtn.textContent = "📥 Download NPZ";
   downloadBtn.style.cssText =
-    "padding:6px 16px;font-size:13px;cursor:pointer;border:1px solid #555;background:#2a5a2a;color:#fff;border-radius:4px;";
+    "padding:4px 14px;font-size:12px;cursor:pointer;border:1px solid #555;" +
+    "background:#2a5a2a;color:#fff;border-radius:4px;align-self:flex-start;";
   downloadBtn.addEventListener("click", () => {
-    window.open(`/pose_editor/download_npz?node_id=${encodeURIComponent(nodeId)}`, "_blank");
+    window.open(
+      `/pose_editor/download_npz?node_id=${encodeURIComponent(nodeId)}`,
+      "_blank"
+    );
   });
 
   // Assemble
@@ -124,37 +134,59 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
   container.appendChild(personsRow);
   container.appendChild(downloadBtn);
 
+  // --- Preload images ---
+  const images = [];
+  let loadedCount = 0;
+
+  for (let i = 0; i < totalFrames; i++) {
+    const img = new Image();
+    const f = frames[i];
+    img.src = `/view?filename=${encodeURIComponent(f.filename)}&type=${f.type}&subfolder=${encodeURIComponent(f.subfolder || "")}`;
+    img.onload = () => {
+      loadedCount++;
+      // Show first frame as soon as it loads
+      if (i === 0) updateDisplay();
+    };
+    images.push(img);
+  }
+
   // --- Playback state ---
   let currentFrame = 0;
   let playing = false;
-  let timerId = null;
 
   function updateDisplay() {
-    if (images[currentFrame] && images[currentFrame].complete) {
-      imgEl.src = images[currentFrame].src;
+    const img = images[currentFrame];
+    if (img && img.complete && img.naturalWidth > 0) {
+      imgEl.src = img.src;
     }
     scrubber.value = currentFrame;
     frameLabel.textContent = `${currentFrame + 1}/${totalFrames}`;
   }
 
-  function play() {
-    playing = true;
-    playBtn.textContent = "⏸";
-    function tick() {
+  function scheduleNextFrame() {
+    node._poseEditorTimerId = setTimeout(() => {
       if (!playing) return;
       currentFrame = (currentFrame + 1) % totalFrames;
       updateDisplay();
-      timerId = setTimeout(tick, 1000 / fps);
-    }
-    tick();
+      scheduleNextFrame();
+    }, 1000 / fps);
+  }
+
+  function play() {
+    playing = true;
+    playBtn.textContent = "⏸";
+    // Advance immediately to next frame, then schedule
+    currentFrame = (currentFrame + 1) % totalFrames;
+    updateDisplay();
+    scheduleNextFrame();
   }
 
   function pause() {
     playing = false;
     playBtn.textContent = "▶";
-    if (timerId) {
-      clearTimeout(timerId);
-      timerId = null;
+    if (node._poseEditorTimerId) {
+      clearTimeout(node._poseEditorTimerId);
+      node._poseEditorTimerId = null;
     }
   }
 
@@ -169,39 +201,30 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
     updateDisplay();
   });
 
-  // Load images
-  for (let i = 0; i < totalFrames; i++) {
-    const img = new Image();
-    const f = frames[i];
-    img.src = `/view?filename=${encodeURIComponent(f.filename)}&type=${f.type}&subfolder=${encodeURIComponent(f.subfolder || "")}`;
-    img.onload = () => {
-      loadedCount++;
-      if (loadedCount === 1) updateDisplay();
-    };
-    images.push(img);
+  // Show first frame immediately if already loaded
+  if (images[0] && images[0].complete) {
+    updateDisplay();
   }
 
   // Add as DOM widget
   const widget = node.addDOMWidget("pose_editor", "customwidget", container, {
-    getMinHeight: () => 400,
-    getMaxHeight: () => 800,
+    getMinHeight: () => 300,
   });
   node._poseEditorWidget = widget;
 
-  // Resize node to fit
   node.setSize([
-    Math.max(node.size[0], 400),
-    Math.max(node.size[1], 520),
+    Math.max(node.size[0], 380),
+    Math.max(node.size[1], 480),
   ]);
 }
 
 function updateToggleBtn(btn, personId, visible) {
   if (visible) {
-    btn.textContent = `✓ Person ${personId}`;
+    btn.textContent = `✓ ${personId}`;
     btn.style.background = "#2a4a2a";
     btn.style.color = "#8f8";
   } else {
-    btn.textContent = `✗ Person ${personId}`;
+    btn.textContent = `✗ ${personId}`;
     btn.style.background = "#4a2a2a";
     btn.style.color = "#f88";
   }
