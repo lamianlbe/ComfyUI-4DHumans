@@ -23,6 +23,7 @@ import random
 
 import numpy as np
 import cv2
+import imageio
 
 import folder_paths
 import comfy.utils
@@ -142,11 +143,8 @@ class PoseEditorNode:
         mp4_filename = f"{filename}_{counter:05}_.mp4"
         mp4_path = os.path.join(full_output_folder, mp4_filename)
 
-        # Encode as H.264 MP4 via OpenCV
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(
-            mp4_path, fourcc, max(fps, 1.0), (img_w, img_h)
-        )
+        # Render frames
+        rendered_frames = []
 
         for t in range(B):
             canvas = images_np[t].copy()  # (H, W, 3) RGB
@@ -185,11 +183,21 @@ class PoseEditorNode:
                     )
                     canvas = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB)
 
-            # Write frame (BGR for OpenCV)
-            writer.write(cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+            rendered_frames.append(np.clip(canvas, 0, 255).astype(np.uint8))
             pbar.update(1)
 
-        writer.release()
+        # Encode as H.264 MP4 via imageio-ffmpeg
+        writer = imageio.get_writer(
+            mp4_path,
+            fps=max(fps, 1.0),
+            codec="libx264",
+            quality=None,
+            output_params=["-crf", "23", "-preset", "fast",
+                           "-pix_fmt", "yuv420p"],
+        )
+        for frame in rendered_frames:
+            writer.append_data(frame)
+        writer.close()
 
         # Cache for API access
         _EDITOR_CACHE[node_id] = poses_edit
