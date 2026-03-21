@@ -94,9 +94,7 @@ class LoadSAM3Node:
         if SAM3_BPE_PATH.is_file():
             kwargs["bpe_path"] = str(SAM3_BPE_PATH)
 
-        import torch
-        with torch.amp.autocast("cuda", enabled=False):
-            predictor = Sam3VideoPredictor(**kwargs)
+        predictor = Sam3VideoPredictor(**kwargs)
         _logger.info("Loaded SAM3 video model: %s", checkpoint)
 
         return ({"predictor": predictor},)
@@ -136,9 +134,6 @@ class SAM3VideoSegmentationNode:
     def segment(self, images, sam3, text_prompt):
         import torch
         predictor = sam3["predictor"]
-        # Cast model to float32 to prevent bfloat16 mismatch on some GPUs
-        if hasattr(predictor, 'model'):
-            predictor.model.float()
 
         # images: (B, H, W, 3) float [0, 1]
         B, H, W, _C = images.shape
@@ -157,15 +152,25 @@ class SAM3VideoSegmentationNode:
 
         # ------------------------------------------------------------------
         # Start session, add text prompt, propagate
+        # Use bfloat16 autocast on CUDA (same as RMBG's SAM3 node)
         # ------------------------------------------------------------------
-        result = predictor.start_session(resource_path=pil_frames)
-        session_id = result["session_id"]
-
-        predictor.add_prompt(
-            session_id=session_id,
-            frame_idx=0,
-            text=text_prompt,
+        from contextlib import nullcontext
+        device = next(predictor.model.parameters()).device
+        autocast_ctx = (
+            torch.autocast(device.type, dtype=torch.bfloat16)
+            if device.type == "cuda"
+            else nullcontext()
         )
+
+        with autocast_ctx:
+            result = predictor.start_session(resource_path=pil_frames)
+            session_id = result["session_id"]
+
+            predictor.add_prompt(
+                session_id=session_id,
+                frame_idx=0,
+                text=text_prompt,
+            )
         pbar.update(1)
 
         # ------------------------------------------------------------------
@@ -173,12 +178,15 @@ class SAM3VideoSegmentationNode:
         # ------------------------------------------------------------------
         per_frame_masks = {}  # frame_idx -> {obj_id: mask_np}
 
-        for result in predictor.propagate_in_video(
-            session_id=session_id,
-            propagation_direction="both",
-            start_frame_idx=None,
-            max_frame_num_to_track=None,
-        ):
+        with autocast_ctx:
+            propagation_results = list(predictor.propagate_in_video(
+                session_id=session_id,
+                propagation_direction="both",
+                start_frame_idx=None,
+                max_frame_num_to_track=None,
+            ))
+
+        for result in propagation_results:
             frame_idx = result["frame_index"]
             outputs = result["outputs"]
             obj_ids = outputs["out_obj_ids"]          # (N,) int
