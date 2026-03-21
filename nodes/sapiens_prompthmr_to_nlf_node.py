@@ -1,8 +1,8 @@
 """
 Sapiens PromptHMR to NLF Poses node.
 
-Converts PromptHMR 3D pose (POSE_3D) and Sapiens 2D pose into formats
-compatible with SCAIL-Pose's "Render NLF Poses" node.
+Converts PromptHMR 3D pose (POSE_3D) and Sapiens 2D pose (POSE_2D) into
+formats compatible with SCAIL-Pose's "Render NLF Poses" node.
 
 Outputs:
   - nlf_poses (NLFPRED): list of per-frame tensors (n_persons, 24, 3)
@@ -10,7 +10,7 @@ Outputs:
   - dw_poses (DWPOSES): dict with per-frame body/face/hands in DWPose
     format for 2D overlay rendering.
 
-Internally runs Sapiens 2D inference and interpolates all results to 16fps.
+Interpolates all results to 16fps for WAN SCAIL compatibility.
 
 Camera transform: PromptHMR's 3D joints are in the model's padded/scaled
 camera space. This node transforms them to the NLF camera space (55 deg FOV)
@@ -21,7 +21,6 @@ import numpy as np
 import torch
 import comfy.utils
 
-from ..humans4d.hmr2.utils.sapiens_inference import run_sapiens_on_bbox
 from ._pose_utils import (
     openpose25_to_dwpose_body,
     coco_wb133_to_dwpose_face_hands,
@@ -109,14 +108,13 @@ def _transform_j3d_to_nlf_camera(j3d, cam_int, scale, offset, K_nlf):
 
 
 class SapiensPromptHMRToNLFNode:
-    """Convert Sapiens 2D + PromptHMR 3D to SCAIL-Pose NLF/DW format."""
+    """Convert POSE_2D + POSE_3D to SCAIL-Pose NLF/DW format."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "sapiens": ("SAPIENS",),
-                "images": ("IMAGE",),
+                "pose_2d": ("POSE_2D",),
                 "pose_3d": ("POSE_3D",),
                 "fps": (
                     "FLOAT",
@@ -136,12 +134,11 @@ class SapiensPromptHMRToNLFNode:
     FUNCTION = "convert"
     CATEGORY = "4dhumans"
 
-    def convert(self, sapiens, images, pose_3d, fps):
-        images_nchw = images.permute(0, 3, 1, 2)
-        B, _C, img_h, img_w = images_nchw.shape
-
+    def convert(self, pose_2d, pose_3d, fps):
         n_persons = pose_3d["n_persons"]
-        whole_bbox = np.array([0, 0, img_w, img_h], dtype=np.float32)
+        B = pose_3d["n_frames"]
+        img_h = pose_3d["img_h"]
+        img_w = pose_3d["img_w"]
 
         # NLF camera intrinsic (55 deg FOV)
         K_nlf = _nlf_intrinsic(img_h, img_w)
@@ -154,25 +151,16 @@ class SapiensPromptHMRToNLFNode:
         per_person_fh = [[None] * B for _ in range(n_persons)]
 
         for t in range(B):
-            img_np = (images_nchw[t].permute(1, 2, 0) * 255).byte().numpy()
-
-            # Run Sapiens to get COCO WholeBody 133 keypoints
-            sapiens_result = run_sapiens_on_bbox(img_np, whole_bbox, sapiens)
-            sapiens_kp = (
-                sapiens_result["pixel_kp"] if sapiens_result is not None
-                else None
-            )
-
             # Camera info for this frame
             cam_int_t = pose_3d["cam_int"][t]
             scale_t = pose_3d["scale"][t]
             offset_t = pose_3d["offset"][t]
 
             for p_idx in range(n_persons):
-                person = pose_3d["persons"][p_idx]
+                person_3d = pose_3d["persons"][p_idx]
 
                 # --- NLF 3D (SMPL 24 joints, transformed to NLF camera) ---
-                j3d_smpl = person["smpl_j3d"][t]
+                j3d_smpl = person_3d["smpl_j3d"][t]
                 if j3d_smpl is not None and cam_int_t is not None:
                     j3d_nlf = _transform_j3d_to_nlf_camera(
                         j3d_smpl, cam_int_t, scale_t, offset_t, K_nlf
@@ -180,14 +168,15 @@ class SapiensPromptHMRToNLFNode:
                     per_person_3d[p_idx][t] = j3d_nlf
 
                 # --- DW body (from PromptHMR 2D) ---
-                j2d = person["body_joints2d"][t]
+                j2d = person_3d["body_joints2d"][t]
                 if j2d is not None:
                     candidate, subset = openpose25_to_dwpose_body(
                         j2d, img_w, img_h
                     )
                     per_person_body[p_idx][t] = (candidate, subset)
 
-                # --- DW face + hands (from Sapiens) ---
+                # --- DW face + hands (from POSE_2D) ---
+                sapiens_kp = pose_2d["persons"][p_idx]["keypoints"][t]
                 if sapiens_kp is not None:
                     face, rhand, lhand = coco_wb133_to_dwpose_face_hands(
                         sapiens_kp, img_w, img_h

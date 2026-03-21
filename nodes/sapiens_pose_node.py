@@ -1,229 +1,100 @@
 """
 Sapiens 2D Human Pose node.
 
-Unified node that replaces the former single-person and multi-person
-Sapiens nodes.  Accepts RGB images (required), an optional Sapiens model,
-and optional PromptHMR 3D pose data (POSE_3D).
+Accepts RGB images, per-person masks (frame-grouped), and a Sapiens model.
+For each frame and each person, the image is masked (regions outside the
+person's mask are blacked out) before running Sapiens inference.
 
-Logic:
-  - Neither connected  → error
-  - Sapiens only       → full COCO-WholeBody 133 keypoints from Sapiens
-  - 3D only            → body+feet from PromptHMR (23 keypoints), no face/hands
-  - Both               → body+feet from 3D, face+hands from Sapiens
-
-Output is rendered as DWPose-style skeleton images.
+Output is a POSE_2D dict with per-person, per-frame COCO-WholeBody 133
+keypoints, structured identically to POSE_3D for easy downstream pairing.
 """
 
 import numpy as np
 import torch
 import comfy.utils
 
-from ..humans4d.hmr2.utils.render_sapiens import render_sapiens_dwpose
 from ..humans4d.hmr2.utils.sapiens_inference import run_sapiens_on_bbox
-from ._pose_utils import (
-    openpose25_to_coco_wholebody,
-    fuse_3d_body_with_sapiens,
-    resample_keypoints,
-)
+
+
+def _mask_to_bbox(mask_np):
+    """Convert a binary mask (H, W) to a [x1, y1, x2, y2] bbox array."""
+    ys, xs = np.where(mask_np > 0.5)
+    if len(xs) == 0:
+        return None
+    x1, x2 = float(xs.min()), float(xs.max())
+    y1, y2 = float(ys.min()), float(ys.max())
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
 
 
 class SapiensPoseNode:
-    """Sapiens 2D whole-body pose estimation (single or multi person)."""
+    """Sapiens 2D whole-body pose estimation (mask-based, multi-person)."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "images": ("IMAGE",),
-                "debug": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": (
-                            "Overlay the skeleton on the original frame "
-                            "instead of a black canvas."
-                        ),
-                    },
-                ),
-                "target_fps": (
-                    "FLOAT",
-                    {
-                        "default": 0.0,
-                        "min": 0.0,
-                        "max": 30.0,
-                        "step": 0.1,
-                        "tooltip": (
-                            "Output frame rate. 0 keeps source fps. "
-                            "Any value 1-30 resamples with interpolation."
-                        ),
-                    },
-                ),
-                "show_face": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": (
-                            "Show face keypoints from Sapiens. "
-                            "When False only PromptHMR body keypoints are shown."
-                        ),
-                    },
-                ),
-                "show_hand_foot": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": (
-                            "Show hand & foot keypoints from Sapiens. "
-                            "When False only PromptHMR body keypoints are shown."
-                        ),
-                    },
-                ),
-            },
-            "optional": {
+                "masks": ("MASK",),
                 "sapiens": ("SAPIENS",),
-                "pose_3d": ("POSE_3D",),
-                "fps": (
-                    "FLOAT",
-                    {
-                        "default": 24.0,
-                        "min": 1.0,
-                        "max": 120.0,
-                        "step": 0.001,
-                        "tooltip": "Source video FPS.",
-                    },
-                ),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "FLOAT")
-    RETURN_NAMES = ("pose_images", "fps")
-    FUNCTION = "render_pose"
+    RETURN_TYPES = ("POSE_2D",)
+    RETURN_NAMES = ("pose_2d",)
+    FUNCTION = "estimate_pose"
     CATEGORY = "4dhumans"
 
-    def render_pose(self, images, debug, target_fps, show_face, show_hand_foot,
-                    sapiens=None, pose_3d=None, fps=24.0):
-        if sapiens is None and pose_3d is None:
+    def estimate_pose(self, images, masks, sapiens):
+        B, img_h, img_w, _C = images.shape
+
+        # masks: (M, H, W) frame-grouped: frame1's N persons, frame2's N, ...
+        if masks.dim() == 4:
+            masks = masks[..., 0]
+        M = masks.shape[0]
+        if M % B != 0:
             raise ValueError(
-                "Sapiens 2D Human Pose: at least one of 'sapiens' or "
-                "'pose_3d' must be connected."
+                f"Sapiens 2D Human Pose: mask count ({M}) must be a "
+                f"multiple of frame count ({B}). Got {M} masks for {B} frames."
             )
+        n_persons = M // B
+        masks = masks.reshape(B, n_persons, masks.shape[-2], masks.shape[-1])
 
-        images_nchw = images.permute(0, 3, 1, 2)
-        B, _C, img_h, img_w = images_nchw.shape
+        pbar = comfy.utils.ProgressBar(B * n_persons)
 
-        use_sapiens = sapiens is not None
-        use_3d = pose_3d is not None
-        n_persons = pose_3d["n_persons"] if use_3d else 1
-
-        pbar = comfy.utils.ProgressBar(2 * B)
-
-        # -----------------------------------------------------------
-        # Pass 1: build per-frame, per-person COCO-WB keypoints
-        # -----------------------------------------------------------
-        # frame_kps[t] = list of (133, 3) arrays, one per person
-        frame_kps = [[] for _ in range(B)]
-
-        whole_bbox = np.array([0, 0, img_w, img_h], dtype=np.float32)
+        # Per-person storage
+        persons = []
+        for _ in range(n_persons):
+            persons.append({"keypoints": [None] * B})
 
         for t in range(B):
-            img_np = (images_nchw[t].permute(1, 2, 0) * 255).byte().numpy()
+            img_np = (images[t] * 255).byte().cpu().numpy()  # (H, W, 3)
 
-            # Get Sapiens prediction if available
-            sapiens_kp = None
-            if use_sapiens:
-                result = run_sapiens_on_bbox(img_np, whole_bbox, sapiens)
+            for p_idx in range(n_persons):
+                mask_frame = masks[t, p_idx].cpu().numpy()
+
+                bbox = _mask_to_bbox(mask_frame)
+                if bbox is None:
+                    pbar.update(1)
+                    continue
+
+                # Apply mask: black out regions outside person
+                mask_bool = mask_frame > 0.5
+                masked_img = img_np.copy()
+                masked_img[~mask_bool] = 0
+
+                # Run Sapiens on masked image with person bbox
+                result = run_sapiens_on_bbox(masked_img, bbox, sapiens)
                 if result is not None:
-                    sapiens_kp = result["pixel_kp"]  # (133, 3)
+                    persons[p_idx]["keypoints"][t] = result["pixel_kp"]  # (133, 3)
 
-            if use_3d and use_sapiens:
-                # Both: body+feet from 3D, face+hands from Sapiens
-                for p_idx in range(n_persons):
-                    j2d = pose_3d["persons"][p_idx]["body_joints2d"][t]
-                    if j2d is not None:
-                        kp = fuse_3d_body_with_sapiens(
-                            j2d, sapiens_kp,
-                            show_face=show_face,
-                            show_hand_foot=show_hand_foot,
-                        )
-                        frame_kps[t].append(kp)
-                    elif sapiens_kp is not None:
-                        frame_kps[t].append(sapiens_kp.copy())
+                pbar.update(1)
 
-            elif use_3d:
-                # 3D only: body+feet from PromptHMR, no face/hands
-                for p_idx in range(n_persons):
-                    j2d = pose_3d["persons"][p_idx]["body_joints2d"][t]
-                    if j2d is not None:
-                        kp = openpose25_to_coco_wholebody(j2d)
-                        frame_kps[t].append(kp)
+        pose_2d = {
+            "n_persons": n_persons,
+            "n_frames": B,
+            "img_h": img_h,
+            "img_w": img_w,
+            "persons": persons,
+        }
 
-            elif use_sapiens:
-                # Sapiens only: full 133-keypoint prediction
-                if sapiens_kp is not None:
-                    frame_kps[t].append(sapiens_kp.copy())
-
-            pbar.update(1)
-
-        # -----------------------------------------------------------
-        # Frame rate resampling (per-person linear interpolation)
-        # -----------------------------------------------------------
-        do_resample = (target_fps >= 1.0
-                       and fps > 0
-                       and abs(fps - target_fps) > 0.1)
-
-        output_fps = float(target_fps) if do_resample else float(fps)
-
-        if do_resample:
-            # Convert frame_kps[t][p] → per-person timelines for interpolation
-            per_person = []
-            for p in range(n_persons):
-                timeline = []
-                for t in range(B):
-                    if p < len(frame_kps[t]):
-                        timeline.append(frame_kps[t][p])
-                    else:
-                        timeline.append(None)
-                per_person.append(timeline)
-
-            # Resample each person's timeline independently
-            resampled_persons = []
-            src_indices = None
-            for p in range(n_persons):
-                resampled, s_idx = resample_keypoints(
-                    per_person[p], fps, target_fps)
-                resampled_persons.append(resampled)
-                if src_indices is None:
-                    src_indices = s_idx
-
-            # Recombine into per-frame structure
-            n_out = len(src_indices)
-            frame_kps_out = [[] for _ in range(n_out)]
-            for t in range(n_out):
-                for p in range(n_persons):
-                    if resampled_persons[p][t] is not None:
-                        frame_kps_out[t].append(resampled_persons[p][t])
-        else:
-            frame_kps_out = frame_kps
-            src_indices = list(range(B))
-            n_out = B
-
-        # -----------------------------------------------------------
-        # Pass 2: render
-        # -----------------------------------------------------------
-        pose_images = []
-        for out_t in range(n_out):
-            src_t = src_indices[out_t]
-            if debug:
-                canvas = (images_nchw[src_t].permute(1, 2, 0)
-                          * 255).byte().numpy().copy()
-            else:
-                canvas = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-
-            for kp in frame_kps_out[out_t]:
-                canvas = render_sapiens_dwpose(canvas, kp, img_h, img_w)
-
-            pose_images.append(
-                torch.from_numpy(canvas.astype(np.float32) / 255.0))
-            pbar.update(1)
-
-        return (torch.stack(pose_images), output_fps)
+        return (pose_2d,)
