@@ -17,9 +17,12 @@ ComfyUI's ``models/sam3/`` directory.
 import glob
 import logging
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 
@@ -28,13 +31,12 @@ import comfy.utils
 from folder_paths import models_dir
 
 # --- SAM3 Python code lives in <repo>/sam3/ ---
-# Internal imports use ``from sam3.model.xxx``, so we put the *parent*
-# of sam3 on sys.path and rename-alias it via the package __init__.
+# Internal imports use ``from sam3.model.xxx``, so we put the repo root
+# (parent of the sam3 package) on sys.path.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SAM3_LIB = os.path.join(_REPO_ROOT, "sam3")
-if _SAM3_LIB not in sys.path:
-    sys.path.insert(0, _SAM3_LIB)
-# sam3 itself acts as the ``sam3`` package (same structure as RMBG)
+_SAM3_PKG = os.path.join(_REPO_ROOT, "sam3")
+if _SAM3_PKG not in sys.path:
+    sys.path.insert(0, _SAM3_PKG)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
@@ -43,7 +45,7 @@ SAM3_CKPT_DIR = os.path.join(models_dir, "sam3")
 os.makedirs(SAM3_CKPT_DIR, exist_ok=True)
 
 # BPE vocabulary file bundled with the code
-SAM3_BPE_PATH = Path(_SAM3_LIB) / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+SAM3_BPE_PATH = Path(_SAM3_PKG) / "assets" / "bpe_simple_vocab_16e6.txt.gz"
 
 _logger = logging.getLogger(__name__)
 
@@ -80,7 +82,7 @@ class LoadSAM3Node:
     CATEGORY = "4dhumans"
 
     def load(self, checkpoint):
-        from sam3.model_builder import build_sam3_video_predictor
+        from sam3.model.sam3_video_predictor import Sam3VideoPredictor
 
         path = os.path.join(SAM3_CKPT_DIR, checkpoint)
         if not os.path.isfile(path):
@@ -90,16 +92,14 @@ class LoadSAM3Node:
                 f"(download from https://huggingface.co/1038lab/sam3)"
             )
 
-        device = comfy.model_management.get_torch_device()
-
         kwargs = dict(checkpoint_path=path)
         if SAM3_BPE_PATH.is_file():
             kwargs["bpe_path"] = str(SAM3_BPE_PATH)
 
-        predictor = build_sam3_video_predictor(**kwargs)
+        predictor = Sam3VideoPredictor(**kwargs)
         _logger.info("Loaded SAM3 video model: %s", checkpoint)
 
-        return ({"predictor": predictor, "device": device},)
+        return ({"predictor": predictor},)
 
 
 class SAM3VideoSegmentationNode:
@@ -139,37 +139,61 @@ class SAM3VideoSegmentationNode:
         # images: (B, H, W, 3) float [0, 1]
         B, H, W, _C = images.shape
 
-        pbar = comfy.utils.ProgressBar(B + 1)
-
-        # Convert to uint8 numpy frames for SAM3
-        frames_np = (images * 255).byte().cpu().numpy()  # (B, H, W, 3)
+        pbar = comfy.utils.ProgressBar(B + 2)
 
         # ------------------------------------------------------------------
-        # Initialise SAM3 state and add text prompt
+        # Write frames to a temp directory as JPEG files (SAM3 expects this)
         # ------------------------------------------------------------------
-        state = predictor.init_state(frames_np)
-        predictor.add_new_text(
-            inference_state=state,
-            frame_idx=0,
-            text=text_prompt,
-        )
-        pbar.update(1)
-
-        # ------------------------------------------------------------------
-        # Propagate through video and collect per-frame results
-        # ------------------------------------------------------------------
-        per_frame_masks = {}  # frame_idx -> {obj_id: mask_np}
-
-        for frame_idx, obj_ids, masks_logits in predictor.propagate_in_video(
-            inference_state=state,
-        ):
-            masks_bin = (masks_logits > 0.0).squeeze(1).cpu().numpy()  # (N, H, W)
-            frame_dict = {}
-            for i, oid in enumerate(obj_ids):
-                oid_int = int(oid)
-                frame_dict[oid_int] = masks_bin[i]
-            per_frame_masks[frame_idx] = frame_dict
+        tmp_dir = tempfile.mkdtemp(prefix="sam3_frames_")
+        try:
+            for t in range(B):
+                frame = (images[t] * 255).byte().cpu().numpy()  # (H, W, 3) RGB
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(
+                    os.path.join(tmp_dir, f"{t:06d}.jpg"), frame_bgr
+                )
             pbar.update(1)
+
+            # ------------------------------------------------------------------
+            # Start session, add text prompt, propagate
+            # ------------------------------------------------------------------
+            result = predictor.start_session(resource_path=tmp_dir)
+            session_id = result["session_id"]
+
+            predictor.add_prompt(
+                session_id=session_id,
+                frame_idx=0,
+                text=text_prompt,
+            )
+            pbar.update(1)
+
+            # ------------------------------------------------------------------
+            # Propagate through video and collect per-frame results
+            # ------------------------------------------------------------------
+            per_frame_masks = {}  # frame_idx -> {obj_id: mask_np}
+
+            for result in predictor.propagate_in_video(
+                session_id=session_id,
+                propagation_direction="both",
+                start_frame_idx=None,
+                max_frame_num_to_track=None,
+            ):
+                frame_idx = result["frame_index"]
+                outputs = result["outputs"]
+                obj_ids = outputs["out_obj_ids"]          # (N,) int
+                binary_masks = outputs["out_binary_masks"]  # (N, H, W) bool
+
+                frame_dict = {}
+                for i, oid in enumerate(obj_ids):
+                    frame_dict[int(oid)] = binary_masks[i]
+                per_frame_masks[frame_idx] = frame_dict
+                pbar.update(1)
+
+            # Close session
+            predictor.close_session(session_id)
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
         # ------------------------------------------------------------------
         # Alignment: ensure every frame has the same N person slots
