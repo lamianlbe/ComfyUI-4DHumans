@@ -23,7 +23,6 @@ import random
 
 import numpy as np
 import cv2
-import imageio
 
 import folder_paths
 import comfy.utils
@@ -186,17 +185,12 @@ class PoseEditorNode:
             rendered_frames.append(np.clip(canvas, 0, 255).astype(np.uint8))
             pbar.update(1)
 
-        # Encode as H.264 MP4 via imageio-ffmpeg
-        writer = imageio.get_writer(
-            mp4_path,
-            fps=max(fps, 1.0),
-            codec="libx264",
-            output_params=["-crf", "23", "-preset", "fast",
-                           "-pix_fmt", "yuv420p"],
-        )
-        for frame in rendered_frames:
-            writer.append_data(frame)
-        writer.close()
+        # Encode as H.264 MP4 via imageio PyAV plugin
+        import imageio.v3 as iio
+        with iio.imopen(mp4_path, "w", plugin="pyav") as out_file:
+            out_file.init_video_stream("libx264", fps=max(fps, 1.0))
+            for frame in rendered_frames:
+                out_file.write_frame(frame, pixel_format="yuv420p")
 
         # Cache for API access
         _EDITOR_CACHE[node_id] = poses_edit
