@@ -3,9 +3,12 @@ Load Pose Data node.
 
 Loads a .npz file previously saved by the Save Pose Data node and
 reconstructs a unified POSES dict with visibility flags preserved.
+
+Supports file upload via ComfyUI's built-in upload button (files are
+uploaded to the input directory).
 """
 
-import glob
+import hashlib
 import os
 
 import numpy as np
@@ -13,14 +16,19 @@ import numpy as np
 import folder_paths
 
 
-def _list_pose_files():
-    """Return basenames of available .npz pose files in the output dir."""
-    output_dir = folder_paths.get_output_directory()
-    files = sorted(glob.glob(os.path.join(output_dir, "*.npz")))
-    basenames = [os.path.basename(f) for f in files]
-    if not basenames:
-        basenames = ["(no files found)"]
-    return basenames
+def _list_npz_files():
+    """Return basenames of available .npz files in the input dir."""
+    input_dir = folder_paths.get_input_directory()
+    files = []
+    if os.path.isdir(input_dir):
+        for f in sorted(os.listdir(input_dir)):
+            if f.lower().endswith(".npz") and os.path.isfile(
+                os.path.join(input_dir, f)
+            ):
+                files.append(f)
+    if not files:
+        files = ["(no files found)"]
+    return files
 
 
 def npz_to_poses(npz):
@@ -80,13 +88,16 @@ def npz_to_poses(npz):
 
 
 class LoadPoseDataNode:
-    """Load unified POSES from a .npz file."""
+    """Load unified POSES from an uploaded .npz file."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "file": (_list_pose_files(),),
+                "file": (
+                    _list_npz_files(),
+                    {"image_upload": True},
+                ),
             },
         }
 
@@ -97,15 +108,22 @@ class LoadPoseDataNode:
 
     @classmethod
     def IS_CHANGED(cls, file):
-        output_dir = folder_paths.get_output_directory()
-        path = os.path.join(output_dir, file)
+        path = folder_paths.get_annotated_filepath(file)
         if os.path.isfile(path):
-            return os.path.getmtime(path)
+            m = hashlib.sha256()
+            with open(path, "rb") as f:
+                m.update(f.read())
+            return m.digest().hex()
         return float("nan")
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, file):
+        if not folder_paths.exists_annotated_filepath(file):
+            return f"Invalid pose file: {file}"
+        return True
+
     def load(self, file):
-        output_dir = folder_paths.get_output_directory()
-        path = os.path.join(output_dir, file)
+        path = folder_paths.get_annotated_filepath(file)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Pose data file not found: {path}")
 
