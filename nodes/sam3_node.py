@@ -8,10 +8,15 @@ frame-aligned masks suitable for PromptHMR / Sapiens downstream nodes.
 Output masks have shape (B * N, H, W) where B = number of frames and
 N = number of detected persons.  Every frame has exactly N mask slots;
 frames where a person is not visible get a zero mask.
+
+Compatible with the checkpoint from ComfyUI-RMBG (``models/sam3/sam3.pt``).
+The same ``sam3.pt`` works for both image and video modes.
 """
 
+import glob
 import logging
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -23,12 +28,15 @@ from folder_paths import models_dir
 SAM3_DIR = os.path.join(models_dir, "sam3")
 os.makedirs(SAM3_DIR, exist_ok=True)
 
+# BPE vocabulary file required by SAM3's text encoder.
+# ComfyUI-RMBG stores it at models/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+SAM3_BPE_PATH = Path(SAM3_DIR) / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+
 _logger = logging.getLogger(__name__)
 
 
 def _list_checkpoints():
     """Return basenames of available SAM3 checkpoint files."""
-    import glob
     patterns = ["*.pt", "*.pth", "*.safetensors"]
     files = []
     for pat in patterns:
@@ -43,6 +51,7 @@ class LoadSAM3Node:
     """Load a SAM3 video segmentation model.
 
     Checkpoint files should be placed in ``models/sam3/``.
+    Compatible with the sam3.pt from ComfyUI-RMBG.
     """
 
     @classmethod
@@ -59,7 +68,7 @@ class LoadSAM3Node:
 
     def load(self, checkpoint):
         try:
-            from sam3 import build_sam3_video_predictor
+            from sam3.model_builder import build_sam3_video_predictor
         except ImportError:
             raise ImportError(
                 "SAM3 is not installed. Please install it with:\n"
@@ -76,13 +85,20 @@ class LoadSAM3Node:
             )
 
         device = comfy.model_management.get_torch_device()
+        device_str = str(device)
 
-        predictor = build_sam3_video_predictor(
+        # Build video predictor.  Pass bpe_path if the BPE vocab file
+        # exists (installed by ComfyUI-RMBG in models/sam3/assets/).
+        kwargs = dict(
             checkpoint_path=path,
             load_from_HF=False,
-            device=device,
+            device=device_str,
         )
-        _logger.info("Loaded SAM3 model: %s", checkpoint)
+        if SAM3_BPE_PATH.is_file():
+            kwargs["bpe_path"] = str(SAM3_BPE_PATH)
+
+        predictor = build_sam3_video_predictor(**kwargs)
+        _logger.info("Loaded SAM3 video model: %s", checkpoint)
 
         return ({"predictor": predictor, "device": device},)
 
