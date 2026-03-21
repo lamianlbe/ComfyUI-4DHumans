@@ -220,11 +220,11 @@ function initEditorUI(node, frames, fps, nPersons, personVisibility, nodeId) {
 
 function updateToggleBtn(btn, personId, visible) {
   if (visible) {
-    btn.textContent = `✓ ${personId}`;
+    btn.textContent = `✓ P${personId}`;
     btn.style.background = "#2a4a2a";
     btn.style.color = "#8f8";
   } else {
-    btn.textContent = `✗ ${personId}`;
+    btn.textContent = `✗ P${personId}`;
     btn.style.background = "#4a2a2a";
     btn.style.color = "#f88";
   }
