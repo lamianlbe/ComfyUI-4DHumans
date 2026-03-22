@@ -270,32 +270,6 @@ class PoseEditorNode:
             "required": {
                 "poses": ("POSES",),
                 "images": ("IMAGE",),
-                "velocity_threshold": (
-                    "FLOAT",
-                    {
-                        "default": 3.0,
-                        "min": 0.0,
-                        "max": 20.0,
-                        "step": 0.1,
-                        "tooltip": (
-                            "Outlier detection sensitivity. Higher = less "
-                            "aggressive filtering. 0 = disabled."
-                        ),
-                    },
-                ),
-                "smooth_sigma": (
-                    "FLOAT",
-                    {
-                        "default": 0.0,
-                        "min": 0.0,
-                        "max": 5.0,
-                        "step": 0.1,
-                        "tooltip": (
-                            "Gaussian temporal smoothing sigma. 0 = no "
-                            "smoothing, only outlier repair."
-                        ),
-                    },
-                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -307,8 +281,7 @@ class PoseEditorNode:
     FUNCTION = "edit"
     CATEGORY = "4dhumans"
 
-    def edit(self, poses, images, velocity_threshold, smooth_sigma,
-             unique_id=None):
+    def edit(self, poses, images, unique_id=None):
         node_id = str(unique_id) if unique_id is not None else "unknown"
 
         poses_edit = copy.deepcopy(poses)
@@ -317,10 +290,10 @@ class PoseEditorNode:
         n_persons = poses_edit["n_persons"]
         fps = poses_edit["fps"]
 
-        # Restore filter params from loaded NPZ if present, but prefer
-        # the node's widget values (which the user may have changed).
-        # The widget values are the authoritative source.
-        # (NPZ-stored values are only used as defaults in the frontend.)
+        # Use filter params from NPZ if present, otherwise defaults
+        velocity_threshold = poses_edit.get(
+            "_filter_velocity_threshold", 3.0)
+        smooth_sigma = poses_edit.get("_filter_smooth_sigma", 0.0)
 
         # Apply temporal filter from raw → keypoints
         _apply_temporal_filter(poses_edit, velocity_threshold, smooth_sigma)
