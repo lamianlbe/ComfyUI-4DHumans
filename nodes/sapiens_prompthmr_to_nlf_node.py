@@ -89,8 +89,8 @@ class SapiensPromptHMRToNLFNode:
             },
         }
 
-    RETURN_TYPES = ("NLFPRED", "DWPOSES")
-    RETURN_NAMES = ("nlf_poses", "dw_poses")
+    RETURN_TYPES = ("NLFPRED", "DWPOSES", "INT", "INT")
+    RETURN_NAMES = ("nlf_poses", "dw_poses", "width", "height")
     FUNCTION = "convert"
     CATEGORY = "4dhumans"
 
@@ -270,4 +270,4 @@ class SapiensPromptHMRToNLFNode:
 
         dw_poses = {"poses": dw_frames, "swap_hands": False}
 
-        return (nlf_poses, dw_poses)
+        return (nlf_poses, dw_poses, img_w, img_h)
