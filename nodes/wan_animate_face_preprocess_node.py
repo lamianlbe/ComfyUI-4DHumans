@@ -20,6 +20,8 @@ import numpy as np
 import torch
 import comfy.utils
 
+TARGET_FPS = 16.0
+
 
 # OpenPose 25 indices for head/upper-body landmarks
 _NOSE = 0
@@ -144,8 +146,8 @@ class WanAnimateFacePreprocessNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("images",)
+    RETURN_TYPES = ("IMAGE", "FLOAT")
+    RETURN_NAMES = ("images", "fps")
     FUNCTION = "preprocess"
     CATEGORY = "4dhumans"
 
@@ -153,6 +155,7 @@ class WanAnimateFacePreprocessNode:
         B, img_h, img_w, C = images.shape
         n_persons = poses["n_persons"]
         n_frames = poses["n_frames"]
+        fps = poses["fps"]
 
         if B != n_frames:
             raise ValueError(
@@ -222,4 +225,21 @@ class WanAnimateFacePreprocessNode:
 
             pbar.update(1)
 
-        return (torch.stack(output),)
+        result = torch.stack(output)
+
+        # --- Resample to 16fps (nearest-frame) ---
+        do_resample = fps > 0 and abs(fps - TARGET_FPS) > 0.1
+        if do_resample and B >= 2:
+            duration = (B - 1) / fps
+            n_out = max(1, int(round(duration * TARGET_FPS)) + 1)
+            indices = []
+            for i in range(n_out):
+                t_sec = i / TARGET_FPS
+                j = min(int(round(t_sec * fps)), B - 1)
+                indices.append(j)
+            result = result[indices]
+            output_fps = TARGET_FPS
+        else:
+            output_fps = float(fps)
+
+        return (result, output_fps)
