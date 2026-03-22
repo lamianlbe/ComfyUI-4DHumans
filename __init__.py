@@ -20,6 +20,7 @@ from .nodes.pose_renderer_node import PoseRendererNode
 from .nodes.save_pose_node import SavePoseDataNode
 from .nodes.load_pose_node import LoadPoseDataNode
 from .nodes.pose_editor_node import PoseEditorNode
+from .nodes.wan_animate_face_preprocess_node import WanAnimateFacePreprocessNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -35,6 +36,7 @@ NODE_CLASS_MAPPINGS = {
     'SavePoseData': SavePoseDataNode,
     'LoadPoseData': LoadPoseDataNode,
     'PoseEditor': PoseEditorNode,
+    'WanAnimateFacePreprocess': WanAnimateFacePreprocessNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -50,4 +52,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'SavePoseData': 'Save Pose Data',
     'LoadPoseData': 'Load Pose Data',
     'PoseEditor': 'Pose Editor',
+    'WanAnimateFacePreprocess': 'Wan Animate Face Preprocess',
 }
