@@ -264,6 +264,192 @@ def coco_wb133_to_dwpose_face_hands(coco_wb, img_w, img_h, conf_thr=0.3):
     return face, right_hand, left_hand
 
 
+# ---------------------------------------------------------------------------
+# Temporal outlier filtering for 2D keypoints
+# ---------------------------------------------------------------------------
+
+def temporal_filter_keypoints(timeline, velocity_threshold=3.0,
+                              window_size=5, smooth_sigma=0.0):
+    """
+    Detect and repair outlier keypoints that jump to wrong positions in
+    isolated frames.  Operates on a single-person timeline.
+
+    Algorithm
+    ---------
+    1. For each joint, compute per-frame displacement (L2 pixel distance).
+    2. Compute a rolling median displacement over *window_size* frames.
+    3. If a frame's displacement exceeds *velocity_threshold* × rolling
+       median, AND the next frame also shows a snap-back (high displacement),
+       mark the frame as an outlier.
+    4. Replace outlier frames with linear interpolation from nearest good
+       neighbours.
+    5. Optionally apply a light Gaussian smooth (sigma > 0).
+
+    Parameters
+    ----------
+    timeline : list of (K, C) ndarray or None, length T
+        Per-frame keypoints.  C >= 2 (x, y, ...).  None = missing frame.
+    velocity_threshold : float
+        Multiplier on rolling median displacement to flag outliers.
+    window_size : int
+        Window for rolling median (must be odd).
+    smooth_sigma : float
+        If > 0, apply Gaussian smoothing after outlier repair.  0 = no
+        smoothing.
+
+    Returns
+    -------
+    filtered : list of (K, C) ndarray or None, same length as input
+    n_repaired : int – number of frames that were repaired
+    """
+    T = len(timeline)
+    if T < 3:
+        return [x.copy() if x is not None else None for x in timeline], 0
+
+    # Find contiguous non-None segments
+    data = [x.copy() if x is not None else None for x in timeline]
+    K = None
+    C = None
+    for d in data:
+        if d is not None:
+            K, C = d.shape
+            break
+    if K is None:
+        return data, 0
+
+    # Build a (T, K, 2) array of xy positions; track valid mask
+    xy = np.zeros((T, K, 2), dtype=np.float64)
+    valid = np.zeros(T, dtype=bool)
+    for t in range(T):
+        if data[t] is not None:
+            xy[t] = data[t][:, :2]
+            valid[t] = True
+
+    # Per-joint displacement between consecutive valid frames
+    # disp[t] = ||xy[t] - xy[prev_valid]|| per joint
+    disp = np.zeros((T, K), dtype=np.float64)
+    prev_valid_idx = -1
+    for t in range(T):
+        if not valid[t]:
+            continue
+        if prev_valid_idx >= 0:
+            diff = xy[t] - xy[prev_valid_idx]
+            disp[t] = np.sqrt((diff ** 2).sum(axis=-1))
+        prev_valid_idx = t
+
+    # Mean displacement across joints per frame
+    mean_disp = disp.mean(axis=1)  # (T,)
+
+    # Rolling median of mean displacement
+    half_w = window_size // 2
+    rolling_med = np.zeros(T, dtype=np.float64)
+    for t in range(T):
+        lo = max(0, t - half_w)
+        hi = min(T, t + half_w + 1)
+        vals = mean_disp[lo:hi]
+        vals = vals[vals > 1e-6]  # ignore zero entries
+        rolling_med[t] = np.median(vals) if len(vals) > 0 else 0.0
+
+    # Detect outliers: spike followed by snap-back
+    outlier = np.zeros(T, dtype=bool)
+    for t in range(1, T - 1):
+        if not valid[t]:
+            continue
+        med = rolling_med[t]
+        if med < 1e-6:
+            continue
+        # Current frame has abnormally high displacement
+        if mean_disp[t] > velocity_threshold * med:
+            # Check if next valid frame also has high displacement (snap-back)
+            # or just mark this frame as suspicious
+            next_t = -1
+            for nt in range(t + 1, min(t + 4, T)):
+                if valid[nt]:
+                    next_t = nt
+                    break
+            if next_t > 0 and mean_disp[next_t] > velocity_threshold * med * 0.5:
+                outlier[t] = True
+            elif next_t > 0:
+                # Even without snap-back, if displacement is very extreme, flag it
+                if mean_disp[t] > velocity_threshold * 2 * med:
+                    outlier[t] = True
+
+    # Also check for isolated single-frame spikes where the frame before
+    # and after are both good (and close to each other)
+    for t in range(1, T - 1):
+        if not valid[t] or outlier[t]:
+            continue
+        if not valid[t - 1] or not valid[t + 1]:
+            continue
+        # Displacement from t-1 to t+1 should be small if t is an outlier
+        skip_disp = np.sqrt(((xy[t + 1] - xy[t - 1]) ** 2).sum(axis=-1)).mean()
+        if skip_disp < mean_disp[t] * 0.3 and mean_disp[t] > velocity_threshold * rolling_med[t]:
+            outlier[t] = True
+
+    n_repaired = int(outlier.sum())
+
+    # Replace outliers with linear interpolation
+    for t in range(T):
+        if not outlier[t]:
+            continue
+        # Find nearest good frame before and after
+        before = -1
+        for b in range(t - 1, -1, -1):
+            if valid[b] and not outlier[b]:
+                before = b
+                break
+        after = -1
+        for a in range(t + 1, T):
+            if valid[a] and not outlier[a]:
+                after = a
+                break
+
+        if before >= 0 and after >= 0:
+            alpha = (t - before) / (after - before)
+            data[t] = data[before] * (1 - alpha) + data[after] * alpha
+        elif before >= 0:
+            data[t] = data[before].copy()
+        elif after >= 0:
+            data[t] = data[after].copy()
+        # else: leave as-is
+
+    # Optional Gaussian smoothing
+    if smooth_sigma > 0 and n_repaired >= 0:
+        from scipy.ndimage import gaussian_filter1d
+        # Build array of valid frames
+        arr = np.zeros((T, K, C), dtype=np.float64)
+        vmask = np.zeros(T, dtype=bool)
+        for t in range(T):
+            if data[t] is not None:
+                arr[t] = data[t]
+                vmask[t] = True
+
+        if vmask.sum() > 2:
+            # Only smooth xy columns, preserve confidence
+            for k in range(K):
+                for c in range(min(2, C)):
+                    vals = arr[:, k, c].copy()
+                    # Only smooth where valid
+                    if vmask.all():
+                        vals = gaussian_filter1d(vals, sigma=smooth_sigma)
+                    else:
+                        # Interpolate gaps first, smooth, then mask back
+                        valid_idx = np.where(vmask)[0]
+                        if len(valid_idx) > 1:
+                            vals_interp = np.interp(
+                                np.arange(T), valid_idx, vals[valid_idx])
+                            vals_interp = gaussian_filter1d(
+                                vals_interp, sigma=smooth_sigma)
+                            vals = vals_interp
+                    arr[:, k, c] = vals
+
+            for t in range(T):
+                if data[t] is not None:
+                    data[t] = arr[t].astype(data[t].dtype)
+
+    return data, n_repaired
+
+
 def compute_resampled_indices(n_in, fps_in, target_fps=30.0):
     """
     Compute nearest source frame indices for resampling from fps_in to
