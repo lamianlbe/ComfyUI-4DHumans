@@ -5,6 +5,15 @@ Displays a video preview of detected poses with person IDs using an
 HTML5 <video> element with H.264 MP4.  Users can scrub to any frame,
 toggle person visibility (triggers re-render), and download edited NPZ.
 
+Temporal filtering parameters (velocity_threshold, smooth_sigma) are
+exposed so users can tune outlier rejection in real time.  The filter
+always derives from ``keypoints_raw`` (the original Sapiens output),
+never from a previously filtered result, so changes are non-destructive.
+
+The downloaded NPZ stores ``keypoints_raw``, ``smooth_sigma``, and
+``velocity_threshold`` alongside the filtered ``keypoints`` so that
+a later Load can fully restore the editor state.
+
 Backend:
   - Renders debug frames with person ID labels (only visible persons)
   - Encodes as H.264 MP4 via imageio PyAV plugin
@@ -13,13 +22,13 @@ Backend:
 Frontend (web/js/pose_editor.js):
   - <video> element with native controls (play/pause/scrub)
   - Per-person toggle buttons (trigger re-render on click)
+  - Sliders for velocity_threshold and smooth_sigma (trigger re-filter)
   - Download NPZ button
 """
 
 import io as _io
 import os
 import copy
-import random
 import time
 
 import numpy as np
@@ -29,11 +38,48 @@ import folder_paths
 import comfy.utils
 
 from ..humans4d.hmr2.utils.render_sapiens import render_sapiens_dwpose
-from ._pose_utils import fuse_3d_body_with_sapiens
+from ._pose_utils import fuse_3d_body_with_sapiens, temporal_filter_keypoints
 from .save_pose_node import poses_to_npz_dict
 
-# Global cache: node_id -> {poses, images_np, output_dir, subfolder}
+# Global cache: node_id -> {poses, images_np, output_dir, subfolder,
+#                            velocity_threshold, smooth_sigma}
 _EDITOR_CACHE = {}
+
+
+def _apply_temporal_filter(poses, velocity_threshold, smooth_sigma):
+    """Apply temporal filtering from keypoints_raw → keypoints.
+
+    Always starts from raw data so parameters can be changed freely.
+    """
+    n_persons = poses["n_persons"]
+    total_repaired = 0
+
+    for p_idx in range(n_persons):
+        person = poses["persons"][p_idx]
+        raw = person.get("keypoints_raw")
+        if raw is None:
+            # No raw data – nothing to filter
+            continue
+
+        if velocity_threshold <= 0:
+            # No filtering: just copy raw → keypoints
+            person["keypoints"] = [
+                kp.copy() if kp is not None else None for kp in raw
+            ]
+            continue
+
+        filtered, n_rep = temporal_filter_keypoints(
+            raw,
+            velocity_threshold=velocity_threshold,
+            window_size=5,
+            smooth_sigma=smooth_sigma,
+        )
+        person["keypoints"] = filtered
+        total_repaired += n_rep
+
+    if total_repaired > 0:
+        print(f"[PoseEditor] Temporal filter (vel={velocity_threshold:.1f}, "
+              f"sigma={smooth_sigma:.1f}): repaired {total_repaired} frames")
 
 
 def _render_video(node_id):
@@ -142,6 +188,40 @@ def _register_routes():
             },
         })
 
+    @PromptServer.instance.routes.post("/pose_editor/update_filter")
+    async def _update_filter(request):
+        """Update temporal filter parameters, re-filter, and re-render."""
+        data = await request.json()
+        node_id = str(data.get("node_id", ""))
+        velocity_threshold = float(data.get("velocity_threshold", 3.0))
+        smooth_sigma = float(data.get("smooth_sigma", 0.0))
+
+        if node_id not in _EDITOR_CACHE:
+            return web.json_response(
+                {"error": "Node not found in cache"}, status=404
+            )
+
+        cache = _EDITOR_CACHE[node_id]
+        cache["velocity_threshold"] = velocity_threshold
+        cache["smooth_sigma"] = smooth_sigma
+
+        # Re-apply filter from raw keypoints
+        _apply_temporal_filter(
+            cache["poses"], velocity_threshold, smooth_sigma
+        )
+
+        # Re-render video
+        mp4_filename = _render_video(node_id)
+
+        return web.json_response({
+            "ok": True,
+            "video": {
+                "filename": mp4_filename,
+                "subfolder": cache.get("subfolder", ""),
+                "type": "temp",
+            },
+        })
+
     @PromptServer.instance.routes.get("/pose_editor/download_npz")
     async def _download_npz(request):
         node_id = str(request.query.get("node_id", ""))
@@ -150,7 +230,14 @@ def _register_routes():
                 {"error": "Node not found in cache"}, status=404
             )
 
-        poses = _EDITOR_CACHE[node_id]["poses"]
+        cache = _EDITOR_CACHE[node_id]
+        poses = cache["poses"]
+
+        # Store filter params in poses for serialisation
+        poses["_filter_velocity_threshold"] = cache.get(
+            "velocity_threshold", 0.0)
+        poses["_filter_smooth_sigma"] = cache.get("smooth_sigma", 0.0)
+
         data = poses_to_npz_dict(poses)
 
         buf = _io.BytesIO()
@@ -161,7 +248,8 @@ def _register_routes():
             body=buf.read(),
             content_type="application/octet-stream",
             headers={
-                "Content-Disposition": "attachment; filename=pose_data_edited.npz"
+                "Content-Disposition":
+                    "attachment; filename=pose_data_edited.npz"
             },
         )
 
@@ -182,6 +270,32 @@ class PoseEditorNode:
             "required": {
                 "poses": ("POSES",),
                 "images": ("IMAGE",),
+                "velocity_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 3.0,
+                        "min": 0.0,
+                        "max": 20.0,
+                        "step": 0.1,
+                        "tooltip": (
+                            "Outlier detection sensitivity. Higher = less "
+                            "aggressive filtering. 0 = disabled."
+                        ),
+                    },
+                ),
+                "smooth_sigma": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 5.0,
+                        "step": 0.1,
+                        "tooltip": (
+                            "Gaussian temporal smoothing sigma. 0 = no "
+                            "smoothing, only outlier repair."
+                        ),
+                    },
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -193,7 +307,8 @@ class PoseEditorNode:
     FUNCTION = "edit"
     CATEGORY = "4dhumans"
 
-    def edit(self, poses, images, unique_id=None):
+    def edit(self, poses, images, velocity_threshold, smooth_sigma,
+             unique_id=None):
         node_id = str(unique_id) if unique_id is not None else "unknown"
 
         poses_edit = copy.deepcopy(poses)
@@ -201,6 +316,14 @@ class PoseEditorNode:
 
         n_persons = poses_edit["n_persons"]
         fps = poses_edit["fps"]
+
+        # Restore filter params from loaded NPZ if present, but prefer
+        # the node's widget values (which the user may have changed).
+        # The widget values are the authoritative source.
+        # (NPZ-stored values are only used as defaults in the frontend.)
+
+        # Apply temporal filter from raw → keypoints
+        _apply_temporal_filter(poses_edit, velocity_threshold, smooth_sigma)
 
         # Determine output folder
         full_output_folder, _, _, subfolder, _ = (
@@ -216,6 +339,8 @@ class PoseEditorNode:
             "images_np": images_np,
             "output_dir": full_output_folder,
             "subfolder": subfolder,
+            "velocity_threshold": velocity_threshold,
+            "smooth_sigma": smooth_sigma,
         }
 
         # Initial render
@@ -236,6 +361,8 @@ class PoseEditorNode:
             "person_visibility": [person_visibility],
             "node_id": [node_id],
             "fps": [fps],
+            "velocity_threshold": [velocity_threshold],
+            "smooth_sigma": [smooth_sigma],
         }
 
         return {"ui": ui_data}

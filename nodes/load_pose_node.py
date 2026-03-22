@@ -45,10 +45,21 @@ def npz_to_poses(npz):
         visible = bool(npz[vis_key]) if vis_key in npz else True
 
         keypoints = [None] * n_frames
+        keypoints_raw = [None] * n_frames
         for j in range(n_frames):
             key = f"p2d_p{i}_f{j}"
             if key in npz:
                 keypoints[j] = npz[key]
+            raw_key = f"p2d_raw_p{i}_f{j}"
+            if raw_key in npz:
+                keypoints_raw[j] = npz[raw_key]
+
+        # If no raw data stored, treat current keypoints as raw
+        has_raw = any(kp is not None for kp in keypoints_raw)
+        if not has_raw:
+            keypoints_raw = [
+                kp.copy() if kp is not None else None for kp in keypoints
+            ]
 
         person = {
             "visible": visible,
@@ -56,6 +67,7 @@ def npz_to_poses(npz):
             "body_joints": [None] * n_frames,
             "smpl_j3d": [None] * n_frames,
             "keypoints": keypoints,
+            "keypoints_raw": keypoints_raw,
         }
         for j in range(n_frames):
             for field in ("body_joints2d", "body_joints", "smpl_j3d"):
@@ -74,7 +86,7 @@ def npz_to_poses(npz):
             scale[j] = float(npz[f"scale_f{j}"])
             offset[j] = npz[f"offset_f{j}"]
 
-    return {
+    poses = {
         "n_persons": n_persons,
         "n_frames": n_frames,
         "img_h": img_h,
@@ -85,6 +97,15 @@ def npz_to_poses(npz):
         "scale": scale,
         "offset": offset,
     }
+
+    # Restore filter params if present (saved by Pose Editor)
+    if "filter_velocity_threshold" in npz:
+        poses["_filter_velocity_threshold"] = float(
+            npz["filter_velocity_threshold"])
+    if "filter_smooth_sigma" in npz:
+        poses["_filter_smooth_sigma"] = float(npz["filter_smooth_sigma"])
+
+    return poses
 
 
 class LoadPoseDataNode:

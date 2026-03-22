@@ -36,15 +36,29 @@ def poses_to_npz_dict(poses):
         "fps": np.float32(poses["fps"]),
     }
 
+    # Filter parameters (stored by Pose Editor for non-destructive restore)
+    if "_filter_velocity_threshold" in poses:
+        data["filter_velocity_threshold"] = np.float32(
+            poses["_filter_velocity_threshold"])
+    if "_filter_smooth_sigma" in poses:
+        data["filter_smooth_sigma"] = np.float32(
+            poses["_filter_smooth_sigma"])
+
     for i in range(n_persons):
         person = poses["persons"][i]
         data[f"person_{i}_visible"] = np.bool_(person.get("visible", True))
 
         for j in range(n_frames):
-            # Sapiens 2D keypoints
+            # Sapiens 2D keypoints (filtered/active)
             kp = person["keypoints"][j]
             if kp is not None:
                 data[f"p2d_p{i}_f{j}"] = np.asarray(kp, dtype=np.float32)
+
+            # Raw Sapiens 2D keypoints (original, before filtering)
+            kp_raw = person.get("keypoints_raw", [None] * n_frames)[j]
+            if kp_raw is not None:
+                data[f"p2d_raw_p{i}_f{j}"] = np.asarray(
+                    kp_raw, dtype=np.float32)
 
             # PromptHMR 3D data
             for key in ("body_joints2d", "body_joints", "smpl_j3d"):

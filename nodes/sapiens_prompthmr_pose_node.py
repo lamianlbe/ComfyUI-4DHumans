@@ -193,27 +193,15 @@ class SapiensPromptHMRPoseNode:
 
             pbar.update(1)
 
-        # ---------------------------------------------------------------
-        # Temporal outlier filtering on Sapiens 2D keypoints
-        # ---------------------------------------------------------------
-        from ._pose_utils import temporal_filter_keypoints
-
-        total_repaired = 0
+        # Store raw keypoints for non-destructive editing in Pose Editor.
+        # keypoints_raw is the original Sapiens output; keypoints is the
+        # "active" version that downstream nodes consume.  The Pose Editor
+        # can apply temporal filtering and always re-derives from raw.
         for p_idx in range(n_persons):
-            kp_timeline = persons[p_idx]["keypoints"]
-            filtered, n_rep = temporal_filter_keypoints(
-                kp_timeline,
-                velocity_threshold=3.0,
-                window_size=5,
-                smooth_sigma=0.0,
-            )
-            persons[p_idx]["keypoints"] = filtered
-            total_repaired += n_rep
-
-        if total_repaired > 0:
-            print(f"[SapiensPromptHMRPose] Temporal filter: "
-                  f"repaired {total_repaired} outlier frames across "
-                  f"{n_persons} persons")
+            persons[p_idx]["keypoints_raw"] = [
+                kp.copy() if kp is not None else None
+                for kp in persons[p_idx]["keypoints"]
+            ]
 
         poses = {
             "n_persons": n_persons,
