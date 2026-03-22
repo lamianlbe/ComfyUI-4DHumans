@@ -2,9 +2,14 @@
 Wan Animate Face Preprocess node.
 
 Ensures each frame has at most one visible person's face for Wan 2.2
-Animate's face video input.  If multiple persons are visible, only the
-visible one's face region is kept; the rest is blacked out.  If no
-person is visible, the entire frame is blacked out.
+Animate's face video input.
+
+Rules:
+  - 0 visible persons in a frame → entire frame blacked out
+  - 1 visible person, no invisible persons → pass through unchanged
+  - 1 visible person, with invisible persons → keep visible person's
+    face region (expanded bbox), black out everything else
+  - >1 visible person → error (must use Pose Editor to select one)
 
 Uses head keypoints (nose, eyes, ears, shoulders) from the POSES dict
 to compute a face bounding box, then expands it to include surrounding
@@ -18,18 +23,26 @@ import comfy.utils
 
 # OpenPose 25 indices for head/upper-body landmarks
 _NOSE = 0
+_NECK = 1
+_R_SHOULDER = 2
+_L_SHOULDER = 5
 _R_EYE = 15
 _L_EYE = 16
 _R_EAR = 17
 _L_EAR = 18
-_R_SHOULDER = 2
-_L_SHOULDER = 5
-_HEAD_INDICES = [_NOSE, _R_EYE, _L_EYE, _R_EAR, _L_EAR, _R_SHOULDER, _L_SHOULDER]
+_HEAD_INDICES = [_NOSE, _R_EYE, _L_EYE, _R_EAR, _L_EAR]
+# Fallback: use shoulders/neck to estimate head position
+_UPPER_BODY_INDICES = [_NECK, _R_SHOULDER, _L_SHOULDER]
 
 
-def _face_bbox_from_keypoints(kp2d, img_w, img_h, expand_ratio=1.8):
+def _face_bbox_from_keypoints(kp2d, img_w, img_h, expand_ratio=2.0):
     """
     Compute an expanded face bounding box from OpenPose 25 keypoints.
+
+    Uses head keypoints (nose, eyes, ears) primarily. If fewer than 2
+    head points are available, falls back to shoulders/neck to estimate
+    head position. If only 1 point is available, uses a fixed-size bbox
+    based on image dimensions.
 
     Parameters
     ----------
@@ -37,39 +50,60 @@ def _face_bbox_from_keypoints(kp2d, img_w, img_h, expand_ratio=1.8):
     img_w, img_h : int
     expand_ratio : float
         How much to expand the tight bbox around head keypoints.
-        1.0 = tight, 2.0 = double the size in each direction.
 
     Returns
     -------
-    (x1, y1, x2, y2) or None if no valid head keypoints
+    (x1, y1, x2, y2) or None if absolutely no keypoints detected
     """
-    pts = []
-    for idx in _HEAD_INDICES:
+    def _valid_pt(idx):
         x, y = float(kp2d[idx, 0]), float(kp2d[idx, 1])
-        # Skip zero/invalid points
         if abs(x) < 1e-3 and abs(y) < 1e-3:
-            continue
+            return None
         if x < 0 or y < 0 or x > img_w or y > img_h:
-            continue
-        pts.append((x, y))
+            return None
+        return (x, y)
 
-    if len(pts) < 2:
-        return None
+    # Collect head points
+    head_pts = []
+    for idx in _HEAD_INDICES:
+        pt = _valid_pt(idx)
+        if pt is not None:
+            head_pts.append(pt)
 
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    cx = sum(xs) / len(xs)
-    cy = sum(ys) / len(ys)
+    if len(head_pts) >= 2:
+        # Good case: multiple head points available
+        xs = [p[0] for p in head_pts]
+        ys = [p[1] for p in head_pts]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        size = max(max(xs) - min(xs), max(ys) - min(ys))
+        # Ensure minimum size (at least 5% of image)
+        size = max(size, min(img_w, img_h) * 0.05)
+    elif len(head_pts) == 1:
+        # Only one head point: use it as center with estimated size
+        cx, cy = head_pts[0]
+        # Estimate head size as ~15% of image height
+        size = img_h * 0.15
+    else:
+        # No head points: try shoulders to estimate head position
+        upper_pts = []
+        for idx in _UPPER_BODY_INDICES:
+            pt = _valid_pt(idx)
+            if pt is not None:
+                upper_pts.append(pt)
 
-    # Tight bbox
-    x1 = min(xs)
-    y1 = min(ys)
-    x2 = max(xs)
-    y2 = max(ys)
+        if len(upper_pts) == 0:
+            return None
 
-    w = x2 - x1
-    h = y2 - y1
-    size = max(w, h)
+        # Head is roughly above the midpoint of shoulders
+        xs = [p[0] for p in upper_pts]
+        ys = [p[1] for p in upper_pts]
+        cx = sum(xs) / len(xs)
+        # Head center is above shoulders by roughly shoulder width
+        shoulder_span = max(xs) - min(xs) if len(xs) > 1 else img_w * 0.15
+        cy = min(ys) - shoulder_span * 0.5
+        cy = max(0, cy)
+        size = shoulder_span
 
     # Expand around center
     half = size * expand_ratio / 2
@@ -126,38 +160,59 @@ class WanAnimateFacePreprocessNode:
                 f"does not match pose frame count ({n_frames})."
             )
 
+        # --- Pre-check: no frame should have >1 visible person ---
+        for t in range(B):
+            n_visible = 0
+            for p_idx in range(n_persons):
+                person = poses["persons"][p_idx]
+                if person.get("visible", True):
+                    j2d = person["body_joints2d"][t]
+                    if j2d is not None:
+                        n_visible += 1
+            if n_visible > 1:
+                raise ValueError(
+                    f"Wan Animate Face Preprocess: frame {t} has {n_visible} "
+                    f"visible persons. Use Pose Editor to set all but one "
+                    f"person to invisible before using this node."
+                )
+
+        # --- Count total persons (visible + invisible) with detections ---
         pbar = comfy.utils.ProgressBar(B)
         output = []
 
         for t in range(B):
-            # Find visible persons in this frame
-            visible_persons = []
+            # Find visible and total detected persons
+            visible_person = None  # (p_idx, j2d)
+            has_invisible = False
+
             for p_idx in range(n_persons):
                 person = poses["persons"][p_idx]
-                if not person.get("visible", True):
-                    continue
                 j2d = person["body_joints2d"][t]
-                if j2d is not None:
-                    visible_persons.append((p_idx, j2d))
+                if j2d is None:
+                    continue
 
-            if len(visible_persons) == 0:
+                if person.get("visible", True):
+                    visible_person = (p_idx, j2d)
+                else:
+                    has_invisible = True
+
+            if visible_person is None:
                 # No visible person → black frame
                 output.append(torch.zeros_like(images[t]))
 
-            elif len(visible_persons) == 1:
-                # Exactly one visible person → pass through unchanged
+            elif not has_invisible:
+                # One visible, no invisible → pass through unchanged
                 output.append(images[t].clone())
 
             else:
-                # Multiple visible persons → keep only the first visible
-                # person's face region, black out everything else
-                _, j2d = visible_persons[0]
+                # One visible + invisible persons → mask to face region
+                _, j2d = visible_person
                 bbox = _face_bbox_from_keypoints(
                     j2d, img_w, img_h, expand_ratio
                 )
 
                 if bbox is None:
-                    # Can't locate face → black frame
+                    # Can't locate face → black frame as safety
                     output.append(torch.zeros_like(images[t]))
                 else:
                     x1, y1, x2, y2 = bbox
