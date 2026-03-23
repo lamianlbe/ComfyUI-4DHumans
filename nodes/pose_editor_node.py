@@ -160,7 +160,7 @@ def _register_routes():
 
     @PromptServer.instance.routes.post("/pose_editor/toggle_visibility")
     async def _toggle_visibility(request):
-        """Toggle person visibility and re-render the video."""
+        """Toggle person visibility (no re-render, use /rerender after)."""
         data = await request.json()
         node_id = str(data.get("node_id", ""))
         person_id = int(data.get("person_id", -1))
@@ -176,7 +176,20 @@ def _register_routes():
         if 0 <= person_id < poses["n_persons"]:
             poses["persons"][person_id]["visible"] = visible
 
-        # Re-render video with updated visibility
+        return web.json_response({"ok": True})
+
+    @PromptServer.instance.routes.post("/pose_editor/rerender")
+    async def _rerender(request):
+        """Re-render the video with current visibility/filter settings."""
+        data = await request.json()
+        node_id = str(data.get("node_id", ""))
+
+        if node_id not in _EDITOR_CACHE:
+            return web.json_response(
+                {"error": "Node not found in cache"}, status=404
+            )
+
+        cache = _EDITOR_CACHE[node_id]
         mp4_filename = _render_video(node_id)
 
         return web.json_response({

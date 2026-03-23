@@ -34,8 +34,19 @@ function buildVideoUrl(videoInfo) {
 
 function initEditorUI(node, videoInfo, nPersons, personVisibility, nodeId,
                       velThresh, smoothSigma) {
-  // Remove previous widget
+  // Remove previous widget and clean up old video element
   if (node._poseEditorWidget) {
+    // Stop old video to free resources
+    const oldContainer = node._poseEditorWidget.element;
+    if (oldContainer) {
+      const oldVideo = oldContainer.querySelector("video");
+      if (oldVideo) {
+        oldVideo.pause();
+        oldVideo.removeAttribute("src");
+        oldVideo.load();
+      }
+      oldContainer.remove();
+    }
     const idx = node.widgets?.indexOf(node._poseEditorWidget);
     if (idx >= 0) node.widgets.splice(idx, 1);
     node._poseEditorWidget = null;
@@ -97,47 +108,77 @@ function initEditorUI(node, videoInfo, nPersons, personVisibility, nodeId,
   personsLabel.style.cssText = "color:#aaa;font-size:11px;flex-shrink:0;";
   personsRow.appendChild(personsLabel);
 
+  // Track pending visibility (may differ from committed visibility)
+  const pendingVisibility = [...visibility];
+
   for (let p = 0; p < nPersons; p++) {
     const btn = document.createElement("button");
     btn.style.cssText =
       "padding:2px 0;font-size:11px;cursor:pointer;border:1px solid #555;" +
       "border-radius:3px;width:42px;text-align:center;";
-    updateToggleBtn(btn, p, visibility[p]);
+    updateToggleBtn(btn, p, pendingVisibility[p]);
 
-    btn.addEventListener("click", async () => {
+    btn.addEventListener("click", () => {
       if (isRendering) return;
-
-      visibility[p] = !visibility[p];
-      updateToggleBtn(btn, p, visibility[p]);
-
-      isRendering = true;
-      overlay.style.display = "flex";
-
-      try {
-        const resp = await api.fetchApi("/pose_editor/toggle_visibility", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            node_id: nodeId,
-            person_id: p,
-            visible: visibility[p],
-          }),
-        });
-        const result = await resp.json();
-
-        if (result.ok && result.video) {
-          await refreshVideo(buildVideoUrl(result.video));
-        }
-      } catch (e) {
-        console.error("Pose editor re-render failed:", e);
-      } finally {
-        overlay.style.display = "none";
-        isRendering = false;
-      }
+      pendingVisibility[p] = !pendingVisibility[p];
+      updateToggleBtn(btn, p, pendingVisibility[p]);
     });
 
     personsRow.appendChild(btn);
   }
+
+  // Apply visibility button
+  const applyVisBtn = document.createElement("button");
+  applyVisBtn.textContent = "Apply";
+  applyVisBtn.style.cssText =
+    "padding:2px 10px;font-size:11px;cursor:pointer;border:1px solid #555;" +
+    "background:#2a3a5a;color:#adf;border-radius:3px;flex-shrink:0;";
+  applyVisBtn.addEventListener("click", async () => {
+    if (isRendering) return;
+
+    // Check if anything changed
+    const changed = pendingVisibility.some((v, i) => v !== visibility[i]);
+    if (!changed) return;
+
+    isRendering = true;
+    overlay.style.display = "flex";
+
+    try {
+      // Send all visibility updates
+      for (let p = 0; p < nPersons; p++) {
+        if (pendingVisibility[p] !== visibility[p]) {
+          await api.fetchApi("/pose_editor/toggle_visibility", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              node_id: nodeId,
+              person_id: p,
+              visible: pendingVisibility[p],
+            }),
+          });
+          visibility[p] = pendingVisibility[p];
+        }
+      }
+
+      // Trigger re-render after all toggles applied
+      const resp = await api.fetchApi("/pose_editor/rerender", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ node_id: nodeId }),
+      });
+      const result = await resp.json();
+
+      if (result.ok && result.video) {
+        await refreshVideo(buildVideoUrl(result.video));
+      }
+    } catch (e) {
+      console.error("Pose editor re-render failed:", e);
+    } finally {
+      overlay.style.display = "none";
+      isRendering = false;
+    }
+  });
+  personsRow.appendChild(applyVisBtn);
 
   // --- Filter controls ---
   const filterRow = document.createElement("div");
