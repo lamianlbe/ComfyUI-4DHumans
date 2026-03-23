@@ -90,7 +90,7 @@ def _render_video(node_id):
     output_dir = cache["output_dir"]
 
     n_persons = poses["n_persons"]
-    B = poses["n_frames"]
+    B = min(poses["n_frames"], len(images_np))
     img_h = poses["img_h"]
     img_w = poses["img_w"]
     fps = poses["fps"]
