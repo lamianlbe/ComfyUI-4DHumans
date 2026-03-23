@@ -34,23 +34,22 @@ function buildVideoUrl(videoInfo) {
 
 function initEditorUI(node, videoInfo, nPersons, personVisibility, nodeId,
                       velThresh, smoothSigma) {
-  // Remove previous widget and clean up old video element
-  if (node._poseEditorWidget) {
-    // Stop old video to free resources
-    const oldContainer = node._poseEditorWidget.element;
-    if (oldContainer) {
-      const oldVideo = oldContainer.querySelector("video");
-      if (oldVideo) {
-        oldVideo.pause();
-        oldVideo.removeAttribute("src");
-        oldVideo.load();
+  // Remove ALL previous pose editor widgets and DOM elements
+  if (node.widgets) {
+    for (let i = node.widgets.length - 1; i >= 0; i--) {
+      const w = node.widgets[i];
+      if (w.name === "pose_editor") {
+        const el = w.element;
+        if (el) {
+          const vid = el.querySelector("video");
+          if (vid) { vid.pause(); vid.removeAttribute("src"); vid.load(); }
+          el.remove();
+        }
+        node.widgets.splice(i, 1);
       }
-      oldContainer.remove();
     }
-    const idx = node.widgets?.indexOf(node._poseEditorWidget);
-    if (idx >= 0) node.widgets.splice(idx, 1);
-    node._poseEditorWidget = null;
   }
+  node._poseEditorWidget = null;
 
   const container = document.createElement("div");
   container.style.cssText =
