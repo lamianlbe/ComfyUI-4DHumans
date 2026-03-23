@@ -103,6 +103,8 @@ def _render_video(node_id):
     rendered_frames = []
     for t in range(B):
         canvas = images_np[t].copy()
+        # Use actual image dimensions (may differ from pose detection resolution)
+        actual_h, actual_w = canvas.shape[:2]
 
         for p_idx in range(n_persons):
             person = poses["persons"][p_idx]
@@ -112,20 +114,37 @@ def _render_video(node_id):
             j2d = person["body_joints2d"][t]
             sapiens_kp = person["keypoints"][t]
 
-            if j2d is not None:
-                kp = fuse_3d_body_with_sapiens(j2d, sapiens_kp)
-                canvas = render_sapiens_dwpose(canvas, kp, img_h, img_w)
-            elif sapiens_kp is not None:
-                canvas = render_sapiens_dwpose(canvas, sapiens_kp, img_h, img_w)
+            # Scale keypoints if image was resized since detection
+            scale_x = actual_w / img_w if img_w > 0 else 1.0
+            scale_y = actual_h / img_h if img_h > 0 else 1.0
+            needs_scale = abs(scale_x - 1.0) > 0.01 or abs(scale_y - 1.0) > 0.01
 
-            # Draw person ID label near nose
+            j2d_r = j2d
+            sap_r = sapiens_kp
+            if needs_scale:
+                if j2d is not None:
+                    j2d_r = j2d.copy()
+                    j2d_r[:, 0] *= scale_x
+                    j2d_r[:, 1] *= scale_y
+                if sapiens_kp is not None:
+                    sap_r = sapiens_kp.copy()
+                    sap_r[:, 0] *= scale_x
+                    sap_r[:, 1] *= scale_y
+
+            if j2d_r is not None:
+                kp = fuse_3d_body_with_sapiens(j2d_r, sap_r)
+                canvas = render_sapiens_dwpose(canvas, kp, actual_h, actual_w)
+            elif sap_r is not None:
+                canvas = render_sapiens_dwpose(canvas, sap_r, actual_h, actual_w)
+
+            # Draw person ID label near nose (use scaled coords)
             label_pos = None
-            if j2d is not None:
-                nx, ny = float(j2d[0, 0]), float(j2d[0, 1])
+            if j2d_r is not None:
+                nx, ny = float(j2d_r[0, 0]), float(j2d_r[0, 1])
                 if nx > 1 or ny > 1:
                     label_pos = (int(nx), int(ny) - 20)
-            elif sapiens_kp is not None:
-                nx, ny = float(sapiens_kp[0, 0]), float(sapiens_kp[0, 1])
+            elif sap_r is not None:
+                nx, ny = float(sap_r[0, 0]), float(sap_r[0, 1])
                 if nx > 1 or ny > 1:
                     label_pos = (int(nx), int(ny) - 20)
 
