@@ -95,7 +95,7 @@ class SapiensPromptHMRPoseNode:
         n_persons = M // B
         masks = masks.reshape(B, n_persons, masks.shape[-2], masks.shape[-1])
 
-        pbar = comfy.utils.ProgressBar(B * 2)  # PromptHMR pass + Sapiens pass
+        pbar = comfy.utils.ProgressBar(B)
 
         # Per-frame camera info
         cam_int_per_frame = [None] * B
@@ -113,29 +113,59 @@ class SapiensPromptHMRPoseNode:
                 "keypoints": [None] * B,
             })
 
-        # ----- Pass 1: PromptHMR 3D -----
+        # Sapiens model/preprocessor (for batched inference)
+        sap_model = sapiens["model"]
+        sap_preproc = sapiens["preprocessor"]
+        sap_device = sapiens["device"]
+        sap_dtype = sapiens["dtype"]
+
+        # ----- Combined pass: PromptHMR 3D + Sapiens 2D per frame -----
         for t in range(B):
             img_np = (rgb[t] * 255).byte().cpu().numpy()
 
-            bboxes = []
+            # --- Collect valid persons for this frame ---
+            bboxes_phmr = []
             masks_uint8 = []
+            sap_tensors = []
+            sap_bboxes = []  # (x1, y1, crop_w, crop_h) for coordinate mapping
             person_indices = []
 
+            masks_frame_np = masks[t].cpu().numpy()  # (n_persons, H, W)
+
             for p_idx in range(n_persons):
-                mask_frame = masks[t, p_idx].cpu().numpy()
-                bbox = _mask_to_bbox_torch(mask_frame)
-                if bbox is None:
+                mask_frame = masks_frame_np[p_idx]
+                ys, xs = np.where(mask_frame > 0.5)
+                if len(xs) == 0:
                     continue
+
+                x1, x2 = int(xs.min()), int(xs.max())
+                y1, y2 = int(ys.min()), int(ys.max())
+
+                # PromptHMR bbox
+                bboxes_phmr.append(
+                    torch.tensor([[x1, y1, x2, y2, 1.0]], dtype=torch.float32)
+                )
                 mask_u8 = (mask_frame > 0.5).astype(np.uint8) * 255
-                bboxes.append(bbox)
                 masks_uint8.append(mask_u8)
                 person_indices.append(p_idx)
 
-            if not bboxes:
+                # Sapiens: mask image and crop
+                x1c = max(0, x1)
+                y1c = max(0, y1)
+                x2c = min(img_w, x2)
+                y2c = min(img_h, y2)
+                cropped = img_np[y1c:y2c, x1c:x2c].copy()
+                crop_mask = mask_frame[y1c:y2c, x1c:x2c] > 0.5
+                cropped[~crop_mask] = 0
+                sap_tensors.append(sap_preproc(cropped))
+                sap_bboxes.append((x1c, y1c, x2c - x1c, y2c - y1c))
+
+            if not person_indices:
                 pbar.update(1)
                 continue
 
-            boxes_cat = torch.cat(bboxes, dim=0)
+            # --- PromptHMR batch inference ---
+            boxes_cat = torch.cat(bboxes_phmr, dim=0)
             masks_arr = np.array(masks_uint8)
 
             inputs = [{
@@ -171,25 +201,28 @@ class SapiensPromptHMRPoseNode:
                 persons[p_idx]["body_joints"][t] = joints_3d[i]
                 persons[p_idx]["smpl_j3d"][t] = smpl_j3d[i]
 
-            pbar.update(1)
+            # --- Sapiens batch inference ---
+            sap_batch = torch.stack(sap_tensors, dim=0).to(sap_device).to(sap_dtype)
+            with torch.inference_mode():
+                heatmaps_batch = sap_model(sap_batch).to(torch.float32).cpu()
+                # heatmaps_batch: (N, K, hm_h, hm_w)
 
-        # ----- Pass 2: Sapiens 2D -----
-        for t in range(B):
-            img_np = (rgb[t] * 255).byte().cpu().numpy()
+            N_sap, K_sap, hm_h, hm_w = heatmaps_batch.shape
 
-            for p_idx in range(n_persons):
-                mask_frame = masks[t, p_idx].cpu().numpy()
-                bbox = _mask_to_bbox_np(mask_frame)
-                if bbox is None:
-                    continue
+            # Vectorised argmax over all keypoints at once
+            hm_flat = heatmaps_batch.reshape(N_sap, K_sap, -1)  # (N, K, hm_h*hm_w)
+            max_vals, max_idxs = hm_flat.max(dim=2)              # (N, K)
+            y_hm = (max_idxs // hm_w).float().numpy()            # (N, K)
+            x_hm = (max_idxs % hm_w).float().numpy()             # (N, K)
+            confs = max_vals.numpy()                               # (N, K)
 
-                mask_bool = mask_frame > 0.5
-                masked_img = img_np.copy()
-                masked_img[~mask_bool] = 0
-
-                result = run_sapiens_on_bbox(masked_img, bbox, sapiens)
-                if result is not None:
-                    persons[p_idx]["keypoints"][t] = result["pixel_kp"]
+            for i, p_idx in enumerate(person_indices):
+                bx, by, bw, bh = sap_bboxes[i]
+                pixel_kp = np.zeros((K_sap, 3), dtype=np.float32)
+                pixel_kp[:, 0] = x_hm[i] * bw / hm_w + bx
+                pixel_kp[:, 1] = y_hm[i] * bh / hm_h + by
+                pixel_kp[:, 2] = confs[i]
+                persons[p_idx]["keypoints"][t] = pixel_kp
 
             pbar.update(1)
 
