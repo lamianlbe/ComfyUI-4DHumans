@@ -16,6 +16,7 @@ from .nodes.load_prompthmr_node import LoadPromptHMRNode
 from .nodes.sapiens_prompthmr_pose_node import SapiensPromptHMRPoseNode
 from .nodes.sapiens_prompthmr_to_nlf_node import SapiensPromptHMRToNLFNode
 from .nodes.sam3_node import LoadSAM3Node, SAM3VideoSegmentationNode
+from .nodes.sam3_image_node import SAM3ImageSegmentationNode
 from .nodes.pose_renderer_node import PoseRendererNode
 from .nodes.save_pose_node import SavePoseDataNode
 from .nodes.load_pose_node import LoadPoseDataNode
@@ -32,6 +33,7 @@ NODE_CLASS_MAPPINGS = {
     'SapiensPromptHMRToNLF': SapiensPromptHMRToNLFNode,
     'LoadSAM3': LoadSAM3Node,
     'SAM3VideoSegmentation': SAM3VideoSegmentationNode,
+    'SAM3ImageSegmentation': SAM3ImageSegmentationNode,
     'PoseRenderer': PoseRendererNode,
     'SavePoseData': SavePoseDataNode,
     'LoadPoseData': LoadPoseDataNode,
@@ -48,6 +50,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'SapiensPromptHMRToNLF': 'Sapiens PromptHMR to NLF Poses',
     'LoadSAM3': 'Load SAM3',
     'SAM3VideoSegmentation': 'SAM3 Video Segmentation',
+    'SAM3ImageSegmentation': 'SAM3 Image Segmentation',
     'PoseRenderer': 'Sapiens PromptHMR Pose Renderer',
     'SavePoseData': 'Save Pose Data',
     'LoadPoseData': 'Load Pose Data',
