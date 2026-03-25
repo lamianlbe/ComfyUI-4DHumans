@@ -118,8 +118,9 @@ class SAM3VideoSegmentationNode:
                     {
                         "default": "person",
                         "tooltip": (
-                            "Text description of objects to segment "
-                            "(e.g. 'person', 'dancer')."
+                            "Text description of objects to segment. "
+                            "Use comma to segment multiple types "
+                            "(e.g. 'person, dog')."
                         ),
                     },
                 ),
@@ -131,6 +132,47 @@ class SAM3VideoSegmentationNode:
     FUNCTION = "segment"
     CATEGORY = "4dhumans"
 
+    def _run_single_prompt(self, predictor, pil_frames, B, H, W, text, autocast_ctx):
+        """Run segmentation for a single text prompt.
+
+        Returns
+        -------
+        per_frame_masks : dict[int, dict[int, ndarray]]
+            frame_idx -> {obj_id: binary_mask}
+        """
+        with autocast_ctx:
+            result = predictor.start_session(resource_path=pil_frames)
+            session_id = result["session_id"]
+
+            predictor.add_prompt(
+                session_id=session_id,
+                frame_idx=0,
+                text=text,
+            )
+
+        per_frame_masks = {}
+        with autocast_ctx:
+            propagation_results = list(predictor.propagate_in_video(
+                session_id=session_id,
+                propagation_direction="both",
+                start_frame_idx=None,
+                max_frame_num_to_track=None,
+            ))
+
+        for res in propagation_results:
+            frame_idx = res["frame_index"]
+            outputs = res["outputs"]
+            obj_ids = outputs["out_obj_ids"]
+            binary_masks = outputs["out_binary_masks"]
+
+            frame_dict = {}
+            for i, oid in enumerate(obj_ids):
+                frame_dict[int(oid)] = binary_masks[i]
+            per_frame_masks[frame_idx] = frame_dict
+
+        predictor.close_session(session_id)
+        return per_frame_masks
+
     def segment(self, images, sam3, text_prompt):
         import torch
         predictor = sam3["predictor"]
@@ -138,21 +180,25 @@ class SAM3VideoSegmentationNode:
         # images: (B, H, W, 3) float [0, 1]
         B, H, W, _C = images.shape
 
-        pbar = comfy.utils.ProgressBar(B + 2)
+        # Split comma-separated prompts
+        prompts = [p.strip() for p in text_prompt.split(",") if p.strip()]
+        if not prompts:
+            prompts = ["person"]
+        n_prompts = len(prompts)
+
+        pbar = comfy.utils.ProgressBar(B + n_prompts * 2)
 
         # ------------------------------------------------------------------
-        # Convert tensor frames to PIL Image list (SAM3 accepts this
-        # directly via load_resource_as_video_frames, no temp files needed)
+        # Convert tensor frames to PIL Image list
         # ------------------------------------------------------------------
         pil_frames = []
         for t in range(B):
-            frame_np = (images[t] * 255).byte().cpu().numpy()  # (H, W, 3) RGB uint8
+            frame_np = (images[t] * 255).byte().cpu().numpy()
             pil_frames.append(Image.fromarray(frame_np))
         pbar.update(1)
 
         # ------------------------------------------------------------------
-        # Start session, add text prompt, propagate
-        # Use bfloat16 autocast on CUDA (same as RMBG's SAM3 node)
+        # Setup autocast
         # ------------------------------------------------------------------
         from contextlib import nullcontext
         device = next(predictor.model.parameters()).device
@@ -162,69 +208,67 @@ class SAM3VideoSegmentationNode:
             else nullcontext()
         )
 
-        with autocast_ctx:
-            result = predictor.start_session(resource_path=pil_frames)
-            session_id = result["session_id"]
+        # ------------------------------------------------------------------
+        # Run segmentation for each prompt separately
+        # ------------------------------------------------------------------
+        # Collect all masks with globally unique slot indices.
+        # Each prompt gets its own set of obj_ids; we remap them to a
+        # contiguous global index so that masks from different prompts
+        # occupy distinct slots.
+        global_slot_count = 0
+        # global_frame_masks[t] = {global_slot: mask_np}
+        global_frame_masks = {t: {} for t in range(B)}
 
-            predictor.add_prompt(
-                session_id=session_id,
-                frame_idx=0,
-                text=text_prompt,
+        for pi, prompt_text in enumerate(prompts):
+            _logger.info("SAM3 prompt %d/%d: '%s'", pi + 1, n_prompts, prompt_text)
+
+            pfm = self._run_single_prompt(
+                predictor, pil_frames, B, H, W, prompt_text, autocast_ctx
             )
-        pbar.update(1)
-
-        # ------------------------------------------------------------------
-        # Propagate through video and collect per-frame results
-        # ------------------------------------------------------------------
-        per_frame_masks = {}  # frame_idx -> {obj_id: mask_np}
-
-        with autocast_ctx:
-            propagation_results = list(predictor.propagate_in_video(
-                session_id=session_id,
-                propagation_direction="both",
-                start_frame_idx=None,
-                max_frame_num_to_track=None,
-            ))
-
-        for result in propagation_results:
-            frame_idx = result["frame_index"]
-            outputs = result["outputs"]
-            obj_ids = outputs["out_obj_ids"]          # (N,) int
-            binary_masks = outputs["out_binary_masks"]  # (N, H, W) bool
-
-            frame_dict = {}
-            for i, oid in enumerate(obj_ids):
-                frame_dict[int(oid)] = binary_masks[i]
-            per_frame_masks[frame_idx] = frame_dict
             pbar.update(1)
 
-        # Close session
-        predictor.close_session(session_id)
+            # Collect all obj_ids from this prompt's results
+            prompt_obj_ids = sorted(
+                set(oid for fd in pfm.values() for oid in fd)
+            )
+
+            if not prompt_obj_ids:
+                _logger.warning(
+                    "SAM3 detected no objects for prompt '%s'", prompt_text
+                )
+                pbar.update(1)
+                continue
+
+            # Map this prompt's obj_ids to global slots
+            local_to_global = {}
+            for oid in prompt_obj_ids:
+                local_to_global[oid] = global_slot_count
+                global_slot_count += 1
+
+            # Merge into global_frame_masks
+            for t in range(B):
+                fd = pfm.get(t, {})
+                for oid, mask_np in fd.items():
+                    global_frame_masks[t][local_to_global[oid]] = mask_np
+
+            pbar.update(1)
 
         # ------------------------------------------------------------------
-        # Alignment: ensure every frame has the same N person slots
+        # Build aligned output
         # ------------------------------------------------------------------
-        all_obj_ids = sorted(
-            set(oid for fd in per_frame_masks.values() for oid in fd)
-        )
-        n_persons = len(all_obj_ids)
+        n_persons = global_slot_count
 
         if n_persons == 0:
             _logger.warning(
-                "SAM3 detected no objects with prompt '%s'. "
+                "SAM3 detected no objects for any prompt. "
                 "Returning single empty mask per frame.",
-                text_prompt,
             )
-            n_persons = 1
             return (torch.zeros(B, H, W),)
-
-        id_to_idx = {oid: i for i, oid in enumerate(all_obj_ids)}
 
         masks_out = torch.zeros(B, n_persons, H, W)
         for t in range(B):
-            fd = per_frame_masks.get(t, {})
-            for oid, mask_np in fd.items():
-                masks_out[t, id_to_idx[oid]] = torch.from_numpy(
+            for slot, mask_np in global_frame_masks[t].items():
+                masks_out[t, slot] = torch.from_numpy(
                     mask_np.astype(np.float32)
                 )
 
@@ -232,8 +276,9 @@ class SAM3VideoSegmentationNode:
         masks_out = masks_out.reshape(B * n_persons, H, W)
 
         _logger.info(
-            "SAM3 segmentation: %d frames, %d persons, output shape %s",
-            B, n_persons, tuple(masks_out.shape),
+            "SAM3 segmentation: %d frames, %d prompts, %d total persons, "
+            "output shape %s",
+            B, n_prompts, n_persons, tuple(masks_out.shape),
         )
 
         return (masks_out,)
