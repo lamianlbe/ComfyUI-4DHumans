@@ -111,4 +111,11 @@ class SavePoseDataNode:
         data = poses_to_npz_dict(poses)
         np.savez_compressed(path, **data)
 
-        return {"ui": {"text": [f"Saved: {filename}"]}}
+        return {"ui": {
+            "text": [f"Saved: {filename}"],
+            "files": [{
+                "filename": filename,
+                "subfolder": "",
+                "type": "output",
+            }],
+        }}
