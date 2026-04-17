@@ -204,21 +204,27 @@ class SapiensPromptHMRPoseNode:
             # --- Sapiens batch inference ---
             sap_batch = torch.stack(sap_tensors, dim=0).to(sap_device).to(sap_dtype)
             with torch.inference_mode():
-                heatmaps_batch = sap_model(sap_batch).to(torch.float32).cpu()
-                # heatmaps_batch: (N, K, hm_h, hm_w)
+                heatmaps_batch = sap_model(sap_batch).to(torch.float32)
+                # heatmaps_batch: (N, K, hm_h, hm_w) still on GPU
 
-            N_sap, K_sap, hm_h, hm_w = heatmaps_batch.shape
+                N_sap, K_sap, hm_h, hm_w = heatmaps_batch.shape
 
-            # Vectorised argmax over all keypoints at once
-            hm_flat = heatmaps_batch.reshape(N_sap, K_sap, -1)  # (N, K, hm_h*hm_w)
-            max_vals, max_idxs = hm_flat.max(dim=2)              # (N, K)
-            y_hm = (max_idxs // hm_w).float().numpy()            # (N, K)
-            x_hm = (max_idxs % hm_w).float().numpy()             # (N, K)
-            confs = max_vals.numpy()                               # (N, K)
+                # GPU-side argmax — avoids transferring full heatmap to CPU.
+                # Full heatmap is N*K*hm_h*hm_w floats (~25 MB per person);
+                # argmax result is only N*K ints (~a few KB).
+                hm_flat = heatmaps_batch.reshape(N_sap, K_sap, -1)
+                max_vals, max_idxs = hm_flat.max(dim=2)   # (N, K)
+                y_hm_t = (max_idxs // hm_w).to(torch.float32)
+                x_hm_t = (max_idxs % hm_w).to(torch.float32)
+
+                # Single small CPU transfer
+                y_hm = y_hm_t.cpu().numpy()
+                x_hm = x_hm_t.cpu().numpy()
+                confs = max_vals.cpu().numpy()
 
             for i, p_idx in enumerate(person_indices):
                 bx, by, bw, bh = sap_bboxes[i]
-                pixel_kp = np.zeros((K_sap, 3), dtype=np.float32)
+                pixel_kp = np.empty((K_sap, 3), dtype=np.float32)
                 pixel_kp[:, 0] = x_hm[i] * bw / hm_w + bx
                 pixel_kp[:, 1] = y_hm[i] * bh / hm_h + by
                 pixel_kp[:, 2] = confs[i]

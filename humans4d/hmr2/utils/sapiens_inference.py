@@ -24,28 +24,8 @@ CONF_THRESHOLD = 0.3
 # Inference
 # ---------------------------------------------------------------------------
 
-@torch.inference_mode()
-def run_sapiens_on_bbox(img_np, bbox, sapiens_dict):
-    """
-    Run Sapiens pose estimation on a single person crop.
-
-    Parameters
-    ----------
-    img_np : ndarray (H, W, 3) uint8 RGB
-    bbox : array-like [x1, y1, x2, y2]
-    sapiens_dict : dict from LoadSapiensNode
-
-    Returns
-    -------
-    dict with:
-        "pixel_kp" : ndarray (N, 3)  image-space (x, y, conf)
-    or None on failure.
-    """
-    model = sapiens_dict["model"]
-    preprocessor = sapiens_dict["preprocessor"]
-    device = sapiens_dict["device"]
-    dtype = sapiens_dict["dtype"]
-
+def _validate_and_crop(img_np, bbox):
+    """Validate and crop. Returns (cropped, x1, y1, crop_w, crop_h) or None."""
     img_h, img_w = img_np.shape[:2]
     x1, y1, x2, y2 = map(int, bbox[:4])
     x1 = max(0, x1)
@@ -54,26 +34,106 @@ def run_sapiens_on_bbox(img_np, bbox, sapiens_dict):
     y2 = min(img_h, y2)
     if x2 <= x1 or y2 <= y1:
         return None
-
     cropped = img_np[y1:y2, x1:x2]
-    crop_h, crop_w = cropped.shape[:2]
+    return cropped, x1, y1, x2 - x1, y2 - y1
 
-    tensor = preprocessor(cropped).unsqueeze(0).to(device).to(dtype)
-    heatmaps = model(tensor).to(torch.float32)  # (1, K, hm_h, hm_w)
-    heatmaps = heatmaps[0].cpu().numpy()         # (K, hm_h, hm_w)
 
-    num_kp, hm_h, hm_w = heatmaps.shape
-    pixel_kp = np.zeros((num_kp, 3), dtype=np.float32)
-    for i in range(num_kp):
-        hm = heatmaps[i]
-        y_hm, x_hm = np.unravel_index(np.argmax(hm), hm.shape)
-        pixel_kp[i] = (
-            float(x_hm) * crop_w / hm_w + x1,
-            float(y_hm) * crop_h / hm_h + y1,
-            float(hm[y_hm, x_hm]),
-        )
+@torch.inference_mode()
+def run_sapiens_on_bbox(img_np, bbox, sapiens_dict):
+    """
+    Run Sapiens pose estimation on a single person crop.
 
-    return {"pixel_kp": pixel_kp}
+    Kept for backward compatibility; internally delegates to the batched
+    implementation so optimizations are shared.
+    """
+    results = run_sapiens_batched(
+        [{"img": img_np, "bbox": bbox}], sapiens_dict
+    )
+    return results[0]
+
+
+@torch.inference_mode()
+def run_sapiens_batched(crop_requests, sapiens_dict, max_batch=None):
+    """
+    Run Sapiens pose estimation on multiple crops in one forward pass.
+
+    Parameters
+    ----------
+    crop_requests : list of dict
+        Each dict has:
+            "img"  : ndarray (H, W, 3) uint8 RGB
+            "bbox" : array-like [x1, y1, x2, y2]
+    sapiens_dict : dict from LoadSapiensNode
+    max_batch : int or None
+        Optional cap on batch size to avoid OOM.  If None, process all
+        requests in a single forward pass.
+
+    Returns
+    -------
+    list of dict or None, one per request:
+        {"pixel_kp": ndarray (K, 3)} or None if the bbox was invalid.
+    """
+    model = sapiens_dict["model"]
+    preprocessor = sapiens_dict["preprocessor"]
+    device = sapiens_dict["device"]
+    dtype = sapiens_dict["dtype"]
+
+    n = len(crop_requests)
+    results = [None] * n
+
+    # Preprocess each valid crop on CPU.  Preprocessor returns (3, H, W)
+    # tensors that are all the same resolution after Resize, so they can
+    # be stacked directly.
+    tensors = []
+    meta = []  # (result_idx, x1, y1, crop_w, crop_h)
+
+    for i, req in enumerate(crop_requests):
+        validated = _validate_and_crop(req["img"], req["bbox"])
+        if validated is None:
+            continue
+        cropped, x1, y1, crop_w, crop_h = validated
+        tensors.append(preprocessor(cropped))
+        meta.append((i, x1, y1, crop_w, crop_h))
+
+    if not tensors:
+        return results
+
+    # Run in sub-batches if requested
+    if max_batch is None or max_batch >= len(tensors):
+        batch_slices = [(0, len(tensors))]
+    else:
+        batch_slices = [
+            (s, min(s + max_batch, len(tensors)))
+            for s in range(0, len(tensors), max_batch)
+        ]
+
+    for start, end in batch_slices:
+        batch = torch.stack(tensors[start:end]).to(device).to(dtype)
+        heatmaps = model(batch).to(torch.float32)  # (B, K, hm_h, hm_w)
+        B, K, hm_h, hm_w = heatmaps.shape
+
+        # ---- GPU-side argmax over spatial dims (single kernel) ----
+        flat = heatmaps.reshape(B, K, hm_h * hm_w)
+        max_vals, max_idx = flat.max(dim=-1)        # (B, K), (B, K)
+        y_hm = (max_idx // hm_w).to(torch.float32)  # (B, K)
+        x_hm = (max_idx %  hm_w).to(torch.float32)  # (B, K)
+
+        # Single small CPU transfer instead of (K,) loops
+        y_hm_np = y_hm.cpu().numpy()
+        x_hm_np = x_hm.cpu().numpy()
+        conf_np = max_vals.cpu().numpy()
+
+        for b in range(B):
+            result_idx, x1, y1, crop_w, crop_h = meta[start + b]
+            sx = crop_w / hm_w
+            sy = crop_h / hm_h
+            pixel_kp = np.empty((K, 3), dtype=np.float32)
+            pixel_kp[:, 0] = x_hm_np[b] * sx + x1
+            pixel_kp[:, 1] = y_hm_np[b] * sy + y1
+            pixel_kp[:, 2] = conf_np[b]
+            results[result_idx] = {"pixel_kp": pixel_kp}
+
+    return results
 
 
 # ---------------------------------------------------------------------------
