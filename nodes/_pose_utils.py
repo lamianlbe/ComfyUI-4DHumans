@@ -92,8 +92,21 @@ def fuse_3d_body_with_sapiens(op_kp2d, sapiens_kp,
     # Start with 3D body+feet
     coco_wb = openpose25_to_coco_wholebody(op_kp2d)
 
-    # Fill face + hands from Sapiens
+    # Fill face + hands from Sapiens, and prefer Sapiens for the head
+    # slots (nose/eyes/ears) of the body too.  Reason: 3D backbones
+    # like NLF don't regress face joints (their SMPL skeleton only has
+    # a Head joint near the crown), so these slots may be zero after
+    # the OpenPose-25 -> COCO-WB mapping.  Sapiens is a 2D keypoint
+    # model specialised for faces and always gives reliable nose/eye/
+    # ear locations for visible persons.
     if sapiens_kp is not None:
+        # COCO-WB head slots: 0 Nose, 1 L_Eye, 2 R_Eye, 3 L_Ear, 4 R_Ear.
+        # Overwrite when Sapiens has confidence; otherwise keep whatever
+        # came from the 3D backbone (which may be zero).
+        for head_idx in (0, 1, 2, 3, 4):
+            if sapiens_kp[head_idx, 2] > 0.1:
+                coco_wb[head_idx] = sapiens_kp[head_idx]
+
         if show_face:
             coco_wb[23:91] = sapiens_kp[23:91]    # face (68 keypoints)
         if show_hand_foot:
