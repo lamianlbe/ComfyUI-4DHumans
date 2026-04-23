@@ -127,11 +127,11 @@ class LoadPromptHMRNode:
                     {
                         "default": "bfloat16",
                         "tooltip": (
-                            "Model precision. bfloat16 recommended for "
-                            "modern GPUs (Ampere+/Blackwell): ~2x less VRAM, "
-                            "same numerical range as float32. float16 has "
-                            "faster matmul on some GPUs but risks overflow. "
-                            "float32 keeps the original precision."
+                            "Autocast precision for the forward pass. "
+                            "Model weights stay in fp32 (bundled SMPL-X "
+                            "requires it), but matmul/attention run in "
+                            "the chosen dtype via torch.autocast. "
+                            "bfloat16 is recommended for Ampere+/Blackwell."
                         ),
                     },
                 ),
@@ -146,9 +146,13 @@ class LoadPromptHMRNode:
         _check_required_files()
         model = _load_model()
 
+        # NOTE: We deliberately do NOT cast the model weights to bf16/fp16.
+        # The bundled SMPL-X body model has hardcoded float32 operations
+        # (in lbs, joint regressors, etc.) that break when weights are in
+        # low precision. Instead we keep weights in fp32 and use `dtype`
+        # only for the autocast context during forward pass — same compute
+        # speedup, no dtype mismatch errors.
         torch_dtype = _DTYPE_MAP.get(dtype, torch.bfloat16)
-        if torch_dtype != torch.float32:
-            model = model.to(torch_dtype)
 
         return ({
             "model": model,

@@ -16,11 +16,22 @@ Output:
   - poses (POSES): unified dict with 2D + 3D data for all persons
 """
 
+import logging
+import time
+
 import numpy as np
 import torch
 import comfy.utils
 
 from ..humans4d.hmr2.utils.sapiens_inference import run_sapiens_on_bbox
+
+_logger = logging.getLogger(__name__)
+
+
+def _cuda_sync():
+    """Force GPU sync so timing measurements are accurate."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def _mask_to_bbox_torch(mask_np):
@@ -144,6 +155,10 @@ class SapiensPromptHMRPoseNode:
         # Each entry: (frame_idx, person_idx, preproc_tensor, (x1,y1,w,h))
         sap_requests = []
 
+        # Timing accumulators (GPU-synchronised).
+        phmr_time_s = 0.0
+        sapiens_time_s = 0.0
+
         # ----- Pass 1: PromptHMR per-frame + gather Sapiens crops -----
         for t in range(B):
             img_np = images_np[t]
@@ -199,9 +214,13 @@ class SapiensPromptHMRPoseNode:
                 "text": None,
             }]
 
+            _cuda_sync()
+            phmr_start = time.perf_counter()
             with torch.no_grad(), autocast("cuda", dtype=phmr_dtype):
                 batch = prepare_batch(inputs, img_size=img_size, interaction=False)
                 output = model(batch, use_mean_hands=True)[0]
+            _cuda_sync()
+            phmr_time_s += time.perf_counter() - phmr_start
 
             joints_2d = output["body_joints2d"].detach().cpu().numpy()
             joints_3d = output["body_joints"].detach().cpu().numpy()
@@ -240,6 +259,8 @@ class SapiensPromptHMRPoseNode:
 
                 sap_batch = torch.stack(tensors, dim=0).to(sap_device).to(sap_dtype)
 
+                _cuda_sync()
+                sap_start = time.perf_counter()
                 with torch.inference_mode():
                     heatmaps_batch = sap_model(sap_batch).to(torch.float32)
                     N_b, K_sap, hm_h, hm_w = heatmaps_batch.shape
@@ -253,6 +274,8 @@ class SapiensPromptHMRPoseNode:
                     y_hm = y_hm_t.cpu().numpy()
                     x_hm = x_hm_t.cpu().numpy()
                     confs = max_vals.cpu().numpy()
+                _cuda_sync()
+                sapiens_time_s += time.perf_counter() - sap_start
 
                 for i, (frame_t, p_idx, _, (bx, by, bw, bh)) in enumerate(chunk):
                     pixel_kp = np.empty((K_sap, 3), dtype=np.float32)
@@ -271,6 +294,18 @@ class SapiensPromptHMRPoseNode:
                 kp.copy() if kp is not None else None
                 for kp in persons[p_idx]["keypoints"]
             ]
+
+        n_sap = len(sap_requests)
+        _logger.info(
+            "SapiensPromptHMR Human Pose: %d frames, %d persons | "
+            "PromptHMR %.2f s (%.1f ms/frame) | "
+            "Sapiens %.2f s (%d crops, %.1f ms/crop, batch=%d)",
+            B, n_persons,
+            phmr_time_s, 1000.0 * phmr_time_s / max(1, B),
+            sapiens_time_s, n_sap,
+            1000.0 * sapiens_time_s / max(1, n_sap),
+            sapiens_batch_size,
+        )
 
         poses = {
             "n_persons": n_persons,

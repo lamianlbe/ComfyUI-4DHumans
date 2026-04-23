@@ -113,7 +113,7 @@ class SMPLX(smplx.SMPLXLayer):
         # Replace some SMPLX joints with SMPL joint for better alignment with datasets
         ### replace: elbows, knees and ankles
         smpl_joints = self.smpl_joints @ smplx_output.vertices
-        body_joints[:, [3,6,10,13,11,14]] = smpl_joints[:, [19,18,5,4,8,7]].to(body_joints.dtype)
+        body_joints[:, [3,6,10,13,11,14]] = smpl_joints[:, [19,18,5,4,8,7]].float()
         
         smplx_output.body_joints = body_joints
         smplx_output.face_joints = face_joints
