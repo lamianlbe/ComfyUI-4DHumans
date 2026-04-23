@@ -43,18 +43,28 @@ class TensorVideoLoader:
         - mode == "video"
         - frames: total frame count
         - frame:  current frame index (updated during iteration)
-        - __iter__ / __next__ yielding one frame at a time as
-          (paths, im_bchw, metadata) matching ultralytics' convention
+        - __iter__ / __next__ yielding one frame as
+          ([path], [im0_hwc_bgr_uint8], [info_str]) — matching what
+          LoadImagesAndVideos yields from cv2.VideoCapture.read().
+          Ultralytics' preprocess() then runs letterbox + normalize +
+          to-tensor, which is what SAM3's positional encodings expect.
     """
 
     def __init__(self, tensor, fps=30):
-        # tensor: (B, C, H, W) float [0, 1] on any device
-        self.im0 = tensor
-        self.bs = 1                       # one frame per step
+        # tensor: (B, C, H, W) float [0, 1], any device
+        import numpy as _np
+        # Pre-convert once to HWC RGB uint8 on CPU, then swap to BGR
+        rgb_u8 = (tensor.clamp(0, 1) * 255).byte().cpu().numpy()  # (B, C, H, W)
+        # BCHW → BHWC
+        hwc = _np.transpose(rgb_u8, (0, 2, 3, 1))
+        # RGB → BGR (ultralytics convention from cv2)
+        self.frames_bgr = hwc[..., ::-1].copy()
+
+        self.bs = 1
         self.mode = "video"
         self.frames = int(tensor.shape[0])
         self.fps = fps
-        self.frame = 0                    # current frame index
+        self.frame = 0
         self.count = 0
         self.paths = [f"frame_{i}.jpg" for i in range(self.frames)]
 
@@ -66,11 +76,11 @@ class TensorVideoLoader:
     def __next__(self):
         if self.count >= self.frames:
             raise StopIteration
-        im = self.im0[self.count:self.count + 1]  # (1, C, H, W)
+        im0 = self.frames_bgr[self.count]   # (H, W, 3) BGR uint8
         path = self.paths[self.count]
         self.frame = self.count
         self.count += 1
-        return [path], im, [""]
+        return [path], [im0], [""]
 
     def __len__(self):
         return self.frames
