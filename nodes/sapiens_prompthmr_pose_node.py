@@ -434,10 +434,18 @@ class SapiensPromptHMRPoseNode:
                 _cuda_sync()
                 sap_start = time.perf_counter()
                 with torch.inference_mode():
-                    heatmaps_batch = sap_model(sap_batch).to(torch.float32)
+                    # Forward in the model's native dtype (bf16 when
+                    # the user picked bf16). Casting the full heatmap
+                    # (N, 133, 256, 192) back to fp32 cost ~420 MB of
+                    # GPU memory bandwidth per batch=16 step and
+                    # bought us nothing — argmax/max on bf16 give the
+                    # same integer indices and the confidence values
+                    # only need fp32 precision at the very end, when
+                    # we hand them to numpy.
+                    heatmaps_batch = sap_model(sap_batch)
                     N_b, K_sap, hm_h, hm_w = heatmaps_batch.shape
 
-                    # GPU-side argmax — only transfer (N, K) indices back.
+                    # GPU-side argmax — only transfer (N, K) ints back.
                     hm_flat = heatmaps_batch.reshape(N_b, K_sap, -1)
                     max_vals, max_idxs = hm_flat.max(dim=2)
                     y_hm_t = (max_idxs // hm_w).to(torch.float32)
@@ -445,7 +453,10 @@ class SapiensPromptHMRPoseNode:
 
                     y_hm = y_hm_t.cpu().numpy()
                     x_hm = x_hm_t.cpu().numpy()
-                    confs = max_vals.cpu().numpy()
+                    # Cast the tiny (N, K) confidence tensor to fp32
+                    # for numpy compatibility — still orders of
+                    # magnitude cheaper than casting the full heatmap.
+                    confs = max_vals.float().cpu().numpy()
                 _cuda_sync()
                 sapiens_time_s += time.perf_counter() - sap_start
 
