@@ -49,8 +49,13 @@ _logger = logging.getLogger(__name__)
 #   15 R_Eye, 16 L_Eye, 17 R_Ear, 18 L_Ear,
 #   19 L_BigToe, 20 L_SmallToe, 21 L_Heel,
 #   22 R_BigToe, 23 R_SmallToe, 24 R_Heel
+# NOTE: OP25[0] (Nose) is deliberately NOT mapped from SMPL[15] (Head).
+# SMPL's Head joint is at the skull top/center, while OpenPose's Nose
+# sits at the face center — projecting Head into the Nose slot makes
+# downstream renderers place the head marker ~10-20 cm too high.
+# Leaving OP25[0] at zeros means "not detected"; Sapiens 2D keypoints
+# fill in proper facial landmarks via fuse_3d_body_with_sapiens.
 _OP25_FROM_SMPL24 = {
-    0:  15,  # Nose    ← Head (approx; SMPL has no face joints)
     1:  12,  # Neck
     2:  17,  # R_Shoulder
     3:  19,  # R_Elbow
