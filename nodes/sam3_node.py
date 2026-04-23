@@ -268,6 +268,7 @@ class SAM3VideoSegmentationNode:
             all_track_ids = set()
 
             frame_idx = 0
+            logged_shape = False
             for r in results_iter:
                 if frame_idx >= B:
                     break
@@ -276,18 +277,35 @@ class SAM3VideoSegmentationNode:
                     masks_data = r.masks.data  # (N, H', W')
                     ids = r.boxes.id           # (N,) or None
 
+                    # Log once so users can diagnose shape mismatches
+                    if not logged_shape:
+                        _logger.info(
+                            "SAM3 mask shape: %s, dtype: %s, range: [%.2f, %.2f], "
+                            "image shape: (%d, %d)",
+                            tuple(masks_data.shape), masks_data.dtype,
+                            float(masks_data.min()), float(masks_data.max()),
+                            H, W,
+                        )
+                        logged_shape = True
+
                     if ids is None:
                         ids = torch.arange(masks_data.shape[0])
 
-                    # Resize masks back to original (H, W) if needed
+                    # Resize masks back to original (H, W) if needed.
+                    # Use bilinear here to avoid nearest-neighbour blockiness
+                    # when ultralytics returns masks at the letterbox size.
                     if masks_data.shape[-2:] != (H, W):
                         masks_data = torch.nn.functional.interpolate(
                             masks_data.unsqueeze(1).float(),
                             size=(H, W),
-                            mode="nearest",
+                            mode="bilinear",
+                            align_corners=False,
                         ).squeeze(1)
 
-                    masks_np = masks_data.cpu().numpy().astype(np.float32)
+                    # Binarise masks to 0/1 floats to match the previous
+                    # SAM3 node's output format (downstream expects
+                    # mask > 0.5 checks).
+                    masks_np = (masks_data > 0.5).cpu().numpy().astype(np.float32)
                     ids_np = ids.cpu().numpy().astype(int)
 
                     for i, tid in enumerate(ids_np):
