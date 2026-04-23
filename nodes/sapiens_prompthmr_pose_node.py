@@ -263,8 +263,15 @@ class SapiensPromptHMRPoseNode:
                 # the forward pass.
                 x1c = max(0, x1)
                 y1c = max(0, y1)
-                x2c = min(img_w, x2)
-                y2c = min(img_h, y2)
+                x2c = min(img_w, x2 + 1)  # make bbox half-open, so x2c > x1c
+                y2c = min(img_h, y2 + 1)
+                # Skip degenerate bboxes (e.g. a mask at the image edge
+                # that collapsed to a single row/column after clamping).
+                # Feeding a (0, 0, C) array into sap_preproc produces
+                # NaN-laden tensors that corrupt CUDA kernels
+                # asynchronously, showing up later as cudaErrorLaunchFailure.
+                if x2c - x1c < 2 or y2c - y1c < 2:
+                    continue
                 sap_requests.append((
                     t, p_idx,
                     (x1c, y1c, x2c, y2c),  # bbox in original coords
@@ -399,6 +406,13 @@ class SapiensPromptHMRPoseNode:
                 tensors = []
                 chunk_bboxes = []  # (frame_t, p_idx, bx, by, bw, bh)
                 for frame_t, p_idx, (x1c, y1c, x2c, y2c) in chunk:
+                    # Defence in depth: skip any degenerate bbox that
+                    # slipped through. Phase 1a already filters these,
+                    # but a corrupt crop here propagates NaN into
+                    # Sapiens and triggers cudaErrorLaunchFailure
+                    # asynchronously at the next .cpu() call.
+                    if x2c - x1c < 2 or y2c - y1c < 2:
+                        continue
                     mask_frame = masks_np[frame_t][p_idx]
                     cropped = images_np[frame_t, y1c:y2c, x1c:x2c].copy()
                     crop_mask = mask_frame[y1c:y2c, x1c:x2c] > 0.5
@@ -407,6 +421,12 @@ class SapiensPromptHMRPoseNode:
                     chunk_bboxes.append(
                         (frame_t, p_idx, x1c, y1c, x2c - x1c, y2c - y1c)
                     )
+
+                if not tensors:
+                    # Entire chunk was degenerate — skip the forward
+                    # pass entirely instead of trying to stack zero
+                    # tensors (which would crash differently).
+                    continue
 
                 sap_batch = torch.stack(tensors, dim=0).to(sap_device).to(sap_dtype)
                 del tensors  # release CPU-side pre-stack list asap
