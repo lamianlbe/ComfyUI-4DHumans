@@ -159,7 +159,13 @@ class YOLOInstanceSegmentationNode:
     FUNCTION = "segment"
     CATEGORY = "4dhumans"
 
+    # Per-chunk frame count — tuned to cap peak VRAM on long HD videos.
+    # At 720p / bf16, a chunk of 128 uses well under 10 GB including
+    # activations, tracker state, and per-frame mask accumulators.
+    _CHUNK_SIZE = 128
+
     def segment(self, images, yolo, class_ids, tracker, iou):
+        chunk_size = self._CHUNK_SIZE
         model = yolo["model"]
 
         # images: (B, H, W, 3) float [0, 1]
@@ -178,8 +184,11 @@ class YOLOInstanceSegmentationNode:
         if not class_list:
             class_list = [0]  # default to person
 
-        # Convert to BCHW RGB float32 [0, 1] for ultralytics' LoadTensor
-        source = images.permute(0, 3, 1, 2).contiguous().float()
+        # Convert to BCHW RGB float32 [0, 1].  Keep on CPU — we slice
+        # it per chunk and let ultralytics move each chunk to GPU.
+        # (Sending the whole (B, 3, H, W) tensor in one call makes
+        # ultralytics allocate ~B * H * W * 12 bytes of VRAM up front.)
+        source_cpu = images.permute(0, 3, 1, 2).contiguous().float()
 
         pbar = comfy.utils.ProgressBar(B)
 
@@ -198,66 +207,82 @@ class YOLOInstanceSegmentationNode:
                 except Exception as e:
                     _logger.warning("YOLO restore-to-CUDA failed: %s", e)
 
-            # model.track() runs YOLO detection + ByteTrack/BoT-SORT tracker
-            # with persistent IDs across consecutive frames in the batch.
-            results_iter = model.track(
-                source=source,
-                stream=True,
-                imgsz=yolo["imgsz"],
-                conf=yolo["conf"],
-                iou=iou,
-                half=yolo["half"],
-                classes=class_list,
-                tracker=tracker,
-                persist=False,
-                verbose=False,
-            )
+            # Process the video in chunks to bound peak VRAM.  Use
+            # persist=True so ByteTrack / BoT-SORT carry their state
+            # across chunk boundaries — track IDs stay consistent end
+            # to end as if it were a single stream.
+            t = 0
+            for chunk_start in range(0, B, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, B)
+                chunk = source_cpu[chunk_start:chunk_end]
 
-            for t, r in enumerate(results_iter):
-                if t >= B:
-                    break
+                results_iter = model.track(
+                    source=chunk,
+                    stream=True,
+                    imgsz=yolo["imgsz"],
+                    conf=yolo["conf"],
+                    iou=iou,
+                    half=yolo["half"],
+                    classes=class_list,
+                    tracker=tracker,
+                    persist=(chunk_start > 0),
+                    verbose=False,
+                )
 
-                if r.masks is None or r.boxes is None:
+                for r in results_iter:
+                    if t >= B:
+                        break
+
+                    if r.masks is None or r.boxes is None:
+                        t += 1
+                        pbar.update(1)
+                        continue
+
+                    masks_data = r.masks.data      # (N, H', W')
+                    ids = r.boxes.id                # (N,) or None
+
+                    if not logged_shape:
+                        _logger.info(
+                            "YOLO mask shape: %s, dtype: %s, range: [%.2f, %.2f], "
+                            "image shape: (%d, %d), chunk_size=%d",
+                            tuple(masks_data.shape), masks_data.dtype,
+                            float(masks_data.min()), float(masks_data.max()),
+                            H, W, chunk_size,
+                        )
+                        logged_shape = True
+
+                    # Tracker may skip IDs on noisy detections; assign
+                    # one-shot placeholder IDs so those masks still
+                    # appear in their own slot rather than being merged.
+                    if ids is None:
+                        ids = torch.arange(masks_data.shape[0]) + fallback_id
+                        fallback_id += masks_data.shape[0]
+
+                    # Resize masks back to original (H, W) if needed
+                    if masks_data.shape[-2:] != (H, W):
+                        masks_data = torch.nn.functional.interpolate(
+                            masks_data.unsqueeze(1).float(),
+                            size=(H, W),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(1)
+
+                    masks_np = (masks_data > 0.5).cpu().numpy().astype(np.float32)
+                    ids_np = ids.cpu().numpy().astype(int)
+
+                    for i, tid in enumerate(ids_np):
+                        per_frame[t][int(tid)] = masks_np[i]
+                        all_track_ids.add(int(tid))
+
+                    t += 1
                     pbar.update(1)
-                    continue
 
-                masks_data = r.masks.data      # (N, H', W')
-                ids = r.boxes.id                # (N,) or None
-
-                if not logged_shape:
-                    _logger.info(
-                        "YOLO mask shape: %s, dtype: %s, range: [%.2f, %.2f], "
-                        "image shape: (%d, %d)",
-                        tuple(masks_data.shape), masks_data.dtype,
-                        float(masks_data.min()), float(masks_data.max()),
-                        H, W,
-                    )
-                    logged_shape = True
-
-                # Tracker may skip IDs on noisy detections; assign
-                # one-shot placeholder IDs so those masks still appear
-                # in their own slot rather than being merged.
-                if ids is None:
-                    ids = torch.arange(masks_data.shape[0]) + fallback_id
-                    fallback_id += masks_data.shape[0]
-
-                # Resize masks back to original (H, W) if needed
-                if masks_data.shape[-2:] != (H, W):
-                    masks_data = torch.nn.functional.interpolate(
-                        masks_data.unsqueeze(1).float(),
-                        size=(H, W),
-                        mode="bilinear",
-                        align_corners=False,
-                    ).squeeze(1)
-
-                masks_np = (masks_data > 0.5).cpu().numpy().astype(np.float32)
-                ids_np = ids.cpu().numpy().astype(int)
-
-                for i, tid in enumerate(ids_np):
-                    per_frame[t][int(tid)] = masks_np[i]
-                    all_track_ids.add(int(tid))
-
-                pbar.update(1)
+                # Force-release per-chunk intermediate tensors (Results
+                # objects, heatmaps, resized masks still on GPU) before
+                # starting the next chunk.
+                del results_iter
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         finally:
             # Offload YOLO to CPU so downstream nodes have VRAM available
             try:
