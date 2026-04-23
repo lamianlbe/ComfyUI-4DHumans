@@ -13,6 +13,7 @@ from .nodes.load_phalp_node import LoadPHALPNode
 from .nodes.phalp_pose_node import PHALPPoseControlNetNode
 from .nodes.load_sapiens_node import LoadSapiensNode
 from .nodes.load_prompthmr_node import LoadPromptHMRNode
+from .nodes.load_nlf_node import LoadNLFNode
 from .nodes.sapiens_prompthmr_pose_node import SapiensPromptHMRPoseNode
 from .nodes.sapiens_prompthmr_to_nlf_node import SapiensPromptHMRToNLFNode
 from .nodes.sam3_node import LoadSAM3Node, SAM3VideoSegmentationNode
@@ -30,6 +31,7 @@ NODE_CLASS_MAPPINGS = {
     'PHALPPoseControlNet': PHALPPoseControlNetNode,
     'LoadSapiens': LoadSapiensNode,
     'LoadPromptHMR': LoadPromptHMRNode,
+    'LoadNLF': LoadNLFNode,
     'SapiensPromptHMRPose': SapiensPromptHMRPoseNode,
     'SapiensPromptHMRToNLF': SapiensPromptHMRToNLFNode,
     'LoadSAM3': LoadSAM3Node,
@@ -49,6 +51,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'PHALPPoseControlNet': '4D Human Pose Tracking (ControlNet)',
     'LoadSapiens': 'Load Sapiens Pose',
     'LoadPromptHMR': 'Load PromptHMR',
+    'LoadNLF': 'Load NLF',
     'SapiensPromptHMRPose': 'Sapiens PromptHMR Human Pose',
     'SapiensPromptHMRToNLF': 'Sapiens PromptHMR to NLF Poses',
     'LoadSAM3': 'Load SAM3',

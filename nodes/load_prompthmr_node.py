@@ -138,7 +138,8 @@ class LoadPromptHMRNode:
             },
         }
 
-    RETURN_TYPES = ("PROMPTHMR",)
+    RETURN_TYPES = ("POSE3D",)
+    RETURN_NAMES = ("pose_3d_model",)
     FUNCTION = "load"
     CATEGORY = "4dhumans"
 
@@ -155,6 +156,7 @@ class LoadPromptHMRNode:
         torch_dtype = _DTYPE_MAP.get(dtype, torch.bfloat16)
 
         return ({
+            "backend": "prompthmr",
             "model": model,
             "img_size": 896,
             "dtype": dtype,

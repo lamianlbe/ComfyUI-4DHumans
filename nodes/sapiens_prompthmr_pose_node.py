@@ -82,7 +82,7 @@ class SapiensPromptHMRPoseNode:
             "required": {
                 "images": ("IMAGE",),
                 "masks": ("MASK",),
-                "prompthmr": ("PROMPTHMR",),
+                "pose_3d_model": ("POSE3D",),
                 "sapiens": ("SAPIENS",),
                 "fps": (
                     "FLOAT",
@@ -108,7 +108,7 @@ class SapiensPromptHMRPoseNode:
                         ),
                     },
                 ),
-                "prompthmr_fps": (
+                "pose_3d_fps": (
                     "FLOAT",
                     {
                         "default": 15.0,
@@ -116,11 +116,11 @@ class SapiensPromptHMRPoseNode:
                         "max": 120.0,
                         "step": 0.5,
                         "tooltip": (
-                            "Target sampling rate for PromptHMR (3D). "
-                            "Frames between samples are filled by linear "
-                            "interpolation. Lower = faster but slightly "
-                            "coarser 3D motion. Set equal to source fps "
-                            "to disable (run every frame)."
+                            "Target sampling rate for the 3D backbone "
+                            "(PromptHMR or NLF). Frames between samples "
+                            "are filled by linear interpolation. Lower = "
+                            "faster but slightly coarser 3D motion. Set "
+                            ">= source fps to disable (run every frame)."
                         ),
                     },
                 ),
@@ -132,19 +132,23 @@ class SapiensPromptHMRPoseNode:
     FUNCTION = "estimate_pose"
     CATEGORY = "4dhumans"
 
-    def estimate_pose(self, images, masks, prompthmr, sapiens, fps,
-                      batch_size=16, prompthmr_fps=15.0):
-        from .load_prompthmr_node import _ensure_lib_importable
-        _ensure_lib_importable()
+    def estimate_pose(self, images, masks, pose_3d_model, sapiens, fps,
+                      batch_size=16, pose_3d_fps=15.0):
+        backend = pose_3d_model.get("backend", "prompthmr")
+        if backend == "prompthmr":
+            from .load_prompthmr_node import _ensure_lib_importable
+            _ensure_lib_importable()
+            from prompt_hmr.models.inference import prepare_batch  # noqa: F401
 
         from torch.amp import autocast
-        from prompt_hmr.models.inference import prepare_batch
 
-        model = prompthmr["model"]
-        img_size = prompthmr["img_size"]
-        # Use the dtype the model was loaded with.  If not set (legacy),
-        # default to float16 to match the previous autocast("cuda") behaviour.
-        phmr_dtype = prompthmr.get("torch_dtype", torch.float16)
+        model = pose_3d_model["model"]
+        img_size = pose_3d_model.get("img_size", 896)
+        # Autocast dtype for forward pass. Default is float16 to match the
+        # historical autocast("cuda") behaviour when no dtype was set.
+        phmr_dtype = pose_3d_model.get("torch_dtype", torch.float16)
+        # Backward-compat: older workflows may pass prompthmr_fps kwarg
+        prompthmr_fps = pose_3d_fps
 
         B, img_h, img_w, C = images.shape
         rgb = images[..., :3]  # (B, H, W, 3)
@@ -269,58 +273,83 @@ class SapiensPromptHMRPoseNode:
                 "person_indices": person_indices,
             }
 
-        # ----- Phase 1b: PromptHMR cross-frame batched inference -----
+        # ----- Phase 1b: 3D pose cross-frame batched inference -----
         valid_frames = [t for t in range(B) if phmr_frame_inputs[t] is not None]
 
-        for chunk_start in range(0, len(valid_frames), batch_size):
-            chunk_frames = valid_frames[chunk_start:chunk_start + batch_size]
-            inputs = [phmr_frame_inputs[t]["input"] for t in chunk_frames]
+        if backend == "prompthmr":
+            for chunk_start in range(0, len(valid_frames), batch_size):
+                chunk_frames = valid_frames[chunk_start:chunk_start + batch_size]
+                inputs = [phmr_frame_inputs[t]["input"] for t in chunk_frames]
 
-            _cuda_sync()
-            phmr_start = time.perf_counter()
-            with torch.no_grad(), autocast("cuda", dtype=phmr_dtype):
-                batch = prepare_batch(
-                    inputs, img_size=img_size, interaction=False
-                )
-                outputs = model(batch, use_mean_hands=True)
-            _cuda_sync()
-            phmr_time_s += time.perf_counter() - phmr_start
+                _cuda_sync()
+                phmr_start = time.perf_counter()
+                with torch.no_grad(), autocast("cuda", dtype=phmr_dtype):
+                    batch = prepare_batch(
+                        inputs, img_size=img_size, interaction=False
+                    )
+                    outputs = model(batch, use_mean_hands=True)
+                _cuda_sync()
+                phmr_time_s += time.perf_counter() - phmr_start
 
-            for chunk_i, t in enumerate(chunk_frames):
-                output = outputs[chunk_i]
-                person_indices = phmr_frame_inputs[t]["person_indices"]
+                for chunk_i, t in enumerate(chunk_frames):
+                    output = outputs[chunk_i]
+                    person_indices = phmr_frame_inputs[t]["person_indices"]
 
-                joints_2d = output["body_joints2d"].detach().cpu().numpy()
-                joints_3d = output["body_joints"].detach().cpu().numpy()
-                smpl_j3d = output["smpl_j3d"].detach().cpu().numpy()
+                    joints_2d = output["body_joints2d"].detach().cpu().numpy()
+                    joints_3d = output["body_joints"].detach().cpu().numpy()
+                    smpl_j3d = output["smpl_j3d"].detach().cpu().numpy()
 
-                scale_val = batch[chunk_i]["image_scale"]
-                offset_val = batch[chunk_i]["image_offset"]
-                if isinstance(offset_val, torch.Tensor):
-                    offset_val = offset_val.numpy()
-                offset_val = np.array(offset_val)
+                    scale_val = batch[chunk_i]["image_scale"]
+                    offset_val = batch[chunk_i]["image_offset"]
+                    if isinstance(offset_val, torch.Tensor):
+                        offset_val = offset_val.numpy()
+                    offset_val = np.array(offset_val)
 
-                cam_int_val = output["cam_int"].detach().cpu().numpy()
-                cam_int_per_frame[t] = cam_int_val[0]
-                scale_per_frame[t] = float(scale_val)
-                offset_per_frame[t] = offset_val.copy()
+                    cam_int_val = output["cam_int"].detach().cpu().numpy()
+                    cam_int_per_frame[t] = cam_int_val[0]
+                    scale_per_frame[t] = float(scale_val)
+                    offset_per_frame[t] = offset_val.copy()
 
-                joints_2d_orig = (
-                    joints_2d - offset_val[None, None, :]
-                ) / scale_val
+                    joints_2d_orig = (
+                        joints_2d - offset_val[None, None, :]
+                    ) / scale_val
 
-                for i, p_idx in enumerate(person_indices):
-                    persons[p_idx]["body_joints2d"][t] = joints_2d_orig[i]
-                    persons[p_idx]["body_joints"][t] = joints_3d[i]
-                    persons[p_idx]["smpl_j3d"][t] = smpl_j3d[i]
+                    for i, p_idx in enumerate(person_indices):
+                        persons[p_idx]["body_joints2d"][t] = joints_2d_orig[i]
+                        persons[p_idx]["body_joints"][t] = joints_3d[i]
+                        persons[p_idx]["smpl_j3d"][t] = smpl_j3d[i]
 
+                    pbar.update(1)
+
+                # Skipped frames (no valid persons) still need pbar updates
+                # when the chunk is shorter than batch_size at the tail.
+            skipped = B - len(valid_frames)
+            for _ in range(skipped):
                 pbar.update(1)
-
-            # Skipped frames (no valid persons) still need pbar updates
-            # when the chunk is shorter than batch_size at the tail.
-        skipped = B - len(valid_frames)
-        for _ in range(skipped):
-            pbar.update(1)
+        elif backend == "nlf":
+            from ._nlf_inference import run_nlf_inference
+            phmr_time_s += run_nlf_inference(
+                model=model,
+                images_np=images_np,
+                masks_np=masks_np,
+                valid_frames=valid_frames,
+                phmr_frame_inputs=phmr_frame_inputs,
+                persons=persons,
+                cam_int_per_frame=cam_int_per_frame,
+                scale_per_frame=scale_per_frame,
+                offset_per_frame=offset_per_frame,
+                batch_size=batch_size,
+                dtype=phmr_dtype,
+                img_h=img_h,
+                img_w=img_w,
+                pbar=pbar,
+                B=B,
+            )
+        else:
+            raise ValueError(
+                f"Unknown 3D pose backend: {backend!r}. "
+                "Expected 'prompthmr' or 'nlf'."
+            )
 
         # ----- Phase 1c: Fill non-sampled frames by linear interpolation -----
         # (only runs when prompthmr_fps < fps)
@@ -399,9 +428,10 @@ class SapiensPromptHMRPoseNode:
         effective_phmr_fps = fps / phmr_stride
         _logger.info(
             "SapiensPromptHMR Human Pose: %d frames, %d persons, batch=%d | "
-            "PromptHMR %.2f s (%d frames @ %.1f fps stride=%d, %.1f ms/frame) | "
+            "%s %.2f s (%d frames @ %.1f fps stride=%d, %.1f ms/frame) | "
             "Sapiens %.2f s (%d crops, %.1f ms/crop)",
             B, n_persons, batch_size,
+            backend.upper(),
             phmr_time_s, n_phmr, effective_phmr_fps, phmr_stride,
             1000.0 * phmr_time_s / max(1, n_phmr),
             sapiens_time_s, n_sap,
