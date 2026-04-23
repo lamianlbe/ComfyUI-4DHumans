@@ -253,18 +253,21 @@ class SapiensPromptHMRPoseNode:
                 )
                 person_indices.append(p_idx)
 
-                # Sapiens crop for Pass 2 (same sampled frames only)
+                # Sapiens crop bbox for Pass 2 — DO NOT preprocess
+                # here.  sap_preproc returns a (3, 1024, 768) fp32
+                # tensor (~9.4 MB); caching those for every
+                # frame × person filled 15-20 GB of system RAM on
+                # long videos and triggered OOM-kills.  Record the
+                # bbox only; Pass 2 performs the crop + preproc
+                # per-chunk and discards each tensor right after
+                # the forward pass.
                 x1c = max(0, x1)
                 y1c = max(0, y1)
                 x2c = min(img_w, x2)
                 y2c = min(img_h, y2)
-                cropped = img_np[y1c:y2c, x1c:x2c].copy()
-                crop_mask = mask_frame[y1c:y2c, x1c:x2c] > 0.5
-                cropped[~crop_mask] = 0
                 sap_requests.append((
                     t, p_idx,
-                    sap_preproc(cropped),
-                    (x1c, y1c, x2c - x1c, y2c - y1c),
+                    (x1c, y1c, x2c, y2c),  # bbox in original coords
                 ))
 
             if not person_indices:
@@ -390,9 +393,23 @@ class SapiensPromptHMRPoseNode:
 
             for chunk_start in range(0, n_total, batch_size):
                 chunk = sap_requests[chunk_start:chunk_start + batch_size]
-                tensors = [r[2] for r in chunk]
+
+                # Crop + preproc on the fly so no large fp32 tensors
+                # linger in CPU RAM between chunks.
+                tensors = []
+                chunk_bboxes = []  # (frame_t, p_idx, bx, by, bw, bh)
+                for frame_t, p_idx, (x1c, y1c, x2c, y2c) in chunk:
+                    mask_frame = masks_np[frame_t][p_idx]
+                    cropped = images_np[frame_t, y1c:y2c, x1c:x2c].copy()
+                    crop_mask = mask_frame[y1c:y2c, x1c:x2c] > 0.5
+                    cropped[~crop_mask] = 0
+                    tensors.append(sap_preproc(cropped))
+                    chunk_bboxes.append(
+                        (frame_t, p_idx, x1c, y1c, x2c - x1c, y2c - y1c)
+                    )
 
                 sap_batch = torch.stack(tensors, dim=0).to(sap_device).to(sap_dtype)
+                del tensors  # release CPU-side pre-stack list asap
 
                 _cuda_sync()
                 sap_start = time.perf_counter()
@@ -412,7 +429,12 @@ class SapiensPromptHMRPoseNode:
                 _cuda_sync()
                 sapiens_time_s += time.perf_counter() - sap_start
 
-                for i, (frame_t, p_idx, _, (bx, by, bw, bh)) in enumerate(chunk):
+                # Release the big GPU input / heatmap tensors before
+                # the next chunk allocates them again.
+                del sap_batch, heatmaps_batch, hm_flat
+                del max_vals, max_idxs, y_hm_t, x_hm_t
+
+                for i, (frame_t, p_idx, bx, by, bw, bh) in enumerate(chunk_bboxes):
                     pixel_kp = np.empty((K_sap, 3), dtype=np.float32)
                     pixel_kp[:, 0] = x_hm[i] * bw / hm_w + bx
                     pixel_kp[:, 1] = y_hm[i] * bh / hm_h + by
