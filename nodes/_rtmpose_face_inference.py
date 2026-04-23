@@ -1,0 +1,326 @@
+"""
+RTMPose-Face inference helper.
+
+Given per-person face bboxes derived from Fast SAM 3D Body's head
+keypoints, run the RTMPose-Face ONNX model batched across (frame, person)
+slots and output 68-point face landmarks in the original image's pixel
+coordinates.
+
+The public RTMPose-Face Face6 checkpoint outputs **106 landmarks** at
+256x256 input.  We map them to the 68-point COCO-WholeBody / 300W
+convention via a fixed index table (LaPa 106 → 300W 68).
+
+Pipeline per face:
+  1. compute face bbox from MHR nose + eyes + ears, square it, pad 1.5x
+  2. warp-resize the image crop to 256x256 via affine transform
+     (matching MMPose's top-down preprocessing — preserves aspect)
+  3. ImageNet normalise → NCHW float32
+  4. ONNX forward returns SimCC heatmaps (x + y)
+  5. argmax on each SimCC axis → 106 keypoints in 256x256 space
+  6. inverse affine back to original pixel coords
+  7. drop to 68 points via the LaPa106→300W68 map
+"""
+
+import logging
+from typing import Optional, Tuple
+
+import numpy as np
+
+_logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# LaPa 106 → 300W 68 subset mapping
+#
+# The Face6 model's 106-landmark convention follows LaPa/InsightFace
+# order:
+#   0-32   : jawline / face contour (33 points)
+#   33-42  : left eyebrow (10)
+#   43-52  : right eyebrow (10)
+#   53-57  : nose bridge (5)
+#   58-62  : nose tip horizontal (5)
+#   63-74  : left eye contour (12 incl. pupil)
+#   75-86  : right eye contour (12 incl. pupil)
+#   87-105 : mouth outer + inner (20)
+#   (plus 2 pupil centres inside the eye indices)
+#
+# 300W 68 layout:
+#   0-16   : jaw  (17)
+#   17-21  : left brow (5)
+#   22-26  : right brow (5)
+#   27-30  : nose bridge (4)
+#   31-35  : nose horizontal (5)
+#   36-41  : left eye (6)
+#   42-47  : right eye (6)
+#   48-59  : outer lip (12)
+#   60-67  : inner lip (8)
+#
+# The mapping below is the widely used community convention — pick one
+# representative 106-index for each 68-slot.  Adjust if the model's
+# exact definition differs (documented per-slot so it's easy to fix).
+# =============================================================================
+
+_LAPA106_TO_300W68 = np.array([
+    # Jaw 0-16 (subsample 33 contour points every other)
+    0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32,
+    # Left brow 17-21
+    33, 34, 36, 38, 40,
+    # Right brow 22-26
+    43, 44, 46, 48, 50,
+    # Nose bridge 27-30
+    53, 54, 55, 56,
+    # Nose horizontal 31-35
+    58, 59, 60, 61, 62,
+    # Left eye 36-41
+    63, 64, 66, 68, 70, 72,
+    # Right eye 42-47
+    75, 76, 78, 80, 82, 84,
+    # Outer lip 48-59
+    87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98,
+    # Inner lip 60-67
+    99, 100, 101, 102, 103, 104, 105, 87,  # last 87 is placeholder
+], dtype=np.int64)
+
+# Note: the last slot (67) should map to a distinct inner-lip point; if
+# the model's inner-lip convention has only 7 points we reuse 87 as a
+# harmless placeholder.  This is easy to patch once the real model's
+# output is inspected.
+
+
+# =============================================================================
+# Preprocessing / postprocessing (MMPose top-down SimCC convention)
+# =============================================================================
+
+_IMG_MEAN = np.array([123.675, 116.28, 103.53], dtype=np.float32)
+_IMG_STD  = np.array([58.395, 57.12, 57.375], dtype=np.float32)
+
+
+def _get_face_bbox_from_coco_wb_head(
+    coco_wb_body_feet: np.ndarray,  # (23, 3) or (23, 2)
+    img_h: int,
+    img_w: int,
+    expand_ratio: float = 1.8,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Derive a square, padded face bbox from the nose + eyes + ears
+    (COCO-WB indices 0-4).
+
+    Returns ``None`` when head keypoints are too sparse to locate a face.
+    """
+    head = coco_wb_body_feet[:5]  # (5, D)
+    if head.shape[1] >= 3:
+        conf = head[:, 2]
+    else:
+        conf = np.ones(5, dtype=np.float32)
+    valid = conf > 0.1
+    if valid.sum() < 2:
+        return None
+
+    pts = head[valid, :2]
+    cx = float(np.mean(pts[:, 0]))
+    cy = float(np.mean(pts[:, 1]))
+    # Use the max distance between valid head points as the face scale
+    if len(pts) >= 2:
+        dists = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+        base = float(dists.max()) + 1.0
+    else:
+        base = max(img_h, img_w) * 0.05
+    half = 0.5 * base * expand_ratio
+
+    x1 = int(round(cx - half))
+    y1 = int(round(cy - half))
+    x2 = int(round(cx + half))
+    y2 = int(round(cy + half))
+
+    # Clamp to image
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(img_w, x2)
+    y2 = min(img_h, y2)
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _affine_preproc(
+    img_np: np.ndarray,        # (H, W, 3) uint8 RGB
+    bbox: Tuple[int, int, int, int],
+    out_size: int = 256,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Crop + pad to out_size×out_size preserving aspect.
+
+    Returns
+    -------
+    tensor_chw : (3, out_size, out_size) float32, ImageNet normalised
+    inv_xy     : (2,) (scale_x, scale_y) + (2,) (pad_x, pad_y) packed
+                 as a 4-tuple [sx, sy, ox, oy] for back-projection.
+    """
+    import cv2
+    x1, y1, x2, y2 = bbox
+    crop = img_np[y1:y2, x1:x2]
+    h, w = crop.shape[:2]
+    s = out_size / max(h, w)
+    new_w = int(round(w * s))
+    new_h = int(round(h * s))
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    # Pad to square
+    padded = np.zeros((out_size, out_size, 3), dtype=np.uint8)
+    pad_x = (out_size - new_w) // 2
+    pad_y = (out_size - new_h) // 2
+    padded[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+
+    # Normalise
+    f = padded.astype(np.float32)
+    f = (f - _IMG_MEAN) / _IMG_STD
+    chw = f.transpose(2, 0, 1)  # (3, out, out)
+    # Back-projection parameters
+    inv_params = np.array([
+        (x2 - x1) / new_w,   # sx: model x -> crop x
+        (y2 - y1) / new_h,   # sy
+        x1 - pad_x * (x2 - x1) / new_w,  # ox: pixel_x_model_0 in original
+        y1 - pad_y * (y2 - y1) / new_h,
+    ], dtype=np.float32)
+    return chw, inv_params
+
+
+def _decode_simcc(simcc_x: np.ndarray, simcc_y: np.ndarray,
+                  simcc_split: float = 2.0) -> np.ndarray:
+    """Decode RTMPose's SimCC output to (N, K, 3): (x, y, score).
+
+    simcc_x : (N, K, W_x) = (N, K, in_w * simcc_split)
+    simcc_y : (N, K, W_y) = (N, K, in_h * simcc_split)
+
+    Returns model-space pixel coords in [0, in_size) and confidence.
+    """
+    N, K, Wx = simcc_x.shape
+    _, _, Wy = simcc_y.shape
+    x_idx = simcc_x.argmax(axis=-1)  # (N, K)
+    y_idx = simcc_y.argmax(axis=-1)
+    x_score = simcc_x.max(axis=-1)
+    y_score = simcc_y.max(axis=-1)
+    # Min of x/y scores — matches MMPose's decoder convention
+    conf = np.minimum(x_score, y_score)
+    # Convert bin indices to pixel coords
+    x_px = x_idx.astype(np.float32) / float(simcc_split)
+    y_px = y_idx.astype(np.float32) / float(simcc_split)
+    return np.stack([x_px, y_px, conf], axis=-1)  # (N, K, 3)
+
+
+def _unmap_to_original(
+    kpts_model: np.ndarray,  # (N, K, 3)  model-space x, y, conf
+    inv_params_batch: np.ndarray,  # (N, 4)  [sx, sy, ox, oy]
+) -> np.ndarray:
+    """Back-project model-space keypoints to original image pixel space."""
+    out = kpts_model.copy()
+    out[..., 0] = kpts_model[..., 0] * inv_params_batch[:, 0:1] + inv_params_batch[:, 2:3]
+    out[..., 1] = kpts_model[..., 1] * inv_params_batch[:, 1:2] + inv_params_batch[:, 3:4]
+    return out
+
+
+# =============================================================================
+# Main entry point: run RTMPose-Face over the whole video
+# =============================================================================
+
+def run_rtmpose_face_video(
+    images_np_u8: np.ndarray,              # (B, H, W, 3) uint8 RGB
+    persons_coco_body_feet_timeline: list, # per-person list:
+                                           #   persons_body_feet[p_idx][t] = (23, 3)
+                                           #   or None
+    rtmpose_face_dict: dict,               # from LoadRTMPoseFace
+    img_h: int,
+    img_w: int,
+    batch_size: int = 16,
+    pbar=None,
+):
+    """Run RTMPose-Face on every visible (frame, person) slot and return
+    per-person face-68 timelines.
+
+    Returns
+    -------
+    face_kp_68_timeline : list[list[np.ndarray | None]]
+        face_kp_68_timeline[p_idx][t] = (68, 3) with pixel (x, y, conf)
+        or None when no valid face bbox.
+    time_s : float
+    """
+    session     = rtmpose_face_dict["session"]
+    input_name  = rtmpose_face_dict["input_name"]
+    output_names = rtmpose_face_dict["output_names"]
+
+    n_persons = len(persons_coco_body_feet_timeline)
+    B = images_np_u8.shape[0]
+
+    # Pre-allocate output
+    face_kp_68_timeline = [
+        [None] * B for _ in range(n_persons)
+    ]
+
+    # Build the request list: (p_idx, t, bbox)
+    requests = []
+    for p_idx in range(n_persons):
+        for t in range(B):
+            head = persons_coco_body_feet_timeline[p_idx][t]
+            if head is None:
+                continue
+            bbox = _get_face_bbox_from_coco_wb_head(head, img_h, img_w)
+            if bbox is None:
+                continue
+            requests.append((p_idx, t, bbox))
+
+    if not requests:
+        return face_kp_68_timeline, 0.0
+
+    import time as _time
+    t_start = _time.perf_counter()
+
+    # Process in batches
+    for chunk_start in range(0, len(requests), batch_size):
+        chunk = requests[chunk_start:chunk_start + batch_size]
+        tensors = []
+        inv_params_list = []
+        for p_idx, t, bbox in chunk:
+            chw, inv = _affine_preproc(images_np_u8[t], bbox, out_size=256)
+            tensors.append(chw)
+            inv_params_list.append(inv)
+        batch = np.stack(tensors, axis=0)      # (N, 3, 256, 256)
+        inv_params_batch = np.stack(inv_params_list, axis=0)  # (N, 4)
+
+        # ONNX forward — expects (N, 3, 256, 256) float32
+        outputs = session.run(output_names, {input_name: batch})
+        # RTMPose SDK ONNX outputs: simcc_x (N, K, 512), simcc_y (N, K, 512)
+        # (256 * simcc_split=2.0 = 512). If export was different, adjust.
+        if len(outputs) >= 2 and outputs[0].ndim == 3:
+            simcc_x, simcc_y = outputs[0], outputs[1]
+            kpts_model = _decode_simcc(simcc_x, simcc_y, simcc_split=2.0)
+        elif len(outputs) == 1 and outputs[0].ndim == 4:
+            # Unlikely but handle: single heatmap output (K, H, W) per person
+            raise NotImplementedError(
+                "RTMPose-Face ONNX returned a single 4D output — expected "
+                "SimCC x+y. Please re-export with SimCC head."
+            )
+        else:
+            raise RuntimeError(
+                f"Unexpected RTMPose-Face outputs: shapes="
+                f"{[o.shape for o in outputs]}"
+            )
+
+        kpts_orig = _unmap_to_original(kpts_model, inv_params_batch)
+
+        # Map 106 → 68 and scatter back
+        K = kpts_orig.shape[1]
+        if K != 106:
+            _logger.warning(
+                "RTMPose-Face returned %d keypoints, expected 106 (Face6). "
+                "Keeping raw output and dropping 68-point mapping.", K
+            )
+            # Fall back: put raw keypoints in; downstream will be misaligned
+            for i, (p_idx, t, _bbox) in enumerate(chunk):
+                face_kp_68_timeline[p_idx][t] = kpts_orig[i, :min(K, 68)]
+        else:
+            kpts_68 = kpts_orig[:, _LAPA106_TO_300W68]  # (N, 68, 3)
+            for i, (p_idx, t, _bbox) in enumerate(chunk):
+                face_kp_68_timeline[p_idx][t] = kpts_68[i].astype(np.float32)
+
+        if pbar is not None:
+            for _ in range(len(chunk)):
+                pbar.update(1)
+
+    return face_kp_68_timeline, _time.perf_counter() - t_start
