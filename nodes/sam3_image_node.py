@@ -70,6 +70,21 @@ def _offload_sam3_to_cpu(sam3_dict):
         torch.cuda.empty_cache()
 
 
+def _restore_predictor_to_cuda(predictor):
+    """Move a SAM3 predictor's model back to CUDA before inference.
+
+    We offload to CPU after each run; this puts it back before the next run.
+    No-op when no CUDA is available.
+    """
+    if not torch.cuda.is_available():
+        return
+    try:
+        if hasattr(predictor, "model") and predictor.model is not None:
+            predictor.model.to("cuda")
+    except Exception as e:
+        _logger.warning("SAM3 restore-to-CUDA failed: %s", e)
+
+
 class SAM3ImageSegmentationNode:
     """Run SAM3 image-model segmentation with cross-frame IoU tracking.
 
@@ -142,6 +157,8 @@ class SAM3ImageSegmentationNode:
         per_frame_detections = [[] for _ in range(B)]
 
         try:
+            # Ensure model is on GPU (previous run offloaded to CPU)
+            _restore_predictor_to_cuda(predictor)
             results_iter = predictor(
                 source=source,
                 text=prompts,

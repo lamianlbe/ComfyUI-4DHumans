@@ -257,6 +257,9 @@ class SAM3VideoSegmentationNode:
         predictor.setup_source = patched_setup_source
 
         try:
+            # Ensure model is on GPU (previous run offloaded to CPU)
+            from .sam3_image_node import _restore_predictor_to_cuda
+            _restore_predictor_to_cuda(predictor)
             results_iter = predictor(
                 source=source,
                 text=prompts,
