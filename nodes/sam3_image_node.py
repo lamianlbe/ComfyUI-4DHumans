@@ -144,11 +144,18 @@ class SAM3ImageSegmentationNode:
         if not prompts:
             prompts = ["person"]
 
-        # Convert to BCHW RGB float32 [0, 1] — ultralytics' LoadTensor
-        # accepts this directly in image mode (which is what we want here).
-        source = images.permute(0, 3, 1, 2).contiguous().float()
+        # Convert to BCHW RGB float32 [0, 1]. Keep on CPU — we slice
+        # per chunk below. (Sending the whole tensor at once makes
+        # ultralytics pin ~B*H*W*12 bytes of VRAM up front, which OOMs
+        # on long HD videos even on 96 GB GPUs.)
+        source_cpu = images.permute(0, 3, 1, 2).contiguous().float()
 
         pbar = comfy.utils.ProgressBar(B + 1)
+
+        # Per-chunk frame count — tuned to cap peak VRAM at HD
+        # resolutions.  SAM3 image is per-frame independent, so any
+        # chunk size just trades VRAM for overhead.
+        CHUNK_SIZE = 128
 
         # ------------------------------------------------------------------
         # Per-frame detections
@@ -159,46 +166,60 @@ class SAM3ImageSegmentationNode:
         try:
             # Ensure model is on GPU (previous run offloaded to CPU)
             _restore_predictor_to_cuda(predictor)
-            results_iter = predictor(
-                source=source,
-                text=prompts,
-                stream=True,
-            )
 
-            for t, r in enumerate(results_iter):
-                if t >= B:
-                    break
+            t = 0
+            for chunk_start in range(0, B, CHUNK_SIZE):
+                chunk_end = min(chunk_start + CHUNK_SIZE, B)
+                chunk = source_cpu[chunk_start:chunk_end]
 
-                if r.masks is None or r.boxes is None:
+                results_iter = predictor(
+                    source=chunk,
+                    text=prompts,
+                    stream=True,
+                )
+
+                for r in results_iter:
+                    if t >= B:
+                        break
+
+                    if r.masks is None or r.boxes is None:
+                        t += 1
+                        pbar.update(1)
+                        continue
+
+                    masks_data = r.masks.data  # (N, H', W')
+                    scores = r.boxes.conf      # (N,)
+                    classes = r.boxes.cls      # (N,) prompt index
+
+                    # Resize masks back to original (H, W) if needed
+                    if masks_data.shape[-2:] != (H, W):
+                        masks_data = torch.nn.functional.interpolate(
+                            masks_data.unsqueeze(1).float(),
+                            size=(H, W),
+                            mode="nearest",
+                        ).squeeze(1)
+
+                    masks_np = (masks_data > 0.5).cpu().numpy().astype(np.float32)
+                    scores_np = scores.cpu().numpy().astype(np.float32)
+                    classes_np = classes.cpu().numpy().astype(int)
+
+                    # Sort by score descending (stable tracking ordering)
+                    order = np.argsort(-scores_np)
+                    for idx in order:
+                        per_frame_detections[t].append({
+                            "mask": masks_np[idx],
+                            "score": float(scores_np[idx]),
+                            "prompt_idx": int(classes_np[idx]),
+                        })
+
+                    t += 1
                     pbar.update(1)
-                    continue
 
-                masks_data = r.masks.data  # (N, H', W')
-                scores = r.boxes.conf      # (N,)
-                classes = r.boxes.cls      # (N,) prompt index
-
-                # Resize masks back to original (H, W) if needed
-                if masks_data.shape[-2:] != (H, W):
-                    masks_data = torch.nn.functional.interpolate(
-                        masks_data.unsqueeze(1).float(),
-                        size=(H, W),
-                        mode="nearest",
-                    ).squeeze(1)
-
-                masks_np = (masks_data > 0.5).cpu().numpy().astype(np.float32)
-                scores_np = scores.cpu().numpy().astype(np.float32)
-                classes_np = classes.cpu().numpy().astype(int)
-
-                # Sort by score descending (stable tracking ordering)
-                order = np.argsort(-scores_np)
-                for idx in order:
-                    per_frame_detections[t].append({
-                        "mask": masks_np[idx],
-                        "score": float(scores_np[idx]),
-                        "prompt_idx": int(classes_np[idx]),
-                    })
-
-                pbar.update(1)
+                # Reclaim GPU memory from this chunk's Results objects
+                # before starting the next chunk.
+                del results_iter
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         finally:
             # Free VRAM so downstream nodes (PromptHMR + Sapiens) don't OOM
             _offload_sam3_to_cpu(sam3)
