@@ -1,49 +1,31 @@
 """
-SAM3 Video Segmentation nodes.
+SAM3 Video Segmentation nodes (Ultralytics backend).
 
-LoadSAM3 loads the SAM3 model.
+LoadSAM3 loads the SAM3 model via Ultralytics' SAM3VideoSemanticPredictor.
 SAM3VideoSegmentation runs text-prompted video segmentation and outputs
 frame-aligned masks suitable for PromptHMR / Sapiens downstream nodes.
 
 Output masks have shape (B * N, H, W) where B = number of frames and
-N = number of detected persons.  Every frame has exactly N mask slots;
-frames where a person is not visible get a zero mask.
+N = number of tracked persons across the whole video.  Every frame has
+exactly N mask slots; frames where a person is not visible get a zero
+mask.
 
-The sam3 Python package is bundled in ``sam3/`` (copied from
-ComfyUI-RMBG).  Model checkpoint (``sam3.pt``) is loaded from
-ComfyUI's ``models/sam3/`` directory.
+Model checkpoint (``sam3.pt``) is loaded from ``models/sam3/``.
 """
 
 import glob
 import logging
 import os
-import sys
-from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
 
-import comfy.model_management
 import comfy.utils
 from folder_paths import models_dir
-
-# --- SAM3 Python code lives in <repo>/sam3/ ---
-# Internal imports use ``from sam3.model.xxx``, so we put the repo root
-# (parent of the sam3 package) on sys.path.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SAM3_PKG = os.path.join(_REPO_ROOT, "sam3")
-if _SAM3_PKG not in sys.path:
-    sys.path.insert(0, _SAM3_PKG)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 # Checkpoint directory under ComfyUI models/
 SAM3_CKPT_DIR = os.path.join(models_dir, "sam3")
 os.makedirs(SAM3_CKPT_DIR, exist_ok=True)
-
-# BPE vocabulary file bundled with the code
-SAM3_BPE_PATH = Path(_SAM3_PKG) / "assets" / "bpe_simple_vocab_16e6.txt.gz"
 
 _logger = logging.getLogger(__name__)
 
@@ -61,10 +43,9 @@ def _list_checkpoints():
 
 
 class LoadSAM3Node:
-    """Load a SAM3 video segmentation model.
+    """Load a SAM3 video segmentation model (Ultralytics backend).
 
     Checkpoint files should be placed in ``models/sam3/``.
-    Compatible with the sam3.pt from ComfyUI-RMBG.
     """
 
     @classmethod
@@ -72,6 +53,37 @@ class LoadSAM3Node:
         return {
             "required": {
                 "checkpoint": (_list_checkpoints(),),
+                "imgsz": (
+                    "INT",
+                    {
+                        "default": 640,
+                        "min": 256,
+                        "max": 1024,
+                        "step": 32,
+                        "tooltip": (
+                            "Inference resolution. Lower = faster but less "
+                            "accurate. SAM3 is internally fixed at 1008 in "
+                            "the official code; ultralytics exposes this."
+                        ),
+                    },
+                ),
+                "half": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Use FP16 inference (faster on modern GPUs).",
+                    },
+                ),
+                "conf": (
+                    "FLOAT",
+                    {
+                        "default": 0.25,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "tooltip": "Detection confidence threshold.",
+                    },
+                ),
             },
         }
 
@@ -79,32 +91,48 @@ class LoadSAM3Node:
     FUNCTION = "load"
     CATEGORY = "4dhumans"
 
-    def load(self, checkpoint):
-        from sam3.model.sam3_video_predictor import Sam3VideoPredictor
+    def load(self, checkpoint, imgsz, half, conf):
+        try:
+            from ultralytics.models.sam.predict import (
+                SAM3VideoSemanticPredictor,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "Ultralytics is required for SAM3. Install with:\n"
+                "  pip install -U ultralytics"
+            ) from e
 
         path = os.path.join(SAM3_CKPT_DIR, checkpoint)
         if not os.path.isfile(path):
             raise FileNotFoundError(
                 f"SAM3 checkpoint not found: {path}\n"
-                f"Please place sam3.pt in {SAM3_CKPT_DIR}/\n"
-                f"(download from https://huggingface.co/1038lab/sam3)"
+                f"Please place sam3.pt in {SAM3_CKPT_DIR}/"
             )
 
-        kwargs = dict(checkpoint_path=path)
-        if SAM3_BPE_PATH.is_file():
-            kwargs["bpe_path"] = str(SAM3_BPE_PATH)
-
-        predictor = Sam3VideoPredictor(**kwargs)
-        _logger.info("Loaded SAM3 video model: %s", checkpoint)
-
-        return ({"predictor": predictor},)
+        overrides = dict(
+            conf=conf,
+            task="segment",
+            mode="predict",
+            imgsz=imgsz,
+            model=path,
+            half=half,
+            save=False,
+            verbose=False,
+        )
+        predictor = SAM3VideoSemanticPredictor(overrides=overrides)
+        _logger.info(
+            "Loaded SAM3 (ultralytics): %s (imgsz=%d, half=%s)",
+            checkpoint, imgsz, half,
+        )
+        return ({"predictor": predictor, "imgsz": imgsz, "half": half},)
 
 
 class SAM3VideoSegmentationNode:
-    """Run SAM3 text-prompted video segmentation.
+    """Run SAM3 text-prompted video segmentation (Ultralytics backend).
 
-    Outputs aligned masks (B * N, H, W) where every frame has
-    exactly N person slots.  Missing persons get zero masks.
+    Outputs aligned masks (B * N, H, W) where every frame has exactly
+    N object slots.  Uses ultralytics' built-in tracking IDs for
+    cross-frame alignment — no manual slot mapping needed.
     """
 
     @classmethod
@@ -132,49 +160,7 @@ class SAM3VideoSegmentationNode:
     FUNCTION = "segment"
     CATEGORY = "4dhumans"
 
-    def _run_single_prompt(self, predictor, pil_frames, B, H, W, text, autocast_ctx):
-        """Run segmentation for a single text prompt.
-
-        Returns
-        -------
-        per_frame_masks : dict[int, dict[int, ndarray]]
-            frame_idx -> {obj_id: binary_mask}
-        """
-        with autocast_ctx:
-            result = predictor.start_session(resource_path=pil_frames)
-            session_id = result["session_id"]
-
-            predictor.add_prompt(
-                session_id=session_id,
-                frame_idx=0,
-                text=text,
-            )
-
-        per_frame_masks = {}
-        with autocast_ctx:
-            propagation_results = list(predictor.propagate_in_video(
-                session_id=session_id,
-                propagation_direction="both",
-                start_frame_idx=None,
-                max_frame_num_to_track=None,
-            ))
-
-        for res in propagation_results:
-            frame_idx = res["frame_index"]
-            outputs = res["outputs"]
-            obj_ids = outputs["out_obj_ids"]
-            binary_masks = outputs["out_binary_masks"]
-
-            frame_dict = {}
-            for i, oid in enumerate(obj_ids):
-                frame_dict[int(oid)] = binary_masks[i]
-            per_frame_masks[frame_idx] = frame_dict
-
-        predictor.close_session(session_id)
-        return per_frame_masks
-
     def segment(self, images, sam3, text_prompt):
-        import torch
         predictor = sam3["predictor"]
 
         # images: (B, H, W, 3) float [0, 1]
@@ -184,101 +170,85 @@ class SAM3VideoSegmentationNode:
         prompts = [p.strip() for p in text_prompt.split(",") if p.strip()]
         if not prompts:
             prompts = ["person"]
-        n_prompts = len(prompts)
 
-        pbar = comfy.utils.ProgressBar(B + n_prompts * 2)
+        # Convert to BCHW RGB float32 [0, 1] for ultralytics
+        source = images.permute(0, 3, 1, 2).contiguous().float()
 
-        # ------------------------------------------------------------------
-        # Convert tensor frames to PIL Image list
-        # ------------------------------------------------------------------
-        pil_frames = []
-        for t in range(B):
-            frame_np = (images[t] * 255).byte().cpu().numpy()
-            pil_frames.append(Image.fromarray(frame_np))
-        pbar.update(1)
+        pbar = comfy.utils.ProgressBar(B)
 
         # ------------------------------------------------------------------
-        # Setup autocast
+        # Run inference streaming.  Ultralytics' SAM3 video predictor
+        # returns Results with persistent tracking IDs via r.boxes.id.
         # ------------------------------------------------------------------
-        from contextlib import nullcontext
-        device = next(predictor.model.parameters()).device
-        autocast_ctx = (
-            torch.autocast(device.type, dtype=torch.bfloat16)
-            if device.type == "cuda"
-            else nullcontext()
+        results_iter = predictor(
+            source=source,
+            text=prompts,
+            stream=True,
         )
 
-        # ------------------------------------------------------------------
-        # Run segmentation for each prompt separately
-        # ------------------------------------------------------------------
-        # Collect all masks with globally unique slot indices.
-        # Each prompt gets its own set of obj_ids; we remap them to a
-        # contiguous global index so that masks from different prompts
-        # occupy distinct slots.
-        global_slot_count = 0
-        # global_frame_masks[t] = {global_slot: mask_np}
-        global_frame_masks = {t: {} for t in range(B)}
+        # Collect per-frame masks indexed by global track_id.
+        # per_frame[t] = {track_id: mask_np}
+        per_frame = [{} for _ in range(B)]
+        all_track_ids = set()
 
-        for pi, prompt_text in enumerate(prompts):
-            _logger.info("SAM3 prompt %d/%d: '%s'", pi + 1, n_prompts, prompt_text)
+        frame_idx = 0
+        for r in results_iter:
+            if frame_idx >= B:
+                break
 
-            pfm = self._run_single_prompt(
-                predictor, pil_frames, B, H, W, prompt_text, autocast_ctx
-            )
+            if r.masks is not None and r.boxes is not None:
+                masks_data = r.masks.data  # (N, H', W') torch tensor
+                ids = r.boxes.id           # (N,) tensor or None
+
+                if ids is None:
+                    # No tracking IDs — fall back to per-frame indices
+                    ids = torch.arange(masks_data.shape[0])
+
+                # Resize masks back to original (H, W) if needed
+                if masks_data.shape[-2:] != (H, W):
+                    masks_data = torch.nn.functional.interpolate(
+                        masks_data.unsqueeze(1).float(),
+                        size=(H, W),
+                        mode="nearest",
+                    ).squeeze(1)
+
+                masks_np = masks_data.cpu().numpy().astype(np.float32)
+                ids_np = ids.cpu().numpy().astype(int)
+
+                for i, tid in enumerate(ids_np):
+                    per_frame[frame_idx][int(tid)] = masks_np[i]
+                    all_track_ids.add(int(tid))
+
+            frame_idx += 1
             pbar.update(1)
 
-            # Collect all obj_ids from this prompt's results
-            prompt_obj_ids = sorted(
-                set(oid for fd in pfm.values() for oid in fd)
-            )
-
-            if not prompt_obj_ids:
-                _logger.warning(
-                    "SAM3 detected no objects for prompt '%s'", prompt_text
-                )
-                pbar.update(1)
-                continue
-
-            # Map this prompt's obj_ids to global slots
-            local_to_global = {}
-            for oid in prompt_obj_ids:
-                local_to_global[oid] = global_slot_count
-                global_slot_count += 1
-
-            # Merge into global_frame_masks
-            for t in range(B):
-                fd = pfm.get(t, {})
-                for oid, mask_np in fd.items():
-                    global_frame_masks[t][local_to_global[oid]] = mask_np
-
-            pbar.update(1)
-
-        # ------------------------------------------------------------------
-        # Build aligned output
-        # ------------------------------------------------------------------
-        n_persons = global_slot_count
-
-        if n_persons == 0:
+        if not all_track_ids:
             _logger.warning(
-                "SAM3 detected no objects for any prompt. "
+                "SAM3 detected nothing for prompts %s. "
                 "Returning single empty mask per frame.",
+                prompts,
             )
             return (torch.zeros(B, H, W),)
 
+        # Map track IDs → contiguous slot indices (0, 1, 2, ...)
+        sorted_ids = sorted(all_track_ids)
+        id_to_slot = {tid: i for i, tid in enumerate(sorted_ids)}
+        n_persons = len(sorted_ids)
+
+        # Build aligned output tensor
         masks_out = torch.zeros(B, n_persons, H, W)
         for t in range(B):
-            for slot, mask_np in global_frame_masks[t].items():
-                masks_out[t, slot] = torch.from_numpy(
-                    mask_np.astype(np.float32)
-                )
+            for tid, mask_np in per_frame[t].items():
+                slot = id_to_slot[tid]
+                masks_out[t, slot] = torch.from_numpy(mask_np)
 
         # Reshape to (B * N, H, W) — frame-grouped ordering
         masks_out = masks_out.reshape(B * n_persons, H, W)
 
         _logger.info(
-            "SAM3 segmentation: %d frames, %d prompts, %d total persons, "
+            "SAM3 (ultralytics): %d frames, %d prompts, %d tracked objects, "
             "output shape %s",
-            B, n_prompts, n_persons, tuple(masks_out.shape),
+            B, len(prompts), n_persons, tuple(masks_out.shape),
         )
 
         return (masks_out,)
