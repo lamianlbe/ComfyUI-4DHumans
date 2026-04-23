@@ -180,7 +180,14 @@ class LoadSAM3Node:
             "Loaded SAM3 (ultralytics): %s (imgsz=%d, half=%s)",
             checkpoint, imgsz, half,
         )
-        return ({"predictor": predictor, "imgsz": imgsz, "half": half},)
+        return ({
+            "predictor": predictor,
+            "imgsz": imgsz,
+            "half": half,
+            "conf": conf,
+            "checkpoint_path": path,  # for lazy image-predictor building
+            "_image_predictor": None,
+        },)
 
 
 class SAM3VideoSegmentationNode:

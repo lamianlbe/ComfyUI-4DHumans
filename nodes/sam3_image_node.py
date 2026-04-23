@@ -1,9 +1,12 @@
 """
-SAM3 Image Segmentation node.
+SAM3 Image Segmentation node (Ultralytics backend).
 
-Uses SAM3's image model (same as RMBG) for per-frame text-prompted
-segmentation with IoU-based cross-frame tracking for consistent
-person/object identity.
+Uses SAM3's image model for per-frame text-prompted segmentation with
+IoU-based cross-frame tracking for consistent person/object identity.
+The image model can be more accurate than the video model for certain
+concepts (e.g. less common or specific text prompts) since it does a
+fresh detection on every frame instead of relying on memory-based
+tracking.
 
 Output masks have shape (B * N, H, W) where B = number of frames and
 N = total number of tracked objects.  Every frame has exactly N mask
@@ -14,21 +17,52 @@ import logging
 
 import numpy as np
 import torch
-from PIL import Image
-from contextlib import nullcontext
 
-import comfy.model_management
 import comfy.utils
 
 _logger = logging.getLogger(__name__)
 
 
-class SAM3ImageSegmentationNode:
-    """Run SAM3 image-model segmentation with cross-frame tracking.
+def _get_or_build_image_predictor(sam3_dict):
+    """Lazily build and cache a SAM3SemanticPredictor on the sam3 dict."""
+    if sam3_dict.get("_image_predictor") is not None:
+        return sam3_dict["_image_predictor"]
 
-    Uses the same image model as RMBG's SAM3 node for better text
-    understanding.  Cross-frame identity is maintained via IoU matching.
-    Supports comma-separated prompts.
+    try:
+        from ultralytics.models.sam.predict import SAM3SemanticPredictor
+    except ImportError as e:
+        raise ImportError(
+            "Ultralytics is required for SAM3. Install with:\n"
+            "  pip install -U ultralytics"
+        ) from e
+
+    overrides = dict(
+        conf=sam3_dict.get("conf", 0.25),
+        task="segment",
+        mode="predict",
+        imgsz=sam3_dict.get("imgsz", 640),
+        model=sam3_dict["checkpoint_path"],
+        half=sam3_dict.get("half", True),
+        save=False,
+        verbose=False,
+    )
+    predictor = SAM3SemanticPredictor(overrides=overrides)
+    sam3_dict["_image_predictor"] = predictor
+    _logger.info(
+        "Built SAM3 image predictor (imgsz=%d, half=%s)",
+        overrides["imgsz"], overrides["half"],
+    )
+    return predictor
+
+
+class SAM3ImageSegmentationNode:
+    """Run SAM3 image-model segmentation with cross-frame IoU tracking.
+
+    For each frame we run the image model independently, then greedily
+    match detections across frames via IoU to assign consistent track
+    IDs.  Compared to SAM3 video model: usually higher accuracy per
+    frame (no memory/tracker trade-offs) but no temporal consistency
+    baked in (we rely on IoU).
     """
 
     @classmethod
@@ -48,14 +82,17 @@ class SAM3ImageSegmentationNode:
                         ),
                     },
                 ),
-                "confidence_threshold": (
+                "iou_threshold": (
                     "FLOAT",
                     {
-                        "default": 0.5,
-                        "min": 0.05,
-                        "max": 0.95,
-                        "step": 0.01,
-                        "tooltip": "Minimum confidence to keep a detection.",
+                        "default": 0.3,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "tooltip": (
+                            "Minimum IoU between frames to consider the "
+                            "same object.  Lower = more lenient tracking."
+                        ),
                     },
                 ),
             },
@@ -66,68 +103,8 @@ class SAM3ImageSegmentationNode:
     FUNCTION = "segment"
     CATEGORY = "4dhumans"
 
-    def segment(self, images, sam3, text_prompt, confidence_threshold):
-        from sam3.model.sam3_image_processor import Sam3Processor
-
-        predictor = sam3["predictor"]
-        # The predictor wraps a video model; we need the underlying model
-        # to build an image-model processor.  However build_sam3_image_model
-        # creates a *different* architecture.  Instead, we use the same
-        # model_builder that RMBG uses.
-        #
-        # Since LoadSAM3 stores the full predictor, we need to build an
-        # image model separately.  We cache it on the predictor object.
-        if not hasattr(predictor, "_image_model"):
-            from sam3.model_builder import build_sam3_image_model
-            import os, sys
-            from pathlib import Path
-
-            _REPO_ROOT = os.path.dirname(
-                os.path.dirname(os.path.abspath(__file__))
-            )
-            _SAM3_PKG = os.path.join(_REPO_ROOT, "sam3")
-            bpe_path = str(
-                Path(_SAM3_PKG) / "assets" / "bpe_simple_vocab_16e6.txt.gz"
-            )
-
-            # Find the checkpoint path from the video predictor's state
-            # We need to rebuild the image model from the same checkpoint
-            from folder_paths import models_dir
-            import glob
-
-            ckpt_dir = os.path.join(models_dir, "sam3")
-            ckpts = glob.glob(os.path.join(ckpt_dir, "*.pt"))
-            if not ckpts:
-                raise FileNotFoundError(
-                    f"No SAM3 checkpoint found in {ckpt_dir}"
-                )
-            ckpt_path = ckpts[0]
-
-            _logger.info("Building SAM3 image model from %s", ckpt_path)
-            image_model = build_sam3_image_model(
-                bpe_path=bpe_path,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-                eval_mode=True,
-                checkpoint_path=ckpt_path,
-                load_from_HF=False,
-                enable_segmentation=True,
-                enable_inst_interactivity=False,
-            )
-            predictor._image_model = image_model
-
-        image_model = predictor._image_model
-        device = next(image_model.parameters()).device
-        device_str = "cuda" if device.type == "cuda" else "cpu"
-        processor = Sam3Processor(
-            image_model, device=device_str,
-            confidence_threshold=confidence_threshold,
-        )
-
-        autocast_ctx = (
-            torch.autocast(device.type, dtype=torch.bfloat16)
-            if device.type == "cuda"
-            else nullcontext()
-        )
+    def segment(self, images, sam3, text_prompt, iou_threshold):
+        predictor = _get_or_build_image_predictor(sam3)
 
         # images: (B, H, W, 3) float [0, 1]
         B, H, W, _C = images.shape
@@ -137,78 +114,82 @@ class SAM3ImageSegmentationNode:
         if not prompts:
             prompts = ["person"]
 
-        pbar = comfy.utils.ProgressBar(B * len(prompts) + 1)
+        # Convert to BCHW RGB float32 [0, 1] — ultralytics' LoadTensor
+        # accepts this directly in image mode (which is what we want here).
+        source = images.permute(0, 3, 1, 2).contiguous().float()
+
+        pbar = comfy.utils.ProgressBar(B + 1)
 
         # ------------------------------------------------------------------
-        # Per-frame segmentation
+        # Per-frame detections
         # ------------------------------------------------------------------
-        # per_frame[t] = list of (mask_np, prompt_idx) for each detection
-        per_frame_detections = []
+        # per_frame_detections[t] = list of {mask, score, prompt_idx}
+        per_frame_detections = [[] for _ in range(B)]
 
-        for t in range(B):
-            frame_np = (images[t] * 255).byte().cpu().numpy()
-            pil_img = Image.fromarray(frame_np)
+        results_iter = predictor(
+            source=source,
+            text=prompts,
+            stream=True,
+        )
 
-            frame_masks = []
-            for pi, prompt_text in enumerate(prompts):
-                with autocast_ctx:
-                    state = processor.set_image(pil_img)
-                    processor.reset_all_prompts(state)
-                    processor.set_confidence_threshold(
-                        confidence_threshold, state
-                    )
-                    state = processor.set_text_prompt(prompt_text, state)
+        for t, r in enumerate(results_iter):
+            if t >= B:
+                break
 
-                masks = state.get("masks")
-                scores = state.get("scores")
-
-                if masks is not None and masks.numel() > 0:
-                    masks_np = masks.float().cpu().numpy()
-                    if masks_np.ndim == 4:
-                        masks_np = masks_np.squeeze(1)  # (N, H, W)
-                    scores_np = (
-                        scores.float().cpu().numpy()
-                        if scores is not None
-                        else np.ones(masks_np.shape[0])
-                    )
-
-                    # Sort by score descending
-                    order = np.argsort(-scores_np)
-                    for idx in order:
-                        frame_masks.append({
-                            "mask": masks_np[idx],
-                            "prompt_idx": pi,
-                            "score": float(scores_np[idx]),
-                        })
-
+            if r.masks is None or r.boxes is None:
                 pbar.update(1)
+                continue
 
-            per_frame_detections.append(frame_masks)
+            masks_data = r.masks.data  # (N, H', W')
+            scores = r.boxes.conf      # (N,)
+            classes = r.boxes.cls      # (N,) prompt index
+
+            # Resize masks back to original (H, W) if needed
+            if masks_data.shape[-2:] != (H, W):
+                masks_data = torch.nn.functional.interpolate(
+                    masks_data.unsqueeze(1).float(),
+                    size=(H, W),
+                    mode="nearest",
+                ).squeeze(1)
+
+            masks_np = masks_data.cpu().numpy().astype(np.float32)
+            scores_np = scores.cpu().numpy().astype(np.float32)
+            classes_np = classes.cpu().numpy().astype(int)
+
+            # Sort by score descending (stable tracking ordering)
+            order = np.argsort(-scores_np)
+            for idx in order:
+                per_frame_detections[t].append({
+                    "mask": masks_np[idx],
+                    "score": float(scores_np[idx]),
+                    "prompt_idx": int(classes_np[idx]),
+                })
+
+            pbar.update(1)
 
         # ------------------------------------------------------------------
-        # Cross-frame IoU tracking
+        # Cross-frame IoU tracking (greedy)
         # ------------------------------------------------------------------
-        # Assign consistent track IDs across frames using greedy IoU matching
         next_track_id = 0
-        # per_frame_tracks[t] = list of (track_id, mask_np)
-        per_frame_tracks = []
-        # prev_tracks: list of (track_id, mask_np) from previous frame
+        per_frame_tracks = []  # per_frame_tracks[t] = [(track_id, mask), ...]
         prev_tracks = []
 
         for t in range(B):
             detections = per_frame_detections[t]
             if not detections:
                 per_frame_tracks.append([])
-                # Keep prev_tracks unchanged for next frame matching
                 continue
 
             current_masks = [d["mask"] for d in detections]
+            current_prompts = [d["prompt_idx"] for d in detections]
 
             if not prev_tracks:
                 # First frame with detections: assign new track IDs
                 frame_tracks = []
-                for d in detections:
-                    frame_tracks.append((next_track_id, d["mask"]))
+                for i, mask in enumerate(current_masks):
+                    frame_tracks.append(
+                        (next_track_id, mask, current_prompts[i])
+                    )
                     next_track_id += 1
                 per_frame_tracks.append(frame_tracks)
                 prev_tracks = frame_tracks
@@ -219,41 +200,46 @@ class SAM3ImageSegmentationNode:
             n_curr = len(current_masks)
             iou_matrix = np.zeros((n_prev, n_curr), dtype=np.float32)
 
-            for i, (_, prev_mask) in enumerate(prev_tracks):
-                prev_bool = prev_mask > 0.5
-                for j, curr_mask in enumerate(current_masks):
-                    curr_bool = curr_mask > 0.5
-                    intersection = np.logical_and(prev_bool, curr_bool).sum()
-                    union = np.logical_or(prev_bool, curr_bool).sum()
+            prev_bools = [pm > 0.5 for _, pm, _ in prev_tracks]
+            curr_bools = [cm > 0.5 for cm in current_masks]
+
+            for i, pb in enumerate(prev_bools):
+                for j, cb in enumerate(curr_bools):
+                    # Only match same prompt class
+                    if prev_tracks[i][2] != current_prompts[j]:
+                        continue
+                    inter = np.logical_and(pb, cb).sum()
+                    union = np.logical_or(pb, cb).sum()
                     iou_matrix[i, j] = (
-                        intersection / union if union > 0 else 0.0
+                        inter / union if union > 0 else 0.0
                     )
 
-            # Greedy matching: pick highest IoU pairs
-            assigned_curr = set()
+            # Greedy matching: highest IoU pairs first
             assigned_prev = set()
+            assigned_curr = set()
             frame_tracks = [None] * n_curr
 
-            # Sort all (prev, curr) pairs by IoU descending
             pairs = []
             for i in range(n_prev):
                 for j in range(n_curr):
-                    if iou_matrix[i, j] > 0.1:  # minimum IoU threshold
+                    if iou_matrix[i, j] >= iou_threshold:
                         pairs.append((iou_matrix[i, j], i, j))
             pairs.sort(reverse=True)
 
-            for iou_val, i, j in pairs:
+            for _, i, j in pairs:
                 if i in assigned_prev or j in assigned_curr:
                     continue
                 track_id = prev_tracks[i][0]
-                frame_tracks[j] = (track_id, current_masks[j])
+                frame_tracks[j] = (track_id, current_masks[j], current_prompts[j])
                 assigned_prev.add(i)
                 assigned_curr.add(j)
 
             # Unmatched detections get new track IDs
             for j in range(n_curr):
                 if frame_tracks[j] is None:
-                    frame_tracks[j] = (next_track_id, current_masks[j])
+                    frame_tracks[j] = (
+                        next_track_id, current_masks[j], current_prompts[j]
+                    )
                     next_track_id += 1
 
             per_frame_tracks.append(frame_tracks)
@@ -264,16 +250,18 @@ class SAM3ImageSegmentationNode:
         # ------------------------------------------------------------------
         # Build aligned output
         # ------------------------------------------------------------------
-        all_track_ids = sorted(set(
-            tid for frame_tracks in per_frame_tracks
-            for tid, _ in frame_tracks
-        ))
+        all_track_ids = sorted({
+            tid
+            for frame_tracks in per_frame_tracks
+            for tid, _, _ in frame_tracks
+        })
         n_total = len(all_track_ids)
 
         if n_total == 0:
             _logger.warning(
-                "SAM3 Image Segmentation: no objects detected. "
-                "Returning single empty mask per frame."
+                "SAM3 Image Segmentation: no objects detected for %s. "
+                "Returning single empty mask per frame.",
+                prompts,
             )
             return (torch.zeros(B, H, W),)
 
@@ -281,16 +269,14 @@ class SAM3ImageSegmentationNode:
 
         masks_out = torch.zeros(B, n_total, H, W)
         for t in range(B):
-            for track_id, mask_np in per_frame_tracks[t]:
+            for track_id, mask_np, _ in per_frame_tracks[t]:
                 slot = id_to_slot[track_id]
-                masks_out[t, slot] = torch.from_numpy(
-                    mask_np.astype(np.float32)
-                )
+                masks_out[t, slot] = torch.from_numpy(mask_np)
 
         masks_out = masks_out.reshape(B * n_total, H, W)
 
         _logger.info(
-            "SAM3 Image Segmentation: %d frames, %d prompts, "
+            "SAM3 Image Segmentation (ultralytics): %d frames, %d prompts, "
             "%d total tracks, output shape %s",
             B, len(prompts), n_total, tuple(masks_out.shape),
         )
