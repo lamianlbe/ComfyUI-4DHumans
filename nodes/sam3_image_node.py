@@ -175,6 +175,15 @@ class SAM3ImageSegmentationNode:
                 chunk_end = min(chunk_start + CHUNK_SIZE, B)
                 chunk = source_cpu[chunk_start:chunk_end]
 
+                # SAM3 image predictor caches backbone features on the
+                # instance (`self.features`) and reuses them in-place
+                # across inference calls. With multi-chunk iteration
+                # this leaks chunk N's features into chunk N+1 and
+                # tripplies the RoPE shape assertion. Reset before
+                # each predictor() call.
+                if hasattr(predictor, "features"):
+                    predictor.features = None
+
                 results_iter = predictor(
                     source=chunk,
                     text=prompts,
