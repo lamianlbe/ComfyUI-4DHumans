@@ -241,6 +241,12 @@ def run_nlf_inference(
                     else None
                 )
                 j3d_t = j3d_list[chunk_i].detach().float().cpu().numpy()
+                # NLF outputs 3D joints in millimetres (observed Pelvis
+                # z ≈ 1400). PromptHMR and downstream code (NLF
+                # renderer, _transform_j3d_to_nlf_camera) work in
+                # metres. Convert here so both backends produce
+                # interchangeable POSES dicts.
+                j3d_t = j3d_t / 1000.0
                 j2d_t = (
                     j2d_list[chunk_i].detach().float().cpu().numpy()
                     if j2d_list is not None and j2d_list[chunk_i] is not None
