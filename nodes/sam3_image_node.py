@@ -150,20 +150,17 @@ class SAM3ImageSegmentationNode:
         #     non-square tensors into SAM3's ViT backbone.
         #   - SAM3's RoPE freqs_cis is precomputed for square
         #     imgsz×imgsz input. Non-square trips a shape assert.
-        # Pass per-chunk numpy lists so ultralytics' normal
-        # LoadPilAndNumpy / preprocess path runs letterbox + normalise.
+        # Additionally SAM's pre_transform asserts batch size == 1,
+        # so we must feed one frame per predictor() call.
         rgb_u8 = (images.clamp(0, 1) * 255).byte().cpu().numpy()  # (B, H, W, 3) RGB
-        frames_bgr = rgb_u8[..., ::-1].copy()                      # BGR for cv2/ultralytics convention
+        frames_bgr = rgb_u8[..., ::-1].copy()                      # BGR
 
         pbar = comfy.utils.ProgressBar(B + 1)
 
-        # Per-chunk frame count.  SAM3's image backbone is a ViT-L with
-        # text encoder + segmentation head — each frame keeps a large
-        # activation footprint on GPU until the Results object is freed.
-        # On HD videos (720p+) even 64 frames can OOM a 96 GB card, so
-        # default conservatively.  SAM3 image is per-frame independent,
-        # so shrinking chunk size just trades VRAM for a bit of overhead.
-        CHUNK_SIZE = 16
+        # How often (in frames) to call torch.cuda.empty_cache(). SAM3's
+        # ViT-L activations can pile up otherwise; 16 is a conservative
+        # default for 720p+ on a ~100 GB card.
+        CACHE_FLUSH_EVERY = 16
 
         # ------------------------------------------------------------------
         # Per-frame detections
@@ -175,43 +172,33 @@ class SAM3ImageSegmentationNode:
             # Ensure model is on GPU (previous run offloaded to CPU)
             _restore_predictor_to_cuda(predictor)
 
-            t = 0
-            for chunk_start in range(0, B, CHUNK_SIZE):
-                chunk_end = min(chunk_start + CHUNK_SIZE, B)
-                # Pass a list of per-frame HWC BGR uint8 arrays so
-                # ultralytics uses LoadPilAndNumpy, which runs the
-                # full preprocess (letterbox to square imgsz + normalise).
-                chunk = [frames_bgr[i] for i in range(chunk_start, chunk_end)]
-
-                # SAM3 image predictor caches backbone features on the
-                # instance (`self.features`) and reuses them in-place
-                # across inference calls. Reset between chunks so
-                # stale features don't leak forward.
+            for t in range(B):
+                # Reset the backbone-feature cache on the predictor so
+                # ultralytics recomputes features for this frame
+                # (otherwise a stale RoPE-sized tensor from the previous
+                # frame will be reused and trip the shape assert when
+                # image sizes differ).
                 if hasattr(predictor, "features"):
                     predictor.features = None
 
+                # Pass a single-frame list; SAM3 requires batch size 1
+                # and takes the LoadPilAndNumpy code path which runs the
+                # full preprocess (letterbox + normalise + to-tensor).
                 results_iter = predictor(
-                    source=chunk,
+                    source=[frames_bgr[t]],
                     text=prompts,
                     stream=True,
                 )
 
                 for r in results_iter:
-                    if t >= B:
-                        break
-
                     if r.masks is None or r.boxes is None:
-                        # Drop the Results' GPU tensors before moving on
                         del r
-                        t += 1
-                        pbar.update(1)
-                        continue
+                        break  # only one frame per iter anyway
 
                     masks_data = r.masks.data  # (N, H', W')
                     scores = r.boxes.conf      # (N,)
-                    classes = r.boxes.cls      # (N,) prompt index
+                    classes = r.boxes.cls      # (N,)
 
-                    # Resize masks back to original (H, W) if needed
                     if masks_data.shape[-2:] != (H, W):
                         masks_data = torch.nn.functional.interpolate(
                             masks_data.unsqueeze(1).float(),
@@ -223,7 +210,6 @@ class SAM3ImageSegmentationNode:
                     scores_np = scores.cpu().numpy().astype(np.float32)
                     classes_np = classes.cpu().numpy().astype(int)
 
-                    # Sort by score descending (stable tracking ordering)
                     order = np.argsort(-scores_np)
                     for idx in order:
                         per_frame_detections[t].append({
@@ -232,18 +218,13 @@ class SAM3ImageSegmentationNode:
                             "prompt_idx": int(classes_np[idx]),
                         })
 
-                    # Free GPU tensors held by this frame's Results
-                    # immediately; don't wait for the generator to yield
-                    # the next one (ultralytics may still reference it).
                     del masks_data, scores, classes, r
+                    break  # SAM3 gives one Results per single-frame call
 
-                    t += 1
-                    pbar.update(1)
-
-                # Reclaim GPU memory from this chunk's Results objects
-                # before starting the next chunk.
                 del results_iter
-                if torch.cuda.is_available():
+                pbar.update(1)
+
+                if torch.cuda.is_available() and ((t + 1) % CACHE_FLUSH_EVERY == 0):
                     torch.cuda.empty_cache()
         finally:
             # Free VRAM so downstream nodes (PromptHMR + Sapiens) don't OOM
