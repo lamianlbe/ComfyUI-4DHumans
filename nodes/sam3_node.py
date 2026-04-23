@@ -30,6 +30,52 @@ os.makedirs(SAM3_CKPT_DIR, exist_ok=True)
 _logger = logging.getLogger(__name__)
 
 
+class TensorVideoLoader:
+    """Make a BCHW tensor batch look like an ultralytics video dataset.
+
+    Ultralytics' built-in LoadTensor hardcodes mode="image" and yields
+    all frames in a single batch.  SAM3VideoSemanticPredictor.init_state
+    asserts dataset.mode == "video" and iterates frame-by-frame with
+    dataset.frame / dataset.frames bookkeeping, so neither file-path
+    loaders nor LoadTensor fit.
+
+    This loader implements the minimal interface SAM3 video needs:
+        - mode == "video"
+        - frames: total frame count
+        - frame:  current frame index (updated during iteration)
+        - __iter__ / __next__ yielding one frame at a time as
+          (paths, im_bchw, metadata) matching ultralytics' convention
+    """
+
+    def __init__(self, tensor, fps=30):
+        # tensor: (B, C, H, W) float [0, 1] on any device
+        self.im0 = tensor
+        self.bs = 1                       # one frame per step
+        self.mode = "video"
+        self.frames = int(tensor.shape[0])
+        self.fps = fps
+        self.frame = 0                    # current frame index
+        self.count = 0
+        self.paths = [f"frame_{i}.jpg" for i in range(self.frames)]
+
+    def __iter__(self):
+        self.count = 0
+        self.frame = 0
+        return self
+
+    def __next__(self):
+        if self.count >= self.frames:
+            raise StopIteration
+        im = self.im0[self.count:self.count + 1]  # (1, C, H, W)
+        path = self.paths[self.count]
+        self.frame = self.count
+        self.count += 1
+        return [path], im, [""]
+
+    def __len__(self):
+        return self.frames
+
+
 def _list_checkpoints():
     """Return basenames of available SAM3 checkpoint files."""
     patterns = ["*.pt", "*.pth", "*.safetensors"]
@@ -177,50 +223,65 @@ class SAM3VideoSegmentationNode:
         pbar = comfy.utils.ProgressBar(B)
 
         # ------------------------------------------------------------------
-        # Run inference streaming.  Ultralytics' SAM3 video predictor
-        # returns Results with persistent tracking IDs via r.boxes.id.
+        # SAM3VideoSemanticPredictor requires dataset.mode == "video".
+        # Ultralytics' default LoadTensor hardcodes "image", which trips
+        # the assertion in init_state.  We monkey-patch setup_source on
+        # this predictor to swap in our TensorVideoLoader after the
+        # built-in path runs (so other predictor state stays initialized).
         # ------------------------------------------------------------------
-        results_iter = predictor(
-            source=source,
-            text=prompts,
-            stream=True,
-        )
+        original_setup_source = predictor.setup_source
 
-        # Collect per-frame masks indexed by global track_id.
-        # per_frame[t] = {track_id: mask_np}
-        per_frame = [{} for _ in range(B)]
-        all_track_ids = set()
+        def patched_setup_source(src):
+            original_setup_source(src)
+            if isinstance(src, torch.Tensor):
+                predictor.dataset = TensorVideoLoader(src)
+                predictor.bs = 1
 
-        frame_idx = 0
-        for r in results_iter:
-            if frame_idx >= B:
-                break
+        predictor.setup_source = patched_setup_source
 
-            if r.masks is not None and r.boxes is not None:
-                masks_data = r.masks.data  # (N, H', W') torch tensor
-                ids = r.boxes.id           # (N,) tensor or None
+        try:
+            results_iter = predictor(
+                source=source,
+                text=prompts,
+                stream=True,
+            )
 
-                if ids is None:
-                    # No tracking IDs — fall back to per-frame indices
-                    ids = torch.arange(masks_data.shape[0])
+            # Collect per-frame masks indexed by global track_id.
+            per_frame = [{} for _ in range(B)]
+            all_track_ids = set()
 
-                # Resize masks back to original (H, W) if needed
-                if masks_data.shape[-2:] != (H, W):
-                    masks_data = torch.nn.functional.interpolate(
-                        masks_data.unsqueeze(1).float(),
-                        size=(H, W),
-                        mode="nearest",
-                    ).squeeze(1)
+            frame_idx = 0
+            for r in results_iter:
+                if frame_idx >= B:
+                    break
 
-                masks_np = masks_data.cpu().numpy().astype(np.float32)
-                ids_np = ids.cpu().numpy().astype(int)
+                if r.masks is not None and r.boxes is not None:
+                    masks_data = r.masks.data  # (N, H', W')
+                    ids = r.boxes.id           # (N,) or None
 
-                for i, tid in enumerate(ids_np):
-                    per_frame[frame_idx][int(tid)] = masks_np[i]
-                    all_track_ids.add(int(tid))
+                    if ids is None:
+                        ids = torch.arange(masks_data.shape[0])
 
-            frame_idx += 1
-            pbar.update(1)
+                    # Resize masks back to original (H, W) if needed
+                    if masks_data.shape[-2:] != (H, W):
+                        masks_data = torch.nn.functional.interpolate(
+                            masks_data.unsqueeze(1).float(),
+                            size=(H, W),
+                            mode="nearest",
+                        ).squeeze(1)
+
+                    masks_np = masks_data.cpu().numpy().astype(np.float32)
+                    ids_np = ids.cpu().numpy().astype(int)
+
+                    for i, tid in enumerate(ids_np):
+                        per_frame[frame_idx][int(tid)] = masks_np[i]
+                        all_track_ids.add(int(tid))
+
+                frame_idx += 1
+                pbar.update(1)
+        finally:
+            # Restore original setup_source to avoid polluting the predictor
+            predictor.setup_source = original_setup_source
 
         if not all_track_ids:
             _logger.warning(
