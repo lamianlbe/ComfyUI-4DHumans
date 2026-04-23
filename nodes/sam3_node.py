@@ -18,6 +18,7 @@ import logging
 import os
 
 import numpy as np
+from ._mask_utils import pack_mask, unpack_mask
 import torch
 
 import comfy.utils
@@ -305,14 +306,14 @@ class SAM3VideoSegmentationNode:
                             align_corners=False,
                         ).squeeze(1)
 
-                    # Binarise masks to 0/1 floats to match the previous
-                    # SAM3 node's output format (downstream expects
-                    # mask > 0.5 checks).
-                    masks_np = (masks_data > 0.5).cpu().numpy().astype(np.float32)
+                    # Bit-pack masks: 1/32 the RAM of float32, 1/8 the
+                    # RAM of plain bool.  Long HD videos with many
+                    # tracked persons can easily OOM without this.
+                    masks_np = (masks_data > 0.5).cpu().numpy()  # bool
                     ids_np = ids.cpu().numpy().astype(int)
 
                     for i, tid in enumerate(ids_np):
-                        per_frame[frame_idx][int(tid)] = masks_np[i]
+                        per_frame[frame_idx][int(tid)] = pack_mask(masks_np[i])
                         all_track_ids.add(int(tid))
 
                 frame_idx += 1
@@ -339,15 +340,19 @@ class SAM3VideoSegmentationNode:
         id_to_slot = {tid: i for i, tid in enumerate(sorted_ids)}
         n_persons = len(sorted_ids)
 
-        # Build aligned output tensor
-        masks_out = torch.zeros(B, n_persons, H, W)
+        # Build aligned output tensor — same layout as other seg nodes.
+        # Allocate the final float32 tensor once and unpack packed
+        # masks directly into it.  Peak RAM ≈ sizeof(masks_out).
+        masks_out = torch.zeros(B * n_persons, H, W, dtype=torch.float32)
         for t in range(B):
-            for tid, mask_np in per_frame[t].items():
+            for tid, packed in per_frame[t].items():
                 slot = id_to_slot[tid]
-                masks_out[t, slot] = torch.from_numpy(mask_np)
+                mask_bool = unpack_mask(packed, H, W)
+                masks_out[t * n_persons + slot] = torch.from_numpy(
+                    mask_bool.astype(np.float32)
+                )
 
-        # Reshape to (B * N, H, W) — frame-grouped ordering
-        masks_out = masks_out.reshape(B * n_persons, H, W)
+        del per_frame
 
         _logger.info(
             "SAM3 (ultralytics): %d frames, %d prompts, %d tracked objects, "

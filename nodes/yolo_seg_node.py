@@ -21,6 +21,8 @@ import torch
 import comfy.utils
 from folder_paths import models_dir
 
+from ._mask_utils import pack_mask, unpack_mask
+
 # Hardcoded checkpoint path: <ComfyUI models/>/reface/yolo26x-seg.pt
 YOLO_CKPT_PATH = os.path.join(models_dir, "reface", "yolo26x-seg.pt")
 
@@ -267,11 +269,15 @@ class YOLOInstanceSegmentationNode:
                             align_corners=False,
                         ).squeeze(1)
 
-                    masks_np = (masks_data > 0.5).cpu().numpy().astype(np.float32)
+                    # Bit-pack masks: 1/32 the RAM of float32, 1/8 the
+                    # RAM of plain bool. Long HD videos with many
+                    # tracked persons easily blow past 16-32 GB of
+                    # system RAM otherwise.
+                    masks_np = (masks_data > 0.5).cpu().numpy()   # bool
                     ids_np = ids.cpu().numpy().astype(int)
 
                     for i, tid in enumerate(ids_np):
-                        per_frame[t][int(tid)] = masks_np[i]
+                        per_frame[t][int(tid)] = pack_mask(masks_np[i])
                         all_track_ids.add(int(tid))
 
                     t += 1
@@ -306,14 +312,20 @@ class YOLOInstanceSegmentationNode:
         id_to_slot = {tid: i for i, tid in enumerate(sorted_ids)}
         n_persons = len(sorted_ids)
 
-        # Build aligned output tensor — same layout as SAM3
-        masks_out = torch.zeros(B, n_persons, H, W)
+        # Build aligned output — same layout as SAM3.
+        # Allocate the final float32 tensor once and unpack each packed
+        # mask directly into it — avoids a parallel intermediate bool
+        # buffer. Peak RAM ≈ sizeof(masks_out).
+        masks_out = torch.zeros(B * n_persons, H, W, dtype=torch.float32)
         for t in range(B):
-            for tid, mask_np in per_frame[t].items():
+            for tid, packed in per_frame[t].items():
                 slot = id_to_slot[tid]
-                masks_out[t, slot] = torch.from_numpy(mask_np)
+                mask_bool = unpack_mask(packed, H, W)
+                masks_out[t * n_persons + slot] = torch.from_numpy(
+                    mask_bool.astype(np.float32)
+                )
 
-        masks_out = masks_out.reshape(B * n_persons, H, W)
+        del per_frame
 
         _logger.info(
             "YOLO segmentation: %d frames, classes=%s, %d tracked objects, "

@@ -20,6 +20,8 @@ import torch
 
 import comfy.utils
 
+from ._mask_utils import pack_mask, unpack_mask
+
 _logger = logging.getLogger(__name__)
 
 
@@ -206,14 +208,18 @@ class SAM3ImageSegmentationNode:
                             mode="nearest",
                         ).squeeze(1)
 
-                    masks_np = (masks_data > 0.5).cpu().numpy().astype(np.float32)
+                    # Bit-pack masks to cap RAM use: each (H, W) bool
+                    # becomes ceil(H*W/8) bytes — 1/32 the float32 cost
+                    # and 1/8 the plain-bool cost. Critical on long HD
+                    # videos with many tracked persons.
+                    masks_np = (masks_data > 0.5).cpu().numpy()   # bool
                     scores_np = scores.cpu().numpy().astype(np.float32)
                     classes_np = classes.cpu().numpy().astype(int)
 
                     order = np.argsort(-scores_np)
                     for idx in order:
                         per_frame_detections[t].append({
-                            "mask": masks_np[idx],
+                            "mask_packed": pack_mask(masks_np[idx]),
                             "score": float(scores_np[idx]),
                             "prompt_idx": int(classes_np[idx]),
                         })
@@ -243,36 +249,41 @@ class SAM3ImageSegmentationNode:
                 per_frame_tracks.append([])
                 continue
 
-            current_masks = [d["mask"] for d in detections]
+            current_packed = [d["mask_packed"] for d in detections]
             current_prompts = [d["prompt_idx"] for d in detections]
 
             if not prev_tracks:
                 # First frame with detections: assign new track IDs
                 frame_tracks = []
-                for i, mask in enumerate(current_masks):
+                for i, packed in enumerate(current_packed):
                     frame_tracks.append(
-                        (next_track_id, mask, current_prompts[i])
+                        (next_track_id, packed, current_prompts[i])
                     )
                     next_track_id += 1
                 per_frame_tracks.append(frame_tracks)
                 prev_tracks = frame_tracks
                 continue
 
-            # Compute IoU matrix between prev_tracks and current detections
+            # Compute IoU matrix between prev_tracks and current detections.
+            # IoU works directly on packed uint8 arrays:
+            #   popcount(A & B) / popcount(A | B)
+            # No need to unpack into full H×W buffers — saves both
+            # memory and time.
             n_prev = len(prev_tracks)
-            n_curr = len(current_masks)
+            n_curr = len(current_packed)
             iou_matrix = np.zeros((n_prev, n_curr), dtype=np.float32)
 
-            prev_bools = [pm > 0.5 for _, pm, _ in prev_tracks]
-            curr_bools = [cm > 0.5 for cm in current_masks]
+            def _popcount_u8(a):
+                return np.unpackbits(a).sum()
 
-            for i, pb in enumerate(prev_bools):
-                for j, cb in enumerate(curr_bools):
-                    # Only match same prompt class
+            for i in range(n_prev):
+                pb = prev_tracks[i][1]
+                for j in range(n_curr):
                     if prev_tracks[i][2] != current_prompts[j]:
                         continue
-                    inter = np.logical_and(pb, cb).sum()
-                    union = np.logical_or(pb, cb).sum()
+                    cb = current_packed[j]
+                    inter = _popcount_u8(pb & cb)
+                    union = _popcount_u8(pb | cb)
                     iou_matrix[i, j] = (
                         inter / union if union > 0 else 0.0
                     )
@@ -293,7 +304,9 @@ class SAM3ImageSegmentationNode:
                 if i in assigned_prev or j in assigned_curr:
                     continue
                 track_id = prev_tracks[i][0]
-                frame_tracks[j] = (track_id, current_masks[j], current_prompts[j])
+                frame_tracks[j] = (
+                    track_id, current_packed[j], current_prompts[j]
+                )
                 assigned_prev.add(i)
                 assigned_curr.add(j)
 
@@ -301,7 +314,9 @@ class SAM3ImageSegmentationNode:
             for j in range(n_curr):
                 if frame_tracks[j] is None:
                     frame_tracks[j] = (
-                        next_track_id, current_masks[j], current_prompts[j]
+                        next_track_id,
+                        current_packed[j],
+                        current_prompts[j],
                     )
                     next_track_id += 1
 
@@ -330,13 +345,20 @@ class SAM3ImageSegmentationNode:
 
         id_to_slot = {tid: i for i, tid in enumerate(all_track_ids)}
 
-        masks_out = torch.zeros(B, n_total, H, W)
+        # Allocate the final float32 tensor once and fill in place by
+        # unpacking each mask. Avoids holding a bool and a float32
+        # copy simultaneously. All packed masks released right after
+        # unpacking so peak RAM ≈ sizeof(masks_out).
+        masks_out = torch.zeros(B * n_total, H, W, dtype=torch.float32)
         for t in range(B):
-            for track_id, mask_np, _ in per_frame_tracks[t]:
+            for track_id, packed, _ in per_frame_tracks[t]:
                 slot = id_to_slot[track_id]
-                masks_out[t, slot] = torch.from_numpy(mask_np)
+                mask_bool = unpack_mask(packed, H, W)
+                masks_out[t * n_total + slot] = torch.from_numpy(
+                    mask_bool.astype(np.float32)
+                )
 
-        masks_out = masks_out.reshape(B * n_total, H, W)
+        del per_frame_tracks, per_frame_detections
 
         _logger.info(
             "SAM3 Image Segmentation (ultralytics): %d frames, %d prompts, "
