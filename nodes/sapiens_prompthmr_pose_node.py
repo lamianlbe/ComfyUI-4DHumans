@@ -108,7 +108,7 @@ class SapiensPromptHMRPoseNode:
                         ),
                     },
                 ),
-                "pose_3d_fps": (
+                "pose_fps": (
                     "FLOAT",
                     {
                         "default": 15.0,
@@ -116,10 +116,11 @@ class SapiensPromptHMRPoseNode:
                         "max": 120.0,
                         "step": 0.5,
                         "tooltip": (
-                            "Target sampling rate for the 3D backbone "
-                            "(PromptHMR or NLF). Frames between samples "
-                            "are filled by linear interpolation. Lower = "
-                            "faster but slightly coarser 3D motion. Set "
+                            "Target sampling rate for both the 3D "
+                            "backbone (PromptHMR / NLF) and the 2D "
+                            "Sapiens pass. Frames between samples are "
+                            "filled by linear interpolation. Lower = "
+                            "faster but slightly coarser motion. Set "
                             ">= source fps to disable (run every frame)."
                         ),
                     },
@@ -133,7 +134,13 @@ class SapiensPromptHMRPoseNode:
     CATEGORY = "4dhumans"
 
     def estimate_pose(self, images, masks, pose_3d_model, sapiens, fps,
-                      batch_size=16, pose_3d_fps=15.0):
+                      batch_size=16, pose_fps=15.0, **kwargs):
+        # Backward-compat: older serialised workflows may still send the
+        # legacy param names pose_3d_fps or prompthmr_fps.
+        if "pose_3d_fps" in kwargs:
+            pose_fps = kwargs.pop("pose_3d_fps")
+        if "prompthmr_fps" in kwargs:
+            pose_fps = kwargs.pop("prompthmr_fps")
         backend = pose_3d_model.get("backend", "prompthmr")
         if backend == "prompthmr":
             from .load_prompthmr_node import _ensure_lib_importable
@@ -147,8 +154,6 @@ class SapiensPromptHMRPoseNode:
         # Autocast dtype for forward pass. Default is float16 to match the
         # historical autocast("cuda") behaviour when no dtype was set.
         phmr_dtype = pose_3d_model.get("torch_dtype", torch.float16)
-        # Backward-compat: older workflows may pass prompthmr_fps kwarg
-        prompthmr_fps = pose_3d_fps
 
         B, img_h, img_w, C = images.shape
         rgb = images[..., :3]  # (B, H, W, 3)
@@ -201,26 +206,26 @@ class SapiensPromptHMRPoseNode:
         phmr_time_s = 0.0
         sapiens_time_s = 0.0
 
-        # ----- Determine PromptHMR sampled frames (downsample + interp) -----
+        # ----- Determine sampled frames (shared by 3D and 2D) -----
         # Stride ≥ 1; if target >= source, stride=1 (no skipping).
-        if prompthmr_fps > 0 and prompthmr_fps < fps:
-            phmr_stride = max(1, int(round(float(fps) / float(prompthmr_fps))))
+        if pose_fps > 0 and pose_fps < fps:
+            phmr_stride = max(1, int(round(float(fps) / float(pose_fps))))
         else:
             phmr_stride = 1
-        phmr_sampled = set(range(0, B, phmr_stride))
-        # Always include the last frame so interpolation has an anchor at the
-        # end of the clip.
+        sampled_frames_set = set(range(0, B, phmr_stride))
+        # Always include the last frame so interpolation has an anchor
+        # at the end of the clip.
         if B > 0:
-            phmr_sampled.add(B - 1)
+            sampled_frames_set.add(B - 1)
 
-        # ----- Phase 1a: Gather per-frame PromptHMR inputs + Sapiens crops -----
-        # Sapiens crops are gathered on EVERY frame (2D stays at source fps).
-        # PromptHMR inputs are only gathered on sampled frames.
+        # ----- Phase 1a: Gather per-frame 3D inputs + Sapiens crops -----
+        # Both passes only process sampled frames; interpolation fills
+        # the rest after inference.
         phmr_frame_inputs = [None] * B
         for t in range(B):
             img_np = images_np[t]
             masks_frame_np = masks_np[t]
-            is_phmr_sampled = t in phmr_sampled
+            is_sampled = t in sampled_frames_set
 
             bboxes_phmr = []
             masks_uint8 = []
@@ -235,18 +240,20 @@ class SapiensPromptHMRPoseNode:
                 x1, x2 = int(xs.min()), int(xs.max())
                 y1, y2 = int(ys.min()), int(ys.max())
 
-                if is_phmr_sampled:
-                    bboxes_phmr.append(
-                        torch.tensor(
-                            [[x1, y1, x2, y2, 1.0]], dtype=torch.float32
-                        )
-                    )
-                    masks_uint8.append(
-                        (mask_frame > 0.5).astype(np.uint8) * 255
-                    )
-                    person_indices.append(p_idx)
+                if not is_sampled:
+                    continue
 
-                # Sapiens crop for Pass 2 (gathered every frame)
+                bboxes_phmr.append(
+                    torch.tensor(
+                        [[x1, y1, x2, y2, 1.0]], dtype=torch.float32
+                    )
+                )
+                masks_uint8.append(
+                    (mask_frame > 0.5).astype(np.uint8) * 255
+                )
+                person_indices.append(p_idx)
+
+                # Sapiens crop for Pass 2 (same sampled frames only)
                 x1c = max(0, x1)
                 y1c = max(0, y1)
                 x2c = min(img_w, x2)
@@ -352,7 +359,7 @@ class SapiensPromptHMRPoseNode:
             )
 
         # ----- Phase 1c: Fill non-sampled frames by linear interpolation -----
-        # (only runs when prompthmr_fps < fps)
+        # (only runs when pose_fps < fps)
         if phmr_stride > 1:
             # Per-person 3D fields
             for p_idx in range(n_persons):
@@ -412,6 +419,14 @@ class SapiensPromptHMRPoseNode:
                     pixel_kp[:, 2] = confs[i]
                     persons[p_idx]["keypoints"][frame_t] = pixel_kp
                     sap_pbar.update(1)
+
+        # Interpolate Sapiens keypoints on skipped frames (same stride
+        # as the 3D backbone).  keypoints are confidence-aware (133, 3):
+        # the linear interpolation averages confidences too, which is a
+        # reasonable "between-sample" estimate.
+        if phmr_stride > 1:
+            for p_idx in range(n_persons):
+                _linear_interp_timeline(persons[p_idx]["keypoints"])
 
         # Store raw keypoints for non-destructive editing in Pose Editor.
         # keypoints_raw is the original Sapiens output; keypoints is the
