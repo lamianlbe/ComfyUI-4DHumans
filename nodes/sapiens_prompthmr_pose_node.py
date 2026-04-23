@@ -73,7 +73,7 @@ class SapiensPromptHMRPoseNode:
                         "tooltip": "Source video FPS.",
                     },
                 ),
-                "sapiens_batch_size": (
+                "batch_size": (
                     "INT",
                     {
                         "default": 16,
@@ -81,8 +81,9 @@ class SapiensPromptHMRPoseNode:
                         "max": 256,
                         "step": 1,
                         "tooltip": (
-                            "Sapiens batch size for cross-frame batching. "
-                            "Higher = faster on large GPUs; reduce if OOM."
+                            "Cross-frame batch size, shared by PromptHMR "
+                            "and Sapiens. Higher = faster on large GPUs; "
+                            "reduce if OOM."
                         ),
                     },
                 ),
@@ -95,7 +96,7 @@ class SapiensPromptHMRPoseNode:
     CATEGORY = "4dhumans"
 
     def estimate_pose(self, images, masks, prompthmr, sapiens, fps,
-                      sapiens_batch_size=16):
+                      batch_size=16):
         from .load_prompthmr_node import _ensure_lib_importable
         _ensure_lib_importable()
 
@@ -159,10 +160,13 @@ class SapiensPromptHMRPoseNode:
         phmr_time_s = 0.0
         sapiens_time_s = 0.0
 
-        # ----- Pass 1: PromptHMR per-frame + gather Sapiens crops -----
+        # ----- Phase 1a: Gather per-frame PromptHMR inputs + Sapiens crops -----
+        # phmr_frame_inputs[t] = None (no valid person) or
+        #   {"input": {...}, "person_indices": [...]}
+        phmr_frame_inputs = [None] * B
         for t in range(B):
             img_np = images_np[t]
-            masks_frame_np = masks_np[t]  # (n_persons, H, W)
+            masks_frame_np = masks_np[t]
 
             bboxes_phmr = []
             masks_uint8 = []
@@ -177,15 +181,15 @@ class SapiensPromptHMRPoseNode:
                 x1, x2 = int(xs.min()), int(xs.max())
                 y1, y2 = int(ys.min()), int(ys.max())
 
-                # PromptHMR bbox + binary mask
                 bboxes_phmr.append(
                     torch.tensor([[x1, y1, x2, y2, 1.0]], dtype=torch.float32)
                 )
-                mask_u8 = (mask_frame > 0.5).astype(np.uint8) * 255
-                masks_uint8.append(mask_u8)
+                masks_uint8.append(
+                    (mask_frame > 0.5).astype(np.uint8) * 255
+                )
                 person_indices.append(p_idx)
 
-                # Sapiens: mask + crop, deferred for cross-frame batching
+                # Sapiens crop for Pass 2
                 x1c = max(0, x1)
                 y1c = max(0, y1)
                 x2c = min(img_w, x2)
@@ -200,50 +204,69 @@ class SapiensPromptHMRPoseNode:
                 ))
 
             if not person_indices:
-                pbar.update(1)
                 continue
 
-            # --- PromptHMR batch inference (batched across persons) ---
-            boxes_cat = torch.cat(bboxes_phmr, dim=0)
-            masks_arr = np.array(masks_uint8)
+            phmr_frame_inputs[t] = {
+                "input": {
+                    "image_cv": img_np,
+                    "boxes": torch.cat(bboxes_phmr, dim=0),
+                    "masks": np.array(masks_uint8),
+                    "text": None,
+                },
+                "person_indices": person_indices,
+            }
 
-            inputs = [{
-                "image_cv": img_np,
-                "boxes": boxes_cat,
-                "masks": masks_arr,
-                "text": None,
-            }]
+        # ----- Phase 1b: PromptHMR cross-frame batched inference -----
+        valid_frames = [t for t in range(B) if phmr_frame_inputs[t] is not None]
+
+        for chunk_start in range(0, len(valid_frames), batch_size):
+            chunk_frames = valid_frames[chunk_start:chunk_start + batch_size]
+            inputs = [phmr_frame_inputs[t]["input"] for t in chunk_frames]
 
             _cuda_sync()
             phmr_start = time.perf_counter()
             with torch.no_grad(), autocast("cuda", dtype=phmr_dtype):
-                batch = prepare_batch(inputs, img_size=img_size, interaction=False)
-                output = model(batch, use_mean_hands=True)[0]
+                batch = prepare_batch(
+                    inputs, img_size=img_size, interaction=False
+                )
+                outputs = model(batch, use_mean_hands=True)
             _cuda_sync()
             phmr_time_s += time.perf_counter() - phmr_start
 
-            joints_2d = output["body_joints2d"].detach().cpu().numpy()
-            joints_3d = output["body_joints"].detach().cpu().numpy()
-            smpl_j3d = output["smpl_j3d"].detach().cpu().numpy()
+            for chunk_i, t in enumerate(chunk_frames):
+                output = outputs[chunk_i]
+                person_indices = phmr_frame_inputs[t]["person_indices"]
 
-            scale_val = batch[0]["image_scale"]
-            offset_val = batch[0]["image_offset"]
-            if isinstance(offset_val, torch.Tensor):
-                offset_val = offset_val.numpy()
-            offset_val = np.array(offset_val)
+                joints_2d = output["body_joints2d"].detach().cpu().numpy()
+                joints_3d = output["body_joints"].detach().cpu().numpy()
+                smpl_j3d = output["smpl_j3d"].detach().cpu().numpy()
 
-            cam_int_val = output["cam_int"].detach().cpu().numpy()
-            cam_int_per_frame[t] = cam_int_val[0]
-            scale_per_frame[t] = float(scale_val)
-            offset_per_frame[t] = offset_val.copy()
+                scale_val = batch[chunk_i]["image_scale"]
+                offset_val = batch[chunk_i]["image_offset"]
+                if isinstance(offset_val, torch.Tensor):
+                    offset_val = offset_val.numpy()
+                offset_val = np.array(offset_val)
 
-            joints_2d_orig = (joints_2d - offset_val[None, None, :]) / scale_val
+                cam_int_val = output["cam_int"].detach().cpu().numpy()
+                cam_int_per_frame[t] = cam_int_val[0]
+                scale_per_frame[t] = float(scale_val)
+                offset_per_frame[t] = offset_val.copy()
 
-            for i, p_idx in enumerate(person_indices):
-                persons[p_idx]["body_joints2d"][t] = joints_2d_orig[i]
-                persons[p_idx]["body_joints"][t] = joints_3d[i]
-                persons[p_idx]["smpl_j3d"][t] = smpl_j3d[i]
+                joints_2d_orig = (
+                    joints_2d - offset_val[None, None, :]
+                ) / scale_val
 
+                for i, p_idx in enumerate(person_indices):
+                    persons[p_idx]["body_joints2d"][t] = joints_2d_orig[i]
+                    persons[p_idx]["body_joints"][t] = joints_3d[i]
+                    persons[p_idx]["smpl_j3d"][t] = smpl_j3d[i]
+
+                pbar.update(1)
+
+            # Skipped frames (no valid persons) still need pbar updates
+            # when the chunk is shorter than batch_size at the tail.
+        skipped = B - len(valid_frames)
+        for _ in range(skipped):
             pbar.update(1)
 
         # ----- Pass 2: Sapiens cross-frame batched inference -----
@@ -253,8 +276,8 @@ class SapiensPromptHMRPoseNode:
 
             K_sap = hm_h = hm_w = None
 
-            for chunk_start in range(0, n_total, sapiens_batch_size):
-                chunk = sap_requests[chunk_start:chunk_start + sapiens_batch_size]
+            for chunk_start in range(0, n_total, batch_size):
+                chunk = sap_requests[chunk_start:chunk_start + batch_size]
                 tensors = [r[2] for r in chunk]
 
                 sap_batch = torch.stack(tensors, dim=0).to(sap_device).to(sap_dtype)
@@ -296,15 +319,16 @@ class SapiensPromptHMRPoseNode:
             ]
 
         n_sap = len(sap_requests)
+        n_phmr = len(valid_frames)
         _logger.info(
-            "SapiensPromptHMR Human Pose: %d frames, %d persons | "
-            "PromptHMR %.2f s (%.1f ms/frame) | "
-            "Sapiens %.2f s (%d crops, %.1f ms/crop, batch=%d)",
-            B, n_persons,
-            phmr_time_s, 1000.0 * phmr_time_s / max(1, B),
+            "SapiensPromptHMR Human Pose: %d frames, %d persons, batch=%d | "
+            "PromptHMR %.2f s (%d frames, %.1f ms/frame) | "
+            "Sapiens %.2f s (%d crops, %.1f ms/crop)",
+            B, n_persons, batch_size,
+            phmr_time_s, n_phmr,
+            1000.0 * phmr_time_s / max(1, n_phmr),
             sapiens_time_s, n_sap,
             1000.0 * sapiens_time_s / max(1, n_sap),
-            sapiens_batch_size,
         )
 
         poses = {
