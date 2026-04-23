@@ -206,25 +206,6 @@ def run_nlf_inference(
                     else:
                         info_parts.append(f"{k}={type(v).__name__}")
                 _logger.info("NLF pred keys: %s", "; ".join(info_parts))
-
-                # Also log joints2d_nonparam value range to diagnose
-                # whether it's pixel coords, normalised [0,1], or
-                # something else (e.g. image-size-relative but not
-                # clamped).
-                j2d_nonparam = pred.get("joints2d_nonparam")
-                if (j2d_nonparam is not None and len(j2d_nonparam) > 0
-                        and j2d_nonparam[0] is not None
-                        and j2d_nonparam[0].numel() > 0):
-                    sample = j2d_nonparam[0].detach().float()
-                    _logger.info(
-                        "NLF joints2d_nonparam range: x[%.2f, %.2f] "
-                        "y[%.2f, %.2f] (image size W=%d H=%d)",
-                        float(sample[..., 0].min()),
-                        float(sample[..., 0].max()),
-                        float(sample[..., 1].min()),
-                        float(sample[..., 1].max()),
-                        img_w, img_h,
-                    )
                 logged_keys = True
 
             # Extract ragged per-frame outputs.  Defensive: the demo
@@ -232,7 +213,16 @@ def run_nlf_inference(
             # tested emits only boxes and joints3d_nonparam.
             boxes_list = pred.get("boxes", None)
             j3d_list = pred.get("joints3d_nonparam", None)
-            j2d_list = pred.get("joints2d_nonparam", None)
+            # NOTE: we deliberately ignore pred["joints2d_nonparam"].
+            # Its coordinates are in NLF's internal preprocessed image
+            # space (observed y up to ~1370 for a 960-px-tall image),
+            # not the original image's pixel space. Projecting
+            # joints3d_nonparam via the 55° FOV intrinsic is the
+            # convention used by SCAIL-Pose and the NLF renderer; the
+            # resulting 2D pixel coords match the original image
+            # exactly, which is what downstream DWPose / renderer
+            # pipelines need.
+            j2d_list = None
 
             if j3d_list is None:
                 raise RuntimeError(
