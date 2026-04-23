@@ -190,6 +190,14 @@ class YOLOInstanceSegmentationNode:
         logged_shape = False
 
         try:
+            # Ensure model is on GPU (previous run offloaded to CPU)
+            if torch.cuda.is_available():
+                try:
+                    if hasattr(model, "model") and model.model is not None:
+                        model.model.to("cuda")
+                except Exception as e:
+                    _logger.warning("YOLO restore-to-CUDA failed: %s", e)
+
             # model.track() runs YOLO detection + ByteTrack/BoT-SORT tracker
             # with persistent IDs across consecutive frames in the batch.
             results_iter = model.track(
