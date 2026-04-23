@@ -318,6 +318,11 @@ class SAM3VideoSegmentationNode:
             # Restore original setup_source to avoid polluting the predictor
             predictor.setup_source = original_setup_source
 
+            # Offload SAM3 model to CPU so downstream nodes
+            # (PromptHMR + Sapiens) have VRAM available.
+            from .sam3_image_node import _offload_sam3_to_cpu
+            _offload_sam3_to_cpu(sam3)
+
         if not all_track_ids:
             _logger.warning(
                 "SAM3 detected nothing for prompts %s. "

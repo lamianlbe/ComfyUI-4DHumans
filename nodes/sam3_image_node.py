@@ -55,6 +55,21 @@ def _get_or_build_image_predictor(sam3_dict):
     return predictor
 
 
+def _offload_sam3_to_cpu(sam3_dict):
+    """Move SAM3 predictors to CPU and empty CUDA cache to free VRAM."""
+    for key in ("predictor", "_image_predictor"):
+        pred = sam3_dict.get(key)
+        if pred is not None and hasattr(pred, "model") and pred.model is not None:
+            try:
+                pred.model.to("cpu")
+            except Exception as e:
+                _logger.warning(
+                    "SAM3 VRAM offload failed for %s: %s", key, e
+                )
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 class SAM3ImageSegmentationNode:
     """Run SAM3 image-model segmentation with cross-frame IoU tracking.
 
@@ -126,46 +141,50 @@ class SAM3ImageSegmentationNode:
         # per_frame_detections[t] = list of {mask, score, prompt_idx}
         per_frame_detections = [[] for _ in range(B)]
 
-        results_iter = predictor(
-            source=source,
-            text=prompts,
-            stream=True,
-        )
+        try:
+            results_iter = predictor(
+                source=source,
+                text=prompts,
+                stream=True,
+            )
 
-        for t, r in enumerate(results_iter):
-            if t >= B:
-                break
+            for t, r in enumerate(results_iter):
+                if t >= B:
+                    break
 
-            if r.masks is None or r.boxes is None:
+                if r.masks is None or r.boxes is None:
+                    pbar.update(1)
+                    continue
+
+                masks_data = r.masks.data  # (N, H', W')
+                scores = r.boxes.conf      # (N,)
+                classes = r.boxes.cls      # (N,) prompt index
+
+                # Resize masks back to original (H, W) if needed
+                if masks_data.shape[-2:] != (H, W):
+                    masks_data = torch.nn.functional.interpolate(
+                        masks_data.unsqueeze(1).float(),
+                        size=(H, W),
+                        mode="nearest",
+                    ).squeeze(1)
+
+                masks_np = (masks_data > 0.5).cpu().numpy().astype(np.float32)
+                scores_np = scores.cpu().numpy().astype(np.float32)
+                classes_np = classes.cpu().numpy().astype(int)
+
+                # Sort by score descending (stable tracking ordering)
+                order = np.argsort(-scores_np)
+                for idx in order:
+                    per_frame_detections[t].append({
+                        "mask": masks_np[idx],
+                        "score": float(scores_np[idx]),
+                        "prompt_idx": int(classes_np[idx]),
+                    })
+
                 pbar.update(1)
-                continue
-
-            masks_data = r.masks.data  # (N, H', W')
-            scores = r.boxes.conf      # (N,)
-            classes = r.boxes.cls      # (N,) prompt index
-
-            # Resize masks back to original (H, W) if needed
-            if masks_data.shape[-2:] != (H, W):
-                masks_data = torch.nn.functional.interpolate(
-                    masks_data.unsqueeze(1).float(),
-                    size=(H, W),
-                    mode="nearest",
-                ).squeeze(1)
-
-            masks_np = masks_data.cpu().numpy().astype(np.float32)
-            scores_np = scores.cpu().numpy().astype(np.float32)
-            classes_np = classes.cpu().numpy().astype(int)
-
-            # Sort by score descending (stable tracking ordering)
-            order = np.argsort(-scores_np)
-            for idx in order:
-                per_frame_detections[t].append({
-                    "mask": masks_np[idx],
-                    "score": float(scores_np[idx]),
-                    "prompt_idx": int(classes_np[idx]),
-                })
-
-            pbar.update(1)
+        finally:
+            # Free VRAM so downstream nodes (PromptHMR + Sapiens) don't OOM
+            _offload_sam3_to_cpu(sam3)
 
         # ------------------------------------------------------------------
         # Cross-frame IoU tracking (greedy)
