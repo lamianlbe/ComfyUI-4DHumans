@@ -1,0 +1,342 @@
+"""
+FastSAM3DBodyRTMFacePose node — new pipeline using Fast SAM 3D Body
++ RTMPose-Face + (optional) YOLO11m-Pose.
+
+Output is a POSES dict fully compatible with the existing NPZ format
+so downstream nodes (Pose Editor, Save/Load, Renderer, NLF converter)
+work unchanged.
+
+Phases:
+  Phase 0: input validation + reshaping (masks, images)
+  Phase 1: per-frame mask → bbox + sampling strategy for pose_fps
+  Phase 2: Fast SAM 3D Body + MHR2SMPL (per-person sequential smoother)
+  Phase 3: linear interpolation of skipped frames (pose_fps < fps)
+  Phase 4: assemble COCO-WB body+feet+hands from MHR
+  Phase 5: RTMPose-Face derives face bboxes and fills COCO-WB 23..90
+  Phase 6: store keypoints_raw snapshot for Pose Editor's non-destructive edits
+  Phase 7: pack the POSES dict
+"""
+
+import logging
+import time
+from typing import Optional
+
+import numpy as np
+import torch
+
+import comfy.utils
+
+from ._fastsam3db_inference import (
+    run_fastsam3db_video,
+    mhr70_to_coco_wb_body_feet_hands,
+)
+from ._rtmpose_face_inference import run_rtmpose_face_video
+
+_logger = logging.getLogger(__name__)
+
+
+def _cuda_sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _linear_interp_timeline(timeline):
+    """In-place fill None entries by linearly interpolating between
+    the nearest non-None neighbours.  Mirrors the helper already used
+    in sapiens_prompthmr_pose_node.py."""
+    n = len(timeline)
+    valid = [i for i, v in enumerate(timeline) if v is not None]
+    if len(valid) < 2:
+        return
+    for a, b in zip(valid[:-1], valid[1:]):
+        if b - a <= 1:
+            continue
+        va = timeline[a]
+        vb = timeline[b]
+        for i in range(a + 1, b):
+            alpha = (i - a) / (b - a)
+            timeline[i] = va * (1.0 - alpha) + vb * alpha
+
+
+class FastSAM3DBodyRTMFacePoseNode:
+    """Fast SAM 3D Body + RTMPose-Face pose estimator.
+
+    Emits the same POSES dict as SapiensPromptHMRPose but using a
+    different backbone stack.  Downstream nodes (Renderer, Editor,
+    NLF converter, Save/Load) remain compatible.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "masks": ("MASK",),
+                "fast_sam_3d_body": ("FASTSAM3DBODY",),
+                "rtmpose_face": ("RTMPOSEFACE",),
+                "fps": (
+                    "FLOAT",
+                    {
+                        "default": 24.0,
+                        "min": 1.0,
+                        "max": 120.0,
+                        "step": 0.001,
+                        "tooltip": "Source video FPS.",
+                    },
+                ),
+                "batch_size": (
+                    "INT",
+                    {
+                        "default": 16,
+                        "min": 1,
+                        "max": 256,
+                        "step": 1,
+                        "tooltip": (
+                            "RTMPose-Face batch size. Larger = faster on "
+                            "large GPUs; reduce if OOM."
+                        ),
+                    },
+                ),
+                "pose_fps": (
+                    "FLOAT",
+                    {
+                        "default": 15.0,
+                        "min": 1.0,
+                        "max": 120.0,
+                        "step": 0.5,
+                        "tooltip": (
+                            "Target FPS for Fast SAM 3D Body inference. "
+                            "Intermediate frames are linearly interpolated. "
+                            "RTMPose-Face always runs per-frame."
+                        ),
+                    },
+                ),
+            },
+            "optional": {
+                "yolo11_pose": ("YOLO11POSE",),
+                # Currently used only for logging/validation — Step 4
+                # defers the yolo_pose keypoint injection patch to Step
+                # 5 refinement.  Wiring it in here doesn't hurt.
+            },
+        }
+
+    RETURN_TYPES = ("POSES",)
+    RETURN_NAMES = ("poses",)
+    FUNCTION = "estimate_pose"
+    CATEGORY = "4dhumans"
+
+    def estimate_pose(self, images, masks, fast_sam_3d_body, rtmpose_face,
+                      fps, batch_size=16, pose_fps=15.0, yolo11_pose=None):
+        # ---------------------------------------------------------------
+        # Phase 0: input validation + reshape
+        # ---------------------------------------------------------------
+        B, img_h, img_w, C = images.shape
+        rgb = images[..., :3]
+
+        if masks.dim() == 4:
+            masks = masks[..., 0]
+        M = masks.shape[0]
+        if M % B != 0:
+            raise ValueError(
+                f"FastSAM3DBody+RTMFace Pose: mask count ({M}) must be a "
+                f"multiple of frame count ({B})."
+            )
+        n_persons = M // B
+        masks = masks.reshape(B, n_persons, masks.shape[-2], masks.shape[-1])
+        masks_np = masks.cpu().numpy() > 0.5  # (B, N, H, W) bool
+        images_np_u8 = (rgb.clamp(0, 1) * 255).byte().cpu().numpy()
+
+        _logger.info(
+            "FastSAM3DBody+RTMFace: %d frames, %d persons, %dx%d, pose_fps=%.1f (src %.1f)",
+            B, n_persons, img_w, img_h, pose_fps, fps,
+        )
+
+        # ---------------------------------------------------------------
+        # Phase 1: per-frame mask bbox + pose_fps sampling decision
+        # ---------------------------------------------------------------
+        # Stride for 3D backbone. Always include first + last frame so
+        # the interpolation has endpoints.
+        if pose_fps > 0 and pose_fps < fps:
+            phmr_stride = max(1, int(round(float(fps) / float(pose_fps))))
+        else:
+            phmr_stride = 1
+        sampled_frames = set(range(0, B, phmr_stride))
+        if B > 0:
+            sampled_frames.add(B - 1)
+
+        mask_bboxes_per_frame = [[] for _ in range(B)]
+        person_indices_per_frame = [[] for _ in range(B)]
+
+        for t in range(B):
+            if t not in sampled_frames:
+                # Still record person slots even though we'll skip; this
+                # keeps the list shape invariant.
+                continue
+            for p_idx in range(n_persons):
+                mask_frame = masks_np[t, p_idx]
+                ys, xs = np.where(mask_frame)
+                if len(xs) == 0:
+                    continue
+                x1 = int(xs.min())
+                y1 = int(ys.min())
+                x2 = int(xs.max() + 1)
+                y2 = int(ys.max() + 1)
+                x1 = max(0, x1); y1 = max(0, y1)
+                x2 = min(img_w, x2); y2 = min(img_h, y2)
+                if x2 - x1 < 2 or y2 - y1 < 2:
+                    continue
+                mask_bboxes_per_frame[t].append((x1, y1, x2, y2))
+                person_indices_per_frame[t].append(p_idx)
+
+        # Total work for progress bar: Fast SAM 3D Body frames + face frames
+        n_sampled = len(sampled_frames)
+        pbar = comfy.utils.ProgressBar(B * 2)
+
+        # ---------------------------------------------------------------
+        # Phase 2: Fast SAM 3D Body + MHR2SMPL
+        # ---------------------------------------------------------------
+        result = run_fastsam3db_video(
+            images_np_u8=images_np_u8,
+            mask_bboxes_per_frame=mask_bboxes_per_frame,
+            masks_np=masks_np,
+            person_indices_per_frame=person_indices_per_frame,
+            fastsam3db_dict=fast_sam_3d_body,
+            yolo11pose_dict=yolo11_pose,
+            n_persons=n_persons,
+            img_h=img_h,
+            img_w=img_w,
+            pbar=pbar,
+        )
+        persons_fs = result["persons"]          # list[dict], per-person timelines
+        cam_int_per_frame = result["cam_int"]   # list of (3,3) or None
+        fastsam3db_time = result["fastsam3db_time_s"]
+        mhr2smpl_time = result["mhr2smpl_time_s"]
+
+        # Scale/offset are always identity for Fast SAM 3D Body (no
+        # padding preprocessing was applied externally).
+        scale_per_frame = [1.0 if cam_int_per_frame[t] is not None else None
+                           for t in range(B)]
+        offset_per_frame = [np.zeros(2, dtype=np.float64)
+                            if cam_int_per_frame[t] is not None else None
+                            for t in range(B)]
+
+        # ---------------------------------------------------------------
+        # Phase 3: Linear interpolation on skipped frames
+        # ---------------------------------------------------------------
+        if phmr_stride > 1:
+            for p_idx in range(n_persons):
+                _linear_interp_timeline(persons_fs[p_idx]["body_joints2d"])
+                _linear_interp_timeline(persons_fs[p_idx]["body_joints"])
+                _linear_interp_timeline(persons_fs[p_idx]["smpl_j3d"])
+                _linear_interp_timeline(persons_fs[p_idx]["mhr_kp2d"])
+            _linear_interp_timeline(cam_int_per_frame)
+            scale_arr = [
+                np.array([v], dtype=np.float64) if v is not None else None
+                for v in scale_per_frame
+            ]
+            _linear_interp_timeline(scale_arr)
+            scale_per_frame = [
+                float(v[0]) if v is not None else None for v in scale_arr
+            ]
+            _linear_interp_timeline(offset_per_frame)
+
+        # ---------------------------------------------------------------
+        # Phase 4: assemble COCO-WB body + feet + hands from MHR
+        # ---------------------------------------------------------------
+        # Each person gets a (133, 3) keypoints timeline, face region
+        # (23..90) stays zero for now — RTMPose-Face will fill it.
+        coco_wb_body_feet_timeline = [
+            [None] * B for _ in range(n_persons)
+        ]
+        persons_coco_wb_133 = [
+            [None] * B for _ in range(n_persons)
+        ]
+        for p_idx in range(n_persons):
+            for t in range(B):
+                mhr_kp2d = persons_fs[p_idx]["mhr_kp2d"][t]
+                if mhr_kp2d is None:
+                    continue
+                # Upgrade to (70, 3) if needed (MHR outputs 2D only)
+                if mhr_kp2d.shape[-1] == 2:
+                    kp2d = np.concatenate(
+                        [mhr_kp2d, np.ones((mhr_kp2d.shape[0], 1), dtype=np.float32)],
+                        axis=-1,
+                    )
+                else:
+                    kp2d = mhr_kp2d.astype(np.float32)
+
+                body_feet, rhand, lhand = mhr70_to_coco_wb_body_feet_hands(kp2d)
+                coco_wb = np.zeros((133, 3), dtype=np.float32)
+                coco_wb[:23] = body_feet           # 0..22  body + feet
+                coco_wb[91:112] = lhand             # 91..111 left hand
+                coco_wb[112:133] = rhand            # 112..132 right hand
+                persons_coco_wb_133[p_idx][t] = coco_wb
+                coco_wb_body_feet_timeline[p_idx][t] = body_feet
+
+        # ---------------------------------------------------------------
+        # Phase 5: RTMPose-Face for face 68 landmarks
+        # ---------------------------------------------------------------
+        face_kp_68_timeline, rtmface_time = run_rtmpose_face_video(
+            images_np_u8=images_np_u8,
+            persons_coco_body_feet_timeline=coco_wb_body_feet_timeline,
+            rtmpose_face_dict=rtmpose_face,
+            img_h=img_h,
+            img_w=img_w,
+            batch_size=batch_size,
+            pbar=pbar,
+        )
+
+        # Fill face slice 23..90 into the 133-layout
+        for p_idx in range(n_persons):
+            for t in range(B):
+                face68 = face_kp_68_timeline[p_idx][t]
+                kp133 = persons_coco_wb_133[p_idx][t]
+                if face68 is None or kp133 is None:
+                    continue
+                kp133[23:91] = face68  # 68 face keypoints
+
+        # ---------------------------------------------------------------
+        # Phase 6: assemble POSES "persons" list (with keypoints_raw snapshot)
+        # ---------------------------------------------------------------
+        poses_persons = []
+        for p_idx in range(n_persons):
+            kp_main = persons_coco_wb_133[p_idx]
+            kp_raw = [kp.copy() if kp is not None else None for kp in kp_main]
+            poses_persons.append({
+                "visible": True,
+                "body_joints2d": persons_fs[p_idx]["body_joints2d"],
+                "body_joints":   persons_fs[p_idx]["body_joints"],
+                "smpl_j3d":      persons_fs[p_idx]["smpl_j3d"],
+                "keypoints":     kp_main,
+                "keypoints_raw": kp_raw,
+            })
+
+        # ---------------------------------------------------------------
+        # Phase 7: pack
+        # ---------------------------------------------------------------
+        poses = {
+            "n_persons": n_persons,
+            "n_frames": B,
+            "img_h": int(img_h),
+            "img_w": int(img_w),
+            "fps": float(fps),
+            "persons": poses_persons,
+            "cam_int": cam_int_per_frame,
+            "scale": scale_per_frame,
+            "offset": offset_per_frame,
+        }
+
+        total = fastsam3db_time + mhr2smpl_time + rtmface_time
+        _logger.info(
+            "FastSAM3DBody+RTMFace Pose: %d frames, %d persons, "
+            "pose_fps=%.1f stride=%d | "
+            "FastSAM3DBody %.2fs (%d sampled frames) | "
+            "MHR2SMPL %.2fs | "
+            "RTMFace %.2fs | total %.2fs",
+            B, n_persons, pose_fps, phmr_stride,
+            fastsam3db_time, n_sampled,
+            mhr2smpl_time,
+            rtmface_time, total,
+        )
+
+        return (poses,)
