@@ -13,11 +13,29 @@ joint-based pipeline).
 Hardcoded checkpoint path: models/nlf/nlf_l_multi_0.3.2.torchscript
 """
 
+import logging
 import os
 
 import torch
 
 from folder_paths import models_dir
+
+_logger = logging.getLogger(__name__)
+
+
+def _check_jit_script_function():
+    """Warn if another custom node has monkey-patched torch.jit.script.
+
+    Mirrors kijai/ComfyUI-WanVideoWrapper's check; patched torch.jit
+    functions can cause subtle NLF TorchScript failures.
+    """
+    if torch.jit.script.__name__ != "script":
+        module = getattr(torch.jit.script, "__module__", "unknown")
+        _logger.warning(
+            "torch.jit.script has been patched by %s.%s — this may "
+            "break the NLF TorchScript model.",
+            module, torch.jit.script.__name__,
+        )
 
 # Hardcoded checkpoint path.
 NLF_CKPT_PATH = os.path.join(
@@ -64,8 +82,25 @@ class LoadNLFNode:
                 f"and place as models/nlf/nlf_l_multi_0.3.2.torchscript"
             )
 
+        _check_jit_script_function()
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = torch.jit.load(NLF_CKPT_PATH, map_location=device).eval()
+
+        # Warm up with profiling executor enabled — avoids the
+        # "vector::_M_range_check" JIT bug on first real call.
+        if torch.cuda.is_available():
+            dummy = torch.zeros(1, 3, 256, 256, device=device)
+            jit_prev = torch._C._jit_set_profiling_executor(True)
+            try:
+                with torch.inference_mode():
+                    for _ in range(2):
+                        _ = model.detect_smpl_batched(dummy)
+            except Exception as e:
+                _logger.warning("NLF warmup failed (continuing): %s", e)
+            finally:
+                torch._C._jit_set_profiling_executor(jit_prev)
+            _logger.info("NLF warmed up on %s", device)
 
         dtype_map = {
             "bfloat16": torch.bfloat16,
