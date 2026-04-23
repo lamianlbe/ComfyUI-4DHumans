@@ -92,6 +92,13 @@ def _load_model():
     return model
 
 
+_DTYPE_MAP = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
 class LoadPromptHMRNode:
     """
     Loads a PromptHMR model for 3D human mesh recovery.
@@ -113,13 +120,39 @@ class LoadPromptHMRNode:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}}
+        return {
+            "required": {
+                "dtype": (
+                    ["bfloat16", "float16", "float32"],
+                    {
+                        "default": "bfloat16",
+                        "tooltip": (
+                            "Model precision. bfloat16 recommended for "
+                            "modern GPUs (Ampere+/Blackwell): ~2x less VRAM, "
+                            "same numerical range as float32. float16 has "
+                            "faster matmul on some GPUs but risks overflow. "
+                            "float32 keeps the original precision."
+                        ),
+                    },
+                ),
+            },
+        }
 
     RETURN_TYPES = ("PROMPTHMR",)
     FUNCTION = "load"
     CATEGORY = "4dhumans"
 
-    def load(self):
+    def load(self, dtype="bfloat16"):
         _check_required_files()
         model = _load_model()
-        return ({"model": model, "img_size": 896},)
+
+        torch_dtype = _DTYPE_MAP.get(dtype, torch.bfloat16)
+        if torch_dtype != torch.float32:
+            model = model.to(torch_dtype)
+
+        return ({
+            "model": model,
+            "img_size": 896,
+            "dtype": dtype,
+            "torch_dtype": torch_dtype,
+        },)

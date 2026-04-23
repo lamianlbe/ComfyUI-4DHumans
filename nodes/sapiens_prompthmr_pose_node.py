@@ -93,6 +93,9 @@ class SapiensPromptHMRPoseNode:
 
         model = prompthmr["model"]
         img_size = prompthmr["img_size"]
+        # Use the dtype the model was loaded with.  If not set (legacy),
+        # default to float16 to match the previous autocast("cuda") behaviour.
+        phmr_dtype = prompthmr.get("torch_dtype", torch.float16)
 
         B, img_h, img_w, C = images.shape
         rgb = images[..., :3]  # (B, H, W, 3)
@@ -196,7 +199,7 @@ class SapiensPromptHMRPoseNode:
                 "text": None,
             }]
 
-            with torch.no_grad(), autocast("cuda"):
+            with torch.no_grad(), autocast("cuda", dtype=phmr_dtype):
                 batch = prepare_batch(inputs, img_size=img_size, interaction=False)
                 output = model(batch, use_mean_hands=True)[0]
 
