@@ -152,10 +152,13 @@ class SAM3ImageSegmentationNode:
 
         pbar = comfy.utils.ProgressBar(B + 1)
 
-        # Per-chunk frame count — tuned to cap peak VRAM at HD
-        # resolutions.  SAM3 image is per-frame independent, so any
-        # chunk size just trades VRAM for overhead.
-        CHUNK_SIZE = 128
+        # Per-chunk frame count.  SAM3's image backbone is a ViT-L with
+        # text encoder + segmentation head — each frame keeps a large
+        # activation footprint on GPU until the Results object is freed.
+        # On HD videos (720p+) even 64 frames can OOM a 96 GB card, so
+        # default conservatively.  SAM3 image is per-frame independent,
+        # so shrinking chunk size just trades VRAM for a bit of overhead.
+        CHUNK_SIZE = 16
 
         # ------------------------------------------------------------------
         # Per-frame detections
@@ -183,6 +186,8 @@ class SAM3ImageSegmentationNode:
                         break
 
                     if r.masks is None or r.boxes is None:
+                        # Drop the Results' GPU tensors before moving on
+                        del r
                         t += 1
                         pbar.update(1)
                         continue
@@ -211,6 +216,11 @@ class SAM3ImageSegmentationNode:
                             "score": float(scores_np[idx]),
                             "prompt_idx": int(classes_np[idx]),
                         })
+
+                    # Free GPU tensors held by this frame's Results
+                    # immediately; don't wait for the generator to yield
+                    # the next one (ultralytics may still reference it).
+                    del masks_data, scores, classes, r
 
                     t += 1
                     pbar.update(1)
