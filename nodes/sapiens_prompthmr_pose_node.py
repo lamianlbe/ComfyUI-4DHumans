@@ -34,6 +34,27 @@ def _cuda_sync():
         torch.cuda.synchronize()
 
 
+def _linear_interp_timeline(timeline):
+    """In-place fill None entries by linearly interpolating neighbours.
+
+    `timeline` is a list of np.ndarray or None. Gaps between valid
+    entries are filled with linear interpolation.  Leading/trailing
+    Nones are left as-is (no extrapolation).
+    """
+    n = len(timeline)
+    valid = [i for i, v in enumerate(timeline) if v is not None]
+    if len(valid) < 2:
+        return
+    for a, b in zip(valid[:-1], valid[1:]):
+        if b - a <= 1:
+            continue
+        va = timeline[a]
+        vb = timeline[b]
+        for i in range(a + 1, b):
+            alpha = (i - a) / (b - a)
+            timeline[i] = va * (1.0 - alpha) + vb * alpha
+
+
 def _mask_to_bbox_torch(mask_np):
     """Convert a binary mask (H, W) to a [x1, y1, x2, y2, score] bbox tensor."""
     ys, xs = np.where(mask_np > 0.5)
@@ -87,6 +108,22 @@ class SapiensPromptHMRPoseNode:
                         ),
                     },
                 ),
+                "prompthmr_fps": (
+                    "FLOAT",
+                    {
+                        "default": 15.0,
+                        "min": 1.0,
+                        "max": 120.0,
+                        "step": 0.5,
+                        "tooltip": (
+                            "Target sampling rate for PromptHMR (3D). "
+                            "Frames between samples are filled by linear "
+                            "interpolation. Lower = faster but slightly "
+                            "coarser 3D motion. Set equal to source fps "
+                            "to disable (run every frame)."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -96,7 +133,7 @@ class SapiensPromptHMRPoseNode:
     CATEGORY = "4dhumans"
 
     def estimate_pose(self, images, masks, prompthmr, sapiens, fps,
-                      batch_size=16):
+                      batch_size=16, prompthmr_fps=15.0):
         from .load_prompthmr_node import _ensure_lib_importable
         _ensure_lib_importable()
 
@@ -160,13 +197,26 @@ class SapiensPromptHMRPoseNode:
         phmr_time_s = 0.0
         sapiens_time_s = 0.0
 
+        # ----- Determine PromptHMR sampled frames (downsample + interp) -----
+        # Stride ≥ 1; if target >= source, stride=1 (no skipping).
+        if prompthmr_fps > 0 and prompthmr_fps < fps:
+            phmr_stride = max(1, int(round(float(fps) / float(prompthmr_fps))))
+        else:
+            phmr_stride = 1
+        phmr_sampled = set(range(0, B, phmr_stride))
+        # Always include the last frame so interpolation has an anchor at the
+        # end of the clip.
+        if B > 0:
+            phmr_sampled.add(B - 1)
+
         # ----- Phase 1a: Gather per-frame PromptHMR inputs + Sapiens crops -----
-        # phmr_frame_inputs[t] = None (no valid person) or
-        #   {"input": {...}, "person_indices": [...]}
+        # Sapiens crops are gathered on EVERY frame (2D stays at source fps).
+        # PromptHMR inputs are only gathered on sampled frames.
         phmr_frame_inputs = [None] * B
         for t in range(B):
             img_np = images_np[t]
             masks_frame_np = masks_np[t]
+            is_phmr_sampled = t in phmr_sampled
 
             bboxes_phmr = []
             masks_uint8 = []
@@ -181,15 +231,18 @@ class SapiensPromptHMRPoseNode:
                 x1, x2 = int(xs.min()), int(xs.max())
                 y1, y2 = int(ys.min()), int(ys.max())
 
-                bboxes_phmr.append(
-                    torch.tensor([[x1, y1, x2, y2, 1.0]], dtype=torch.float32)
-                )
-                masks_uint8.append(
-                    (mask_frame > 0.5).astype(np.uint8) * 255
-                )
-                person_indices.append(p_idx)
+                if is_phmr_sampled:
+                    bboxes_phmr.append(
+                        torch.tensor(
+                            [[x1, y1, x2, y2, 1.0]], dtype=torch.float32
+                        )
+                    )
+                    masks_uint8.append(
+                        (mask_frame > 0.5).astype(np.uint8) * 255
+                    )
+                    person_indices.append(p_idx)
 
-                # Sapiens crop for Pass 2
+                # Sapiens crop for Pass 2 (gathered every frame)
                 x1c = max(0, x1)
                 y1c = max(0, y1)
                 x2c = min(img_w, x2)
@@ -269,6 +322,29 @@ class SapiensPromptHMRPoseNode:
         for _ in range(skipped):
             pbar.update(1)
 
+        # ----- Phase 1c: Fill non-sampled frames by linear interpolation -----
+        # (only runs when prompthmr_fps < fps)
+        if phmr_stride > 1:
+            # Per-person 3D fields
+            for p_idx in range(n_persons):
+                person = persons[p_idx]
+                _linear_interp_timeline(person["body_joints2d"])
+                _linear_interp_timeline(person["body_joints"])
+                _linear_interp_timeline(person["smpl_j3d"])
+
+            # Global per-frame camera parameters (same for all persons)
+            _linear_interp_timeline(cam_int_per_frame)
+            # scale is a list of floats; wrap to arrays for interp, then unwrap
+            scale_arr = [
+                np.array([v], dtype=np.float64) if v is not None else None
+                for v in scale_per_frame
+            ]
+            _linear_interp_timeline(scale_arr)
+            scale_per_frame[:] = [
+                float(v[0]) if v is not None else None for v in scale_arr
+            ]
+            _linear_interp_timeline(offset_per_frame)
+
         # ----- Pass 2: Sapiens cross-frame batched inference -----
         if sap_requests:
             n_total = len(sap_requests)
@@ -320,12 +396,13 @@ class SapiensPromptHMRPoseNode:
 
         n_sap = len(sap_requests)
         n_phmr = len(valid_frames)
+        effective_phmr_fps = fps / phmr_stride
         _logger.info(
             "SapiensPromptHMR Human Pose: %d frames, %d persons, batch=%d | "
-            "PromptHMR %.2f s (%d frames, %.1f ms/frame) | "
+            "PromptHMR %.2f s (%d frames @ %.1f fps stride=%d, %.1f ms/frame) | "
             "Sapiens %.2f s (%d crops, %.1f ms/crop)",
             B, n_persons, batch_size,
-            phmr_time_s, n_phmr,
+            phmr_time_s, n_phmr, effective_phmr_fps, phmr_stride,
             1000.0 * phmr_time_s / max(1, n_phmr),
             sapiens_time_s, n_sap,
             1000.0 * sapiens_time_s / max(1, n_sap),
