@@ -144,11 +144,16 @@ class SAM3ImageSegmentationNode:
         if not prompts:
             prompts = ["person"]
 
-        # Convert to BCHW RGB float32 [0, 1]. Keep on CPU — we slice
-        # per chunk below. (Sending the whole tensor at once makes
-        # ultralytics pin ~B*H*W*12 bytes of VRAM up front, which OOMs
-        # on long HD videos even on 96 GB GPUs.)
-        source_cpu = images.permute(0, 3, 1, 2).contiguous().float()
+        # Convert to HWC BGR uint8 numpy on CPU.  We deliberately do
+        # NOT use torch tensor input:
+        #   - ultralytics' LoadTensor skips letterbox, sending raw
+        #     non-square tensors into SAM3's ViT backbone.
+        #   - SAM3's RoPE freqs_cis is precomputed for square
+        #     imgsz×imgsz input. Non-square trips a shape assert.
+        # Pass per-chunk numpy lists so ultralytics' normal
+        # LoadPilAndNumpy / preprocess path runs letterbox + normalise.
+        rgb_u8 = (images.clamp(0, 1) * 255).byte().cpu().numpy()  # (B, H, W, 3) RGB
+        frames_bgr = rgb_u8[..., ::-1].copy()                      # BGR for cv2/ultralytics convention
 
         pbar = comfy.utils.ProgressBar(B + 1)
 
@@ -173,14 +178,15 @@ class SAM3ImageSegmentationNode:
             t = 0
             for chunk_start in range(0, B, CHUNK_SIZE):
                 chunk_end = min(chunk_start + CHUNK_SIZE, B)
-                chunk = source_cpu[chunk_start:chunk_end]
+                # Pass a list of per-frame HWC BGR uint8 arrays so
+                # ultralytics uses LoadPilAndNumpy, which runs the
+                # full preprocess (letterbox to square imgsz + normalise).
+                chunk = [frames_bgr[i] for i in range(chunk_start, chunk_end)]
 
                 # SAM3 image predictor caches backbone features on the
                 # instance (`self.features`) and reuses them in-place
-                # across inference calls. With multi-chunk iteration
-                # this leaks chunk N's features into chunk N+1 and
-                # tripplies the RoPE shape assertion. Reset before
-                # each predictor() call.
+                # across inference calls. Reset between chunks so
+                # stale features don't leak forward.
                 if hasattr(predictor, "features"):
                     predictor.features = None
 
