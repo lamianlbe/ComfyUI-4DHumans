@@ -18,10 +18,23 @@ BMP's relative strengths based on our tests:
                     overlapping bodies
   * Speed:          ~200-500 ms / frame on Blackwell class GPUs
 
-This node loads the full 4-model stack (RTMDet-ins-L detector,
+This node loads the full three-model stack (RTMDet-ins-L detector,
 SAM 2.1 Hiera base+ for pose-prompted segmentation, PMPose-b for
-pose estimation, plus SAM 2.1's shared backbone) and returns a
-single dict downstream nodes consume.
+pose estimation) and returns a single dict downstream nodes consume.
+
+Weight paths (ComfyUI convention — place under ``models/bmp/``):
+
+    models/bmp/rtmdet-ins-l-mask.pth          ~200 MB
+    models/bmp/SAM-pose2seg_hiera_b+.pt       ~300 MB
+    models/bmp/PMPose-b-1.0.0.pth             ~350 MB
+
+Download from HuggingFace ``vrg-prague/BBoxMaskPose``:
+    https://huggingface.co/vrg-prague/BBoxMaskPose/tree/main
+
+If a weight is present locally we use it; if missing, we fall back to
+BMP's auto-download-from-HF behaviour (cached under ~/.cache/huggingface
+/hub/). You can mix: e.g. put the big detector locally to avoid re-fetch
+while letting the others auto-download.
 
 Prerequisites (pip installed into your ComfyUI env):
     - mmcv >= 2.2.0
@@ -31,16 +44,16 @@ Prerequisites (pip installed into your ComfyUI env):
     - bboxmaskpose  (pip install from github.com/MiraPurkrabek/BBoxMaskPose)
     - sam2 (Meta's SAM 2.1, pulled by BMP)
 
-Weights (auto-downloaded from HuggingFace on first use, cached under
-~/.cache/huggingface/hub/), no manual placement required. If offline,
-pre-populate the cache or set HF_HOME.
-
 License note: BMP is GPL-3.0. By loading this node, your ComfyUI
 graph inherits that license for any derived works distributed with
 BMP weights / inference results.
 """
 
 import logging
+import os
+import tempfile
+
+from folder_paths import models_dir
 
 _logger = logging.getLogger(__name__)
 
@@ -55,6 +68,78 @@ _PMPOSE_VARIANTS = [
     "PMPose-s", "PMPose-b", "PMPose-l", "PMPose-h",
     "MaskPose-s", "MaskPose-b", "MaskPose-l", "MaskPose-h",
 ]
+
+# ComfyUI models/ subdir where we expect BMP weights to live.
+BMP_MODELS_DIR = os.path.join(models_dir, "bmp")
+
+# Fixed weight filenames — these match the URL basenames from HF so
+# users can ``wget -O <dir>/<filename> <url>`` verbatim.
+RTMDET_FILENAME = "rtmdet-ins-l-mask.pth"
+SAM2_POSE2SEG_FILENAME = "SAM-pose2seg_hiera_b+.pt"
+
+# URLs used when the local file is absent. Mirror whatever BMP ships
+# in its configs/*.yaml.
+RTMDET_URL = (
+    "https://huggingface.co/vrg-prague/BBoxMaskPose/resolve/main/"
+    + RTMDET_FILENAME
+)
+SAM2_POSE2SEG_URL = (
+    # '+' must be URL-escaped as %2B when fetching over HTTP.
+    "https://huggingface.co/vrg-prague/BBoxMaskPose/resolve/main/"
+    "SAM-pose2seg_hiera_b%2B.pt"
+)
+
+
+def _pose_filename_from_variant(variant: str) -> str:
+    """Upstream version strings differ between PMPose (1.0.0) and
+    MaskPose (1.1.0). Keep them in sync with PRETRAINED_URLS in
+    pmpose/api.py.
+    """
+    if variant.startswith("PMPose-"):
+        return f"{variant}-1.0.0.pth"
+    if variant.startswith("MaskPose-"):
+        return f"{variant}-1.1.0.pth"
+    raise ValueError(f"Unknown pose variant: {variant}")
+
+
+def _resolve_local_or_url(local_path: str, fallback_url: str, what: str) -> str:
+    """Prefer ``local_path`` if it exists; otherwise return ``fallback_url``
+    so BMP / mmengine auto-downloads it. Log which one we pick."""
+    if os.path.isfile(local_path):
+        _logger.info("  %s: local  %s", what, local_path)
+        return local_path
+    _logger.info(
+        "  %s: missing locally (%s) → falling back to HF download  %s",
+        what, local_path, fallback_url,
+    )
+    return fallback_url
+
+
+def _write_patched_config(src_yaml_path: str,
+                          det_checkpoint: str,
+                          sam2_checkpoint: str) -> str:
+    """Read BMP's packaged config YAML, swap the detector + SAM2
+    checkpoint paths for the ones we picked (local file or URL), write
+    the result to a temp YAML file, return its path.
+
+    We don't touch the ``pose_estimator`` section because our load flow
+    constructs PMPose ourselves and injects it via ``pose_model=``, so
+    BBoxMaskPose.__init__ skips its own pose_checkpoint lookup entirely.
+    """
+    import yaml
+
+    with open(src_yaml_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    cfg["detector"]["det_checkpoint"] = det_checkpoint
+    cfg["sam2"]["sam2_checkpoint"] = sam2_checkpoint
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", prefix="bmp_cfg_", delete=False,
+    )
+    yaml.safe_dump(cfg, tmp)
+    tmp.close()
+    return tmp.name
 
 
 class LoadBMPNode:
@@ -123,6 +208,7 @@ class LoadBMPNode:
         try:
             from bboxmaskpose import BBoxMaskPose
             from pmpose import PMPose
+            from pmpose.api import PRETRAINED_URLS as _PMPOSE_URLS
         except ImportError as e:
             raise ImportError(
                 "BBoxMaskPose is not installed in this Python env. "
@@ -143,28 +229,88 @@ class LoadBMPNode:
                 "False — falling back to CPU (BMP will be unusably slow)."
             )
 
+        # ----------------------------------------------------------------
+        # Resolve weights: prefer ``models/bmp/*`` locally, else HF URL.
+        # ----------------------------------------------------------------
         _logger.info(
             "Loading BMP stack: config=%s pose_variant=%s device=%s",
             config, pose_variant, device_str,
         )
+        _logger.info("Resolving BMP weights (local > HF URL):")
 
-        # Step 1: PMPose. Construct explicitly so the user-chosen variant
-        # takes effect; if we pass pose_model=None, BBoxMaskPose builds
-        # the variant baked into the YAML config instead.
-        pose_model = PMPose(
-            device=device_str,
-            variant=pose_variant,
-            from_pretrained=True,
+        det_ckpt = _resolve_local_or_url(
+            os.path.join(BMP_MODELS_DIR, RTMDET_FILENAME),
+            RTMDET_URL,
+            "RTMDet-ins-L     ",
+        )
+        sam2_ckpt = _resolve_local_or_url(
+            os.path.join(BMP_MODELS_DIR, SAM2_POSE2SEG_FILENAME),
+            SAM2_POSE2SEG_URL,
+            "SAM-pose2seg     ",
+        )
+        pose_filename = _pose_filename_from_variant(pose_variant)
+        pose_ckpt = _resolve_local_or_url(
+            os.path.join(BMP_MODELS_DIR, pose_filename),
+            _PMPOSE_URLS[pose_variant],
+            f"{pose_variant:17s}",
         )
 
-        # Step 2: BBoxMaskPose wires RTMDet + SAM 2.1 + PMPose together
-        # and loads all three onto `device_str`. First call will fetch
-        # ~1.5-2 GB of HF weights if not cached.
-        bmp_model = BBoxMaskPose(
-            config=config,
-            device=device_str,
-            pose_model=pose_model,
+        # ----------------------------------------------------------------
+        # Step 1: PMPose. We route the resolved path through PMPose's own
+        # URL registry — its constructor then passes it straight to
+        # mmpose's init_pose_estimator, which accepts both URLs and local
+        # paths. Using the registry means we don't need a separate
+        # "pretrained=False then load_from_file" two-phase load.
+        # ----------------------------------------------------------------
+        _original_pmpose_url = _PMPOSE_URLS.get(pose_variant)
+        _PMPOSE_URLS[pose_variant] = pose_ckpt
+        try:
+            pose_model = PMPose(
+                device=device_str,
+                variant=pose_variant,
+                from_pretrained=True,
+            )
+        finally:
+            # Restore the registry so a second LoadBMP call with a
+            # different resolution doesn't see a stale override.
+            if _original_pmpose_url is not None:
+                _PMPOSE_URLS[pose_variant] = _original_pmpose_url
+
+        # ----------------------------------------------------------------
+        # Step 2: Patch BMP's YAML config with our resolved detector +
+        # SAM2 paths, then build BBoxMaskPose off the patched file.
+        # ----------------------------------------------------------------
+        # Locate the source YAML inside the installed BMP package.
+        import bboxmaskpose
+        bmp_pkg_root = os.path.dirname(bboxmaskpose.__file__)
+        src_yaml = os.path.join(bmp_pkg_root, "configs", f"{config}.yaml")
+        if not os.path.isfile(src_yaml):
+            raise FileNotFoundError(
+                f"BMP config not found at {src_yaml}. Is bboxmaskpose "
+                f"installed correctly?"
+            )
+
+        patched_yaml = _write_patched_config(
+            src_yaml_path=src_yaml,
+            det_checkpoint=det_ckpt,
+            sam2_checkpoint=sam2_ckpt,
         )
+        _logger.info("BMP config patched → %s", patched_yaml)
+
+        try:
+            bmp_model = BBoxMaskPose(
+                config=config,                 # informational (logged)
+                config_path=patched_yaml,      # what actually drives load
+                device=device_str,
+                pose_model=pose_model,         # our already-loaded PMPose
+            )
+        finally:
+            # We can delete the temp config now — BBoxMaskPose has
+            # finished parsing it.
+            try:
+                os.unlink(patched_yaml)
+            except OSError:
+                pass
 
         _logger.info(
             "BMP ready. Run BMPInstanceSegmentation downstream to do "
@@ -177,4 +323,7 @@ class LoadBMPNode:
             "device":        device_str,
             "config":        config,
             "pose_variant":  pose_variant,
+            "det_ckpt":      det_ckpt,
+            "sam2_ckpt":     sam2_ckpt,
+            "pose_ckpt":     pose_ckpt,
         },)
