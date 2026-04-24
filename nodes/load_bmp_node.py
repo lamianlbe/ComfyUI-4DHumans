@@ -58,6 +58,37 @@ from folder_paths import models_dir
 _logger = logging.getLogger(__name__)
 
 
+# PMPose's pip package ships pmpose/api.py but NOT the mmpose config
+# files that its DEFAULT_CONFIGS points at — those live in the BMP
+# repo's mmpose fork under ``mmpose/configs/{ProbMaskPose,MaskPose}/``
+# and aren't part of the ``pmpose`` wheel. So an out-of-the-box
+# ``PMPose(variant=...)`` call crashes with FileNotFoundError trying
+# to open ``.../site-packages/mmpose/configs/ProbMaskPose/PMPose-b-1.0.0.py``.
+#
+# We vendor the full config set (~160 KB: 13 variant .py files + the
+# shared ``_base_/default_runtime.py``) into bmp_configs/ next to this
+# package, and pass the resolved path explicitly via
+# ``PMPose(config_path=...)`` to override the broken default lookup.
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BMP_CONFIGS_ROOT = os.path.join(REPO_ROOT, "bmp_configs")
+
+# Variant → relative path inside bmp_configs/. Mirrors pmpose.api's
+# DEFAULT_CONFIGS table but with our vendored prefix.
+_PMPOSE_CONFIG_RELPATH = {
+    # PMPose (full w/ presence + visibility heads, v1.0.0)
+    "PMPose-s":       "ProbMaskPose/PMPose-s-1.0.0.py",
+    "PMPose-b":       "ProbMaskPose/PMPose-b-1.0.0.py",
+    "PMPose-l":       "ProbMaskPose/PMPose-l-1.0.0.py",
+    "PMPose-h":       "ProbMaskPose/PMPose-h-1.0.0.py",
+    # MaskPose (predecessor, v1.1.0 for size variants)
+    "MaskPose-s":     "MaskPose/MaskPose-s-1.1.0.py",
+    "MaskPose-b":     "MaskPose/MaskPose-b-1.1.0.py",
+    "MaskPose-l":     "MaskPose/MaskPose-l-1.1.0.py",
+    "MaskPose-h":     "MaskPose/MaskPose-h-1.1.0.py",
+}
+
+
 # BMP config aliases shipped in bboxmaskpose/configs/. Each trades off
 # how aggressively SAM2 is prompted (num_pos_keypoints) vs recall.
 _BMP_CONFIGS = ["bmp_v2", "bmp_D3", "bmp_J1"]
@@ -256,12 +287,38 @@ class LoadBMPNode:
         )
 
         # ----------------------------------------------------------------
-        # Step 1: PMPose. We route the resolved path through PMPose's own
-        # URL registry — its constructor then passes it straight to
-        # mmpose's init_pose_estimator, which accepts both URLs and local
-        # paths. Using the registry means we don't need a separate
-        # "pretrained=False then load_from_file" two-phase load.
+        # Step 1: PMPose. Two overrides layered on top of the stock
+        # constructor, both needed because the pip package is shipped
+        # without some of the assets upstream's default paths reference.
+        #
+        #   a) config_path=<our vendored .py> — the pmpose wheel ships
+        #      api.py but not the mmpose config files; api's
+        #      DEFAULT_CONFIGS still points at a nonexistent path under
+        #      site-packages/mmpose/configs/. We vendor the 13 variant
+        #      configs + _base_/default_runtime.py ourselves and feed
+        #      the resolved path in directly.
+        #
+        #   b) PRETRAINED_URLS[variant] = <local .pth or HF url> —
+        #      flows into init_pose_estimator as the checkpoint path.
+        #      We restore the registry afterwards so a second LoadBMP
+        #      with different resolution sees clean state.
         # ----------------------------------------------------------------
+        variant_relpath = _PMPOSE_CONFIG_RELPATH.get(pose_variant)
+        if variant_relpath is None:
+            raise ValueError(
+                f"Unknown pose variant '{pose_variant}'. "
+                f"Known: {list(_PMPOSE_CONFIG_RELPATH)}"
+            )
+        pose_config_path = os.path.join(BMP_CONFIGS_ROOT, variant_relpath)
+        if not os.path.isfile(pose_config_path):
+            raise FileNotFoundError(
+                f"Vendored PMPose config missing: {pose_config_path}\n"
+                f"This file should ship with the ComfyUI-4DHumans repo "
+                f"under bmp_configs/. Reinstall/pull the repo, or copy "
+                f"from BBoxMaskPose/mmpose/configs/ manually."
+            )
+        _logger.info("  PMPose config   : vendored  %s", pose_config_path)
+
         _original_pmpose_url = _PMPOSE_URLS.get(pose_variant)
         _PMPOSE_URLS[pose_variant] = pose_ckpt
         try:
@@ -269,6 +326,7 @@ class LoadBMPNode:
                 device=device_str,
                 variant=pose_variant,
                 from_pretrained=True,
+                config_path=pose_config_path,   # override broken default
             )
         finally:
             # Restore the registry so a second LoadBMP call with a
