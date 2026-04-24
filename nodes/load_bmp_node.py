@@ -147,23 +147,26 @@ def _resolve_local_or_url(local_path: str, fallback_url: str, what: str) -> str:
 
 
 def _write_patched_config(src_yaml_path: str,
+                          det_config_abs: str,
                           det_checkpoint: str,
                           sam2_checkpoint: str,
                           sam2_config_abs: str) -> str:
-    """Read BMP's packaged config YAML, swap the detector + SAM2
-    checkpoint paths + SAM2 config path for the ones we picked, write
-    the result to a temp YAML file, return its path.
+    """Read BMP's packaged config YAML, swap the detector config +
+    detector checkpoint + SAM2 config + SAM2 checkpoint paths for the
+    ones we picked, write the result to a temp YAML file, return its
+    path.
 
     We don't touch the ``pose_estimator`` section because our load flow
     constructs PMPose ourselves and injects it via ``pose_model=``, so
     BBoxMaskPose.__init__ skips its own pose_checkpoint lookup entirely.
 
-    The ``sam2_config_abs`` swap-in uses an absolute path. BBoxMaskPose
-    resolves sam2_config via
+    The ``*_abs`` swap-ins use absolute paths. BBoxMaskPose passes
+    ``det_config`` STRAIGHT to ``init_detector`` (so an absolute path
+    just works) and resolves ``sam2_config`` via
     ``os.path.join(BMP_ROOT, "bboxmaskpose", "sam2", sam2_config)`` —
     Python's os.path.join discards the prefix when the second arg is
-    absolute, so feeding an absolute path bypasses the broken lookup
-    into site-packages/bboxmaskpose/sam2/configs/ (which is missing in
+    absolute, so feeding absolute paths bypasses the broken lookups
+    into site-packages (which is missing the YAML/PY data files in
     the pip install).
     """
     import yaml
@@ -171,6 +174,7 @@ def _write_patched_config(src_yaml_path: str,
     with open(src_yaml_path, "r") as f:
         cfg = yaml.safe_load(f)
 
+    cfg["detector"]["det_config"] = det_config_abs
     cfg["detector"]["det_checkpoint"] = det_checkpoint
     cfg["sam2"]["sam2_checkpoint"] = sam2_checkpoint
     cfg["sam2"]["sam2_config"] = sam2_config_abs
@@ -190,6 +194,9 @@ _BMP_TO_SAM2_CONFIG = {
     "bmp_D3": "samurai/sam2.1_hiera_b+.yaml",
     "bmp_J1": "samurai/sam2.1_hiera_b+.yaml",
 }
+
+# All three BMP configs point at the same RTMDet-ins-L detector config.
+_BMP_DET_CONFIG = "mmdet/rtmdet/rtmdet-ins_l_8xb32-300e_coco.py"
 
 
 class LoadBMPNode:
@@ -372,7 +379,7 @@ class LoadBMPNode:
                 f"BBoxMaskPose/bboxmaskpose/configs/ manually."
             )
 
-        # Resolve SAM2 config (also vendored) to an absolute path so
+        # Resolve SAM2 config (vendored) to an absolute path so
         # BBoxMaskPose's internal os.path.join-under-site-packages
         # lookup gets bypassed.
         sam2_config_rel = _BMP_TO_SAM2_CONFIG.get(config)
@@ -391,8 +398,22 @@ class LoadBMPNode:
             )
         _logger.info("  SAM2 config     : vendored  %s", sam2_config_abs)
 
+        # Resolve RTMDet detector config (also vendored). Its `_base_`
+        # chain (rtmdet_l_8xb32-300e_coco.py, rtmdet_tta.py, plus 3
+        # _base_/ entries) is shipped alongside — mmengine resolves
+        # `_base_` relative to the config file's dir, so as long as
+        # we preserve the layout the chain walks our vendor tree.
+        det_config_abs = os.path.join(BMP_CONFIGS_ROOT, _BMP_DET_CONFIG)
+        if not os.path.isfile(det_config_abs):
+            raise FileNotFoundError(
+                f"Vendored RTMDet config missing: {det_config_abs}\n"
+                f"Should ship with the repo under bmp_configs/mmdet/."
+            )
+        _logger.info("  RTMDet config   : vendored  %s", det_config_abs)
+
         patched_yaml = _write_patched_config(
             src_yaml_path=src_yaml,
+            det_config_abs=det_config_abs,
             det_checkpoint=det_ckpt,
             sam2_checkpoint=sam2_ckpt,
             sam2_config_abs=sam2_config_abs,
