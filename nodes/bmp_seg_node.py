@@ -160,24 +160,31 @@ class _BMPReplayModel:
 # Debug overlay: extend the shared mask overlay with skeletons
 # --------------------------------------------------------------------------
 
-def _draw_skeletons_on_overlay(overlay_float, per_frame_keypoints, per_frame_tids,
+def _draw_skeletons_on_overlay(overlay_float, per_frame_tids_with_slot,
                                 H, W, conf_thresh=0.3):
     """Draw COCO-17 skeletons on top of the color-coded mask overlay.
 
-    Uses the same color palette as build_debug_overlay (via track slot
-    index) so a person's mask color matches their skeleton color.
-    Modifies a copy of ``overlay_float`` and returns it.
+    Parameters
+    ----------
+    overlay_float : torch.Tensor
+        (B, H, W, 3) float in [0, 1], the mask overlay output from
+        build_debug_overlay that we draw skeletons on top of.
+    per_frame_tids_with_slot : list[B] of list[tuple]
+        per-frame list of ``(tid, slot, kpts_17x3)`` triples. The slot
+        index is looked up from ``id_to_slot`` so the skeleton color
+        matches the mask color for the same track.
+
+    Uses the same palette as build_debug_overlay so a person's mask
+    color matches their skeleton color. Returns a new tensor; input
+    is not modified.
     """
     import cv2
     from ._mask_utils import _DEBUG_PALETTE_RGB
 
-    # The palette is keyed by slot (stable across frames via id_to_slot),
-    # but what we have per-frame is (tid, kpts) — so the caller passes
-    # tid→slot as per_frame_tids[t] = list of (tid, slot, kpts_17x3).
     arr = (overlay_float.detach().cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
     arr = np.ascontiguousarray(arr)
 
-    for t, frame_entries in enumerate(per_frame_tids):
+    for t, frame_entries in enumerate(per_frame_tids_with_slot):
         frame = arr[t]
         for tid, slot, kpts in frame_entries:
             color = _DEBUG_PALETTE_RGB[slot % len(_DEBUG_PALETTE_RGB)]
@@ -524,7 +531,7 @@ class BMPInstanceSegmentationNode:
                 for t in range(B)
             ]
             overlay_out = _draw_skeletons_on_overlay(
-                overlay_out, per_frame_tids_with_slot, None, H, W,
+                overlay_out, per_frame_tids_with_slot, H, W,
             )
         else:
             overlay_out = images
