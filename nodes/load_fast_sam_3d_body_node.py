@@ -124,25 +124,42 @@ class LoadFastSAM3DBodyNode:
         ensure_lib_importable()
 
         # 3. Build the SAM 3D Body model + MHR predictor
+        # Vendored upstream uses bare print() for load + warmup telemetry;
+        # silence those so the ComfyUI console stays readable.
+        import contextlib as _ctxlib
+        import os as _os
+        import sys as _sys
+
+        @_ctxlib.contextmanager
+        def _quiet():
+            old = _os.dup(1)
+            dn = _os.open(_os.devnull, _os.O_WRONLY)
+            try:
+                _sys.stdout.flush(); _os.dup2(dn, 1)
+                yield
+            finally:
+                _sys.stdout.flush(); _os.dup2(old, 1); _os.close(dn); _os.close(old)
+
         from sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         _logger.info("Loading SAM 3D Body from %s ...", SAM3D_CKPT)
-        model, model_cfg = load_sam_3d_body(
-            checkpoint_path=SAM3D_CKPT,
-            device=device,
-            mhr_path=SAM3D_MHR_PATH,
-        )
+        with _quiet():
+            model, model_cfg = load_sam_3d_body(
+                checkpoint_path=SAM3D_CKPT,
+                device=device,
+                mhr_path=SAM3D_MHR_PATH,
+            )
 
-        # Estimator runs detection/SAM2/FOV internally — we pass everything
-        # external (bboxes, masks, yolo keypoints), so don't wire those up.
-        estimator = SAM3DBodyEstimator(
-            sam_3d_body_model=model,
-            model_cfg=model_cfg,
-            human_detector=None,
-            human_segmentor=None,
-            fov_estimator=None,
-        )
+            # Estimator runs detection/SAM2/FOV internally — we pass everything
+            # external (bboxes, masks, yolo keypoints), so don't wire those up.
+            estimator = SAM3DBodyEstimator(
+                sam_3d_body_model=model,
+                model_cfg=model_cfg,
+                human_detector=None,
+                human_segmentor=None,
+                fov_estimator=None,
+            )
 
         # 4. Build MHR2SMPL mapper
         from infer_multiview import MHR2SMPLMultiView
@@ -151,13 +168,14 @@ class LoadFastSAM3DBodyNode:
             "Loading MHR2SMPL (smoother=%s)",
             "on" if use_smoother else "off",
         )
-        mhr2smpl = MHR2SMPLMultiView(
-            model_path=MHR2SMPL_CKPT,
-            mapping_path=MHR2SMPL_MAPPING,
-            sample_idx_path=MHR2SMPL_SAMPLE_IDX,
-            device=str(device),
-            smoother_dir=smoother_dir,
-        )
+        with _quiet():
+            mhr2smpl = MHR2SMPLMultiView(
+                model_path=MHR2SMPL_CKPT,
+                mapping_path=MHR2SMPL_MAPPING,
+                sample_idx_path=MHR2SMPL_SAMPLE_IDX,
+                device=str(device),
+                smoother_dir=smoother_dir,
+            )
 
         dtype_map = {
             "float32": torch.float32,

@@ -17,7 +17,11 @@ Camera params per frame:
   scale=1.0, offset=(0, 0)   (no padding applied)
 """
 
+import contextlib
+import io
 import logging
+import os
+import sys
 import time
 from typing import List, Optional
 
@@ -27,6 +31,30 @@ import torch
 from ..fastsam3dbody_lib import ensure_lib_importable
 
 _logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _suppress_stdout():
+    """Redirect both Python-level stdout and C-level fd-1 writes.
+
+    Fast SAM 3D Body's internal timing uses bare `print(...)` calls
+    *and* direct C-level writes (e.g. from TorchScript / CUDA kernels),
+    so only redirecting `sys.stdout` isn't enough on its own.  We
+    double-wrap: a Python-level redirect handles `print`, and a dup2
+    on fd-1 handles anything that bypasses the io module.
+    """
+    old_stdout_fd = os.dup(1)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        sys.stdout.flush()
+        os.dup2(devnull_fd, 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(old_stdout_fd, 1)
+        os.close(devnull_fd)
+        os.close(old_stdout_fd)
 
 
 # =============================================================================
@@ -413,17 +441,18 @@ def run_fastsam3db_video(
             torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-        outputs = estimator.process_one_image(
-            img=img_rgb,
-            bboxes=mbboxes_np,
-            masks=masks_arr,
-            cam_int=None,   # use default focal = sqrt(H^2 + W^2)
-            bbox_thr=0.0,
-            nms_thr=0.3,
-            use_mask=masks_arr is not None,
-            inference_type="full",
-            hand_box_source="body_decoder",
-        )
+        with _suppress_stdout():
+            outputs = estimator.process_one_image(
+                img=img_rgb,
+                bboxes=mbboxes_np,
+                masks=masks_arr,
+                cam_int=None,   # use default focal = sqrt(H^2 + W^2)
+                bbox_thr=0.0,
+                nms_thr=0.3,
+                use_mask=masks_arr is not None,
+                inference_type="full",
+                hand_box_source="body_decoder",
+            )
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
