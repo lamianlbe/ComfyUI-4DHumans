@@ -18,7 +18,7 @@ import logging
 import os
 
 import numpy as np
-from ._mask_utils import pack_mask, unpack_mask
+from ._mask_utils import build_debug_overlay, pack_mask, unpack_mask
 import torch
 
 import comfy.utils
@@ -216,15 +216,31 @@ class SAM3VideoSegmentationNode:
                         ),
                     },
                 ),
+                "debug_overlay": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Output a second IMAGE where each tracked "
+                            "object's mask is color-coded and alpha-"
+                            "blended onto the original frames, with a "
+                            "matching bbox outline + tid text label. "
+                            "Off by default (adds a CPU pass per "
+                            "frame). When off, the debug_overlay "
+                            "output is just the input images passed "
+                            "through unchanged."
+                        ),
+                    },
+                ),
             },
         }
 
-    RETURN_TYPES = ("MASK",)
-    RETURN_NAMES = ("masks",)
+    RETURN_TYPES = ("MASK", "IMAGE")
+    RETURN_NAMES = ("masks", "debug_overlay")
     FUNCTION = "segment"
     CATEGORY = "4dhumans"
 
-    def segment(self, images, sam3, text_prompt):
+    def segment(self, images, sam3, text_prompt, debug_overlay=False):
         predictor = sam3["predictor"]
 
         # images: (B, H, W, 3) float [0, 1]
@@ -333,7 +349,9 @@ class SAM3VideoSegmentationNode:
                 "Returning single empty mask per frame.",
                 prompts,
             )
-            return (torch.zeros(B, H, W),)
+            # Pass-through for the debug output so downstream graph
+            # wiring stays valid when nothing is detected.
+            return (torch.zeros(B, H, W), images)
 
         # Map track IDs → contiguous slot indices (0, 1, 2, ...)
         sorted_ids = sorted(all_track_ids)
@@ -352,6 +370,22 @@ class SAM3VideoSegmentationNode:
                     mask_bool.astype(np.float32)
                 )
 
+        # Build the colored-mask overlay before dropping per_frame.
+        # When the toggle is off, pass the input images through so the
+        # output signature stays consistent for downstream wiring.
+        if debug_overlay:
+            per_frame_items = [
+                list(per_frame[t].items()) for t in range(B)
+            ]
+            overlay_out, legend = build_debug_overlay(
+                images=images,
+                per_frame_items=per_frame_items,
+                H=H, W=W,
+            )
+            _logger.info("SAM3 video debug overlay legend: %s", legend)
+        else:
+            overlay_out = images
+
         del per_frame
 
         _logger.info(
@@ -360,4 +394,4 @@ class SAM3VideoSegmentationNode:
             B, len(prompts), n_persons, tuple(masks_out.shape),
         )
 
-        return (masks_out,)
+        return (masks_out, overlay_out)
