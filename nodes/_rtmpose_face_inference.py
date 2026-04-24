@@ -230,6 +230,7 @@ def run_rtmpose_face_video(
     img_w: int,
     batch_size: int = 16,
     pbar=None,
+    debug_dump_path: str | None = None,     # if set, save raw 106-pt output
 ):
     """Run RTMPose-Face on every visible (frame, person) slot and return
     per-person face-68 timelines.
@@ -271,6 +272,12 @@ def run_rtmpose_face_video(
     import time as _time
     t_start = _time.perf_counter()
 
+    # Optional debug: collect raw 106-pt output from the first frame of
+    # each person so we can manually calibrate the LaPa106 → 300W68 map.
+    debug_dump = None
+    if debug_dump_path is not None:
+        debug_dump = {"bboxes": [], "kpts_106": [], "frame_idx": [], "person_idx": []}
+
     # Process in batches
     for chunk_start in range(0, len(requests), batch_size):
         chunk = requests[chunk_start:chunk_start + batch_size]
@@ -304,6 +311,16 @@ def run_rtmpose_face_video(
 
         kpts_orig = _unmap_to_original(kpts_model, inv_params_batch)
 
+        # Debug dump: save raw 106 points + bbox for the first frame of
+        # each person so the user can help calibrate the LaPa→300W map.
+        if debug_dump is not None:
+            for i, (p_idx, t, bbox) in enumerate(chunk):
+                if t == 0 or (p_idx not in debug_dump["person_idx"]):
+                    debug_dump["bboxes"].append(np.array(bbox, dtype=np.float32))
+                    debug_dump["kpts_106"].append(kpts_orig[i].astype(np.float32))
+                    debug_dump["frame_idx"].append(int(t))
+                    debug_dump["person_idx"].append(int(p_idx))
+
         # Map 106 → 68 and scatter back
         K = kpts_orig.shape[1]
         if K != 106:
@@ -317,10 +334,35 @@ def run_rtmpose_face_video(
         else:
             kpts_68 = kpts_orig[:, _LAPA106_TO_300W68]  # (N, 68, 3)
             for i, (p_idx, t, _bbox) in enumerate(chunk):
-                face_kp_68_timeline[p_idx][t] = kpts_68[i].astype(np.float32)
+                # Post-process: the RTMPose-Face SimCC decoder occasionally
+                # outputs a bilateral-mirrored jaw contour on symmetric
+                # face points. Detect via jaw endpoint ordering and flip
+                # back. This eliminates the 30-85 px per-frame jitter on
+                # COCO-WB indices 23..39 we observed when face was not
+                # rotating between frames.
+                f68 = kpts_68[i].astype(np.float32)
+                # 300W jaw: 17 points from image-left ear to image-right ear.
+                # In a non-flipped, upright face: jaw[0].x < jaw[16].x.
+                if f68[0, 0] > f68[16, 0]:
+                    f68[0:17] = f68[0:17][::-1]
+                face_kp_68_timeline[p_idx][t] = f68
 
         if pbar is not None:
             for _ in range(len(chunk)):
                 pbar.update(1)
+
+    # Persist raw debug dump if requested
+    if debug_dump is not None and debug_dump["kpts_106"]:
+        np.savez(
+            debug_dump_path,
+            bboxes=np.stack(debug_dump["bboxes"]),
+            kpts_106=np.stack(debug_dump["kpts_106"]),
+            frame_idx=np.array(debug_dump["frame_idx"], dtype=np.int32),
+            person_idx=np.array(debug_dump["person_idx"], dtype=np.int32),
+        )
+        _logger.info(
+            "RTMPose-Face raw 106-pt debug dump saved to %s  (%d entries)",
+            debug_dump_path, len(debug_dump["kpts_106"]),
+        )
 
     return face_kp_68_timeline, _time.perf_counter() - t_start

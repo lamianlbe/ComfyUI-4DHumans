@@ -18,6 +18,7 @@ Phases:
 """
 
 import logging
+import os
 import time
 from typing import Optional
 
@@ -114,9 +115,18 @@ class FastSAM3DBodyRTMFacePoseNode:
             },
             "optional": {
                 "yolo11_pose": ("YOLO11POSE",),
-                # Currently used only for logging/validation — Step 4
-                # defers the yolo_pose keypoint injection patch to Step
-                # 5 refinement.  Wiring it in here doesn't hurt.
+                "debug_dump_rtmface_106": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Save raw 106-pt RTMPose-Face output for the "
+                            "first frame of each person to "
+                            "output/rtmface_106_debug.npz so the "
+                            "LaPa106 → 300W68 map can be calibrated."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -126,7 +136,8 @@ class FastSAM3DBodyRTMFacePoseNode:
     CATEGORY = "4dhumans"
 
     def estimate_pose(self, images, masks, fast_sam_3d_body, rtmpose_face,
-                      fps, batch_size=16, pose_fps=15.0, yolo11_pose=None):
+                      fps, batch_size=16, pose_fps=15.0, yolo11_pose=None,
+                      debug_dump_rtmface_106=False):
         # ---------------------------------------------------------------
         # Phase 0: input validation + reshape
         # ---------------------------------------------------------------
@@ -276,6 +287,14 @@ class FastSAM3DBodyRTMFacePoseNode:
         # ---------------------------------------------------------------
         # Phase 5: RTMPose-Face for face 68 landmarks
         # ---------------------------------------------------------------
+        debug_path = None
+        if debug_dump_rtmface_106:
+            import folder_paths
+            debug_path = os.path.join(
+                folder_paths.get_output_directory(),
+                "rtmface_106_debug.npz",
+            )
+
         face_kp_68_timeline, rtmface_time = run_rtmpose_face_video(
             images_np_u8=images_np_u8,
             persons_coco_body_feet_timeline=coco_wb_body_feet_timeline,
@@ -284,6 +303,7 @@ class FastSAM3DBodyRTMFacePoseNode:
             img_w=img_w,
             batch_size=batch_size,
             pbar=pbar,
+            debug_dump_path=debug_path,
         )
 
         # Fill face slice 23..90 into the 133-layout
