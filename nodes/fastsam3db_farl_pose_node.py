@@ -1,18 +1,23 @@
 """
-FastSAM3DBodyFaRLPose node — Fast SAM 3D Body + FaRL face + (optional)
-YOLO11m-Pose.
+FastSAM3DBodyFaRLPose node — Fast SAM 3D Body + RetinaFace + FaRL face
++ (optional) YOLO11m-Pose.
 
 Output is a POSES dict fully compatible with the existing NPZ format
 so downstream nodes (Pose Editor, Save/Load, Renderer, NLF converter)
 work unchanged.
 
-FaRL (pyfacer, MIT) replaces the previous RTMPose-Face stack. RTMPose
-had a reproducible bimodal-heatmap bug where SimCC argmax flipped
-between the true peak and its bilateral mirror on nearly-identical
-consecutive frames. FaRL's ViT backbone + 448 px input is
-structurally robust against this, and it outputs 68 landmarks in
-the 300W/iBUG convention — a direct match for COCO-WholeBody
-indices 23..90 with zero remapping.
+Face stack (pyfacer, MIT) replaces the previous RTMPose-Face:
+
+  * RetinaFace MobileNet-0.25 runs per-frame to produce real 5-point
+    face landmarks (any pose, any roll — no synthesis from MHR head
+    kps, which only worked for frontal/upright).
+  * FaRL ViT-B consumes those 5 points, computes a similarity
+    alignment to a canonical 448 px template, and regresses 68
+    landmarks in the standard 300W/iBUG convention — a direct match
+    for COCO-WholeBody indices 23..90 with zero remapping.
+  * Detected faces are assigned to tracked persons by testing the
+    face bbox center against each person's segmentation mask (greedy,
+    score-sorted) so per-person identities stay stable across frames.
 
 Phases:
   Phase 0: input validation + reshaping (masks, images)
@@ -20,7 +25,7 @@ Phases:
   Phase 2: Fast SAM 3D Body + MHR2SMPL (per-person sequential smoother)
   Phase 3: linear interpolation of skipped frames (pose_fps < fps)
   Phase 4: assemble COCO-WB body+feet+hands from MHR
-  Phase 5: FaRL derives face bboxes from MHR head kps and fills COCO-WB 23..90
+  Phase 5: RetinaFace + FaRL fill COCO-WB face slots 23..90 per person
   Phase 6: store keypoints_raw snapshot for Pose Editor's non-destructive edits
   Phase 7: pack the POSES dict
 """
@@ -239,9 +244,6 @@ class FastSAM3DBodyFaRLPoseNode:
         # ---------------------------------------------------------------
         # Phase 4: assemble COCO-WB body + feet + hands from MHR
         # ---------------------------------------------------------------
-        coco_wb_body_feet_timeline = [
-            [None] * B for _ in range(n_persons)
-        ]
         persons_coco_wb_133 = [
             [None] * B for _ in range(n_persons)
         ]
@@ -264,15 +266,20 @@ class FastSAM3DBodyFaRLPoseNode:
                 coco_wb[91:112] = lhand             # 91..111 left hand
                 coco_wb[112:133] = rhand            # 112..132 right hand
                 persons_coco_wb_133[p_idx][t] = coco_wb
-                coco_wb_body_feet_timeline[p_idx][t] = body_feet
 
         # ---------------------------------------------------------------
-        # Phase 5: FaRL for 68 face landmarks (COCO-WB 23..90)
+        # Phase 5: RetinaFace + FaRL for 68 face landmarks (COCO-WB 23..90)
+        #
+        # RetinaFace detects faces per frame (any pose/roll), and each
+        # face is matched to a tracked person by testing the face bbox
+        # center against that person's mask. FaRL then regresses the 68
+        # iBUG landmarks from the matched 5-point detections.
         # ---------------------------------------------------------------
         face_kp_68_timeline, farl_time = run_farl_face_video(
             images_np_u8=images_np_u8,
-            persons_coco_body_feet_timeline=coco_wb_body_feet_timeline,
+            masks_np=masks_np,
             farl_face_dict=farl_face,
+            n_persons=n_persons,
             img_h=img_h,
             img_w=img_w,
             frame_batch_size=face_frame_batch_size,
@@ -325,7 +332,7 @@ class FastSAM3DBodyFaRLPoseNode:
             "pose_fps=%.1f stride=%d | "
             "FastSAM3DBody %.2fs (%d sampled frames) | "
             "MHR2SMPL %.2fs | "
-            "FaRL %.2fs | total %.2fs",
+            "RetinaFace+FaRL %.2fs | total %.2fs",
             B, n_persons, pose_fps, phmr_stride,
             fastsam3db_time, n_sampled,
             mhr2smpl_time,
