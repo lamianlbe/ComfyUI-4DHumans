@@ -129,6 +129,78 @@ _IMG_MEAN = np.array([123.675, 116.28, 103.53], dtype=np.float32)
 _IMG_STD  = np.array([58.395, 57.12, 57.375], dtype=np.float32)
 
 
+# =============================================================================
+# LaPa-106 side prior for SimCC decoding
+#
+# Diagnosis: on nearly identical input frames (1-2 px shift), ONNX outputs
+# jaw[0]/jaw[32] (and other symmetric landmarks) at the bilaterally MIRRORED
+# position on roughly half the frames. The raw ONNX output is deterministic
+# on identical input (verified via diagnose_rtmpose_face_determinism.py
+# scenario 1), so this is the model itself producing a bimodal SimCC
+# heatmap — one peak at the true location and a ghost at its mirror — for
+# symmetric landmarks. Numeric noise from a 1-2 px input shift tips argmax
+# from the true peak to the ghost.
+#
+# Fix: each LaPa landmark has a well-defined LEFT/CENTER/RIGHT position on
+# the face in a frontal crop. Since our face bbox is square and centered
+# on the head keypoints, the face center sits at x=128 in the 256×256
+# model input, i.e. SimCC bin 256 out of 512. For LEFT landmarks we
+# argmax over simcc_x[:, :256]; for RIGHT we argmax over simcc_x[:, 256:];
+# for CENTER we keep the global argmax. The mirror peak is thus
+# unreachable for side-constrained landmarks.
+#
+# Classification derived from the actual predicted positions of a
+# known-good frame (f0 in rtmface_106_debug.npz) — see the debug analysis
+# in commit message for the decision per index. Near-center landmarks
+# (|x - face_cx| <= 3 px) are marked CENTER.
+# =============================================================================
+
+# -1 = LEFT half, 0 = center (no restriction), +1 = RIGHT half
+_LAPA_SIDE = np.zeros(106, dtype=np.int8)
+
+# Jaw contour: 0..15 left, 16 chin-bottom (center), 17..32 right
+_LAPA_SIDE[0:16]  = -1
+_LAPA_SIDE[16]    = 0
+_LAPA_SIDE[17:33] = +1
+
+# Eyebrows: left 33..41, right 42..50
+_LAPA_SIDE[33:42] = -1
+_LAPA_SIDE[42:51] = +1
+
+# Nose bridge 51..54 sits on the vertical centerline
+_LAPA_SIDE[51:55] = 0
+
+# Nose bottom 55..65: alternating L/R layout around centre idx 60 and 61
+_LAPA_SIDE[55] = -1; _LAPA_SIDE[56] = +1; _LAPA_SIDE[57] = -1
+_LAPA_SIDE[58] = +1; _LAPA_SIDE[59] = -1; _LAPA_SIDE[60] = 0
+_LAPA_SIDE[61] = 0   # within ±3 of centre on f0, keep unrestricted
+_LAPA_SIDE[62] = -1; _LAPA_SIDE[63] = +1; _LAPA_SIDE[64] = -1
+_LAPA_SIDE[65] = +1
+
+# Left eye 66..74
+_LAPA_SIDE[66:75] = -1
+# Right eye 75..83
+_LAPA_SIDE[75:84] = +1
+
+# Outer lip 84..95
+_LAPA_SIDE[84:87] = -1  # top-left → top-centre-left
+_LAPA_SIDE[87]    = 0   # top centre
+_LAPA_SIDE[88:91] = +1  # top-centre-right → top-right
+_LAPA_SIDE[91:93] = +1  # bottom-right
+_LAPA_SIDE[93]    = 0   # bottom centre
+_LAPA_SIDE[94:96] = -1  # bottom-left
+
+# Inner lip 96..103 + eye pupils 104..105
+_LAPA_SIDE[96:98]   = -1  # 96, 97 inner top-left
+_LAPA_SIDE[98]      = 0
+_LAPA_SIDE[99:101]  = +1  # 99, 100 inner top-right
+_LAPA_SIDE[101]     = +1  # NOTE: LaPa pair [101, 103] has 101 on RIGHT
+_LAPA_SIDE[102]     = 0   # bottom centre
+_LAPA_SIDE[103]     = -1  # inner bottom-left
+_LAPA_SIDE[104]     = -1  # left pupil
+_LAPA_SIDE[105]     = +1  # right pupil
+
+
 def _get_face_bbox_from_coco_wb_head(
     coco_wb_body_feet: np.ndarray,  # (23, 3) or (23, 2)
     img_h: int,
@@ -222,18 +294,42 @@ def _affine_preproc(
 
 def _decode_simcc(simcc_x: np.ndarray, simcc_y: np.ndarray,
                   simcc_split: float = 2.0) -> np.ndarray:
-    """Decode RTMPose's SimCC output to (N, K, 3): (x, y, score).
+    """Decode RTMPose's SimCC output to (N, K, 3): (x, y, score) using the
+    per-landmark LEFT / CENTER / RIGHT side prior in ``_LAPA_SIDE``.
 
-    simcc_x : (N, K, W_x) = (N, K, in_w * simcc_split)
+    simcc_x : (N, K, W_x) = (N, K, in_w * simcc_split)   -- 512 bins for 256 px
     simcc_y : (N, K, W_y) = (N, K, in_h * simcc_split)
+
+    For LEFT/RIGHT landmarks we argmax over the correct half of simcc_x
+    only, which makes the mirror peak unreachable. Y axis is never
+    constrained — bimodal ghosts are horizontal, not vertical.
 
     Returns model-space pixel coords in [0, in_size) and confidence.
     """
     N, K, Wx = simcc_x.shape
     _, _, Wy = simcc_y.shape
-    x_idx = simcc_x.argmax(axis=-1)  # (N, K)
+    cx_sim = Wx // 2  # 256 for Wx=512 (face horizontal centre in SimCC space)
+
+    # Default: global argmax for all keypoints (fallback / CENTER landmarks)
+    x_idx = simcc_x.argmax(axis=-1).astype(np.int64)  # (N, K)
+    x_score = simcc_x.max(axis=-1).astype(simcc_x.dtype)
+
+    if K == _LAPA_SIDE.size:
+        # Override LEFT landmarks: argmax restricted to [0, cx_sim)
+        left_k = np.where(_LAPA_SIDE == -1)[0]
+        if len(left_k) > 0:
+            left_slice = simcc_x[:, left_k, :cx_sim]  # (N, K_L, cx_sim)
+            x_idx[:, left_k] = left_slice.argmax(axis=-1)
+            x_score[:, left_k] = left_slice.max(axis=-1)
+        # Override RIGHT landmarks: argmax restricted to [cx_sim, Wx)
+        right_k = np.where(_LAPA_SIDE == +1)[0]
+        if len(right_k) > 0:
+            right_slice = simcc_x[:, right_k, cx_sim:]  # (N, K_R, Wx-cx_sim)
+            x_idx[:, right_k] = right_slice.argmax(axis=-1) + cx_sim
+            x_score[:, right_k] = right_slice.max(axis=-1)
+        # CENTER landmarks (_LAPA_SIDE == 0) keep the global argmax above.
+
     y_idx = simcc_y.argmax(axis=-1)
-    x_score = simcc_x.max(axis=-1)
     y_score = simcc_y.max(axis=-1)
     # Min of x/y scores — matches MMPose's decoder convention
     conf = np.minimum(x_score, y_score)
@@ -406,18 +502,10 @@ def run_rtmpose_face_video(
         else:
             kpts_68 = kpts_orig[:, _LAPA106_TO_300W68]  # (N, 68, 3)
             for i, (p_idx, t, _bbox) in enumerate(chunk):
-                # Post-process: the RTMPose-Face SimCC decoder occasionally
-                # outputs a bilateral-mirrored jaw contour on symmetric
-                # face points. Detect via jaw endpoint ordering and flip
-                # back. This eliminates the 30-85 px per-frame jitter on
-                # COCO-WB indices 23..39 we observed when face was not
-                # rotating between frames.
-                f68 = kpts_68[i].astype(np.float32)
-                # 300W jaw: 17 points from image-left ear to image-right ear.
-                # In a non-flipped, upright face: jaw[0].x < jaw[16].x.
-                if f68[0, 0] > f68[16, 0]:
-                    f68[0:17] = f68[0:17][::-1]
-                face_kp_68_timeline[p_idx][t] = f68
+                # The side-prior SimCC decoder (_decode_simcc) already
+                # prevents the bilateral-mirror ambiguity per landmark,
+                # so no post-flip correction is needed here.
+                face_kp_68_timeline[p_idx][t] = kpts_68[i].astype(np.float32)
 
         if pbar is not None:
             for _ in range(len(chunk)):
