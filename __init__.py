@@ -26,8 +26,8 @@ from .nodes.pose_editor_node import PoseEditorNode
 from .nodes.wan_animate_face_preprocess_node import WanAnimateFacePreprocessNode
 from .nodes.load_fast_sam_3d_body_node import LoadFastSAM3DBodyNode
 from .nodes.load_yolo11_pose_node import LoadYOLO11PoseNode
-from .nodes.load_rtmpose_face_node import LoadRTMPoseFaceNode
-from .nodes.fastsam3db_rtmface_pose_node import FastSAM3DBodyRTMFacePoseNode
+from .nodes.load_farl_face_node import LoadFaRLFaceNode
+from .nodes.fastsam3db_farl_pose_node import FastSAM3DBodyFaRLPoseNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -50,8 +50,8 @@ NODE_CLASS_MAPPINGS = {
     'WanAnimateFacePreprocess': WanAnimateFacePreprocessNode,
     'LoadFastSAM3DBody': LoadFastSAM3DBodyNode,
     'LoadYOLO11Pose': LoadYOLO11PoseNode,
-    'LoadRTMPoseFace': LoadRTMPoseFaceNode,
-    'FastSAM3DBodyRTMFacePose': FastSAM3DBodyRTMFacePoseNode,
+    'LoadFaRLFace': LoadFaRLFaceNode,
+    'FastSAM3DBodyFaRLPose': FastSAM3DBodyFaRLPoseNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -74,6 +74,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'WanAnimateFacePreprocess': 'Wan Animate Face Preprocess',
     'LoadFastSAM3DBody': 'Load Fast SAM 3D Body',
     'LoadYOLO11Pose': 'Load YOLO11m-Pose',
-    'LoadRTMPoseFace': 'Load RTMPose-Face',
-    'FastSAM3DBodyRTMFacePose': 'Fast SAM 3D Body + RTMPose-Face Pose',
+    'LoadFaRLFace': 'Load FaRL Face',
+    'FastSAM3DBodyFaRLPose': 'Fast SAM 3D Body + FaRL Face Pose',
 }

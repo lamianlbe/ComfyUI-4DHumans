@@ -397,7 +397,7 @@ def run_fastsam3db_video(
                   {"body_joints2d": [None|(25,2)] * B,
                    "body_joints":   [None|(25,3)] * B,
                    "smpl_j3d":      [None|(24,3)] * B,
-                   "mhr_kp2d":      [None|(70,2)] * B,  (used by RTMFace bbox derivation)
+                   "mhr_kp2d":      [None|(70,2)] * B,  (used by FaRL bbox derivation)
                    "mhr_vertices":  [None|(18439,3)] * B  (kept in memory; not saved)
                    "mhr_cam_t":     [None|(3,)] * B,
                    }

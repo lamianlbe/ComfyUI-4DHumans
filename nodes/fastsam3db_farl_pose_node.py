@@ -1,10 +1,18 @@
 """
-FastSAM3DBodyRTMFacePose node — new pipeline using Fast SAM 3D Body
-+ RTMPose-Face + (optional) YOLO11m-Pose.
+FastSAM3DBodyFaRLPose node — Fast SAM 3D Body + FaRL face + (optional)
+YOLO11m-Pose.
 
 Output is a POSES dict fully compatible with the existing NPZ format
 so downstream nodes (Pose Editor, Save/Load, Renderer, NLF converter)
 work unchanged.
+
+FaRL (pyfacer, MIT) replaces the previous RTMPose-Face stack. RTMPose
+had a reproducible bimodal-heatmap bug where SimCC argmax flipped
+between the true peak and its bilateral mirror on nearly-identical
+consecutive frames. FaRL's ViT backbone + 448 px input is
+structurally robust against this, and it outputs 68 landmarks in
+the 300W/iBUG convention — a direct match for COCO-WholeBody
+indices 23..90 with zero remapping.
 
 Phases:
   Phase 0: input validation + reshaping (masks, images)
@@ -12,15 +20,12 @@ Phases:
   Phase 2: Fast SAM 3D Body + MHR2SMPL (per-person sequential smoother)
   Phase 3: linear interpolation of skipped frames (pose_fps < fps)
   Phase 4: assemble COCO-WB body+feet+hands from MHR
-  Phase 5: RTMPose-Face derives face bboxes and fills COCO-WB 23..90
+  Phase 5: FaRL derives face bboxes from MHR head kps and fills COCO-WB 23..90
   Phase 6: store keypoints_raw snapshot for Pose Editor's non-destructive edits
   Phase 7: pack the POSES dict
 """
 
 import logging
-import os
-import time
-from typing import Optional
 
 import numpy as np
 import torch
@@ -31,21 +36,15 @@ from ._fastsam3db_inference import (
     run_fastsam3db_video,
     mhr70_to_coco_wb_body_feet_hands,
 )
-from ._rtmpose_face_inference import run_rtmpose_face_video
+from ._farl_face_inference import run_farl_face_video
 
 _logger = logging.getLogger(__name__)
-
-
-def _cuda_sync():
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
 
 
 def _linear_interp_timeline(timeline):
     """In-place fill None entries by linearly interpolating between
     the nearest non-None neighbours.  Mirrors the helper already used
     in sapiens_prompthmr_pose_node.py."""
-    n = len(timeline)
     valid = [i for i, v in enumerate(timeline) if v is not None]
     if len(valid) < 2:
         return
@@ -59,8 +58,8 @@ def _linear_interp_timeline(timeline):
             timeline[i] = va * (1.0 - alpha) + vb * alpha
 
 
-class FastSAM3DBodyRTMFacePoseNode:
-    """Fast SAM 3D Body + RTMPose-Face pose estimator.
+class FastSAM3DBodyFaRLPoseNode:
+    """Fast SAM 3D Body + FaRL face pose estimator.
 
     Emits the same POSES dict as SapiensPromptHMRPose but using a
     different backbone stack.  Downstream nodes (Renderer, Editor,
@@ -74,7 +73,7 @@ class FastSAM3DBodyRTMFacePoseNode:
                 "images": ("IMAGE",),
                 "masks": ("MASK",),
                 "fast_sam_3d_body": ("FASTSAM3DBODY",),
-                "rtmpose_face": ("RTMPOSEFACE",),
+                "farl_face": ("FARLFACE",),
                 "fps": (
                     "FLOAT",
                     {
@@ -85,16 +84,18 @@ class FastSAM3DBodyRTMFacePoseNode:
                         "tooltip": "Source video FPS.",
                     },
                 ),
-                "batch_size": (
+                "face_frame_batch_size": (
                     "INT",
                     {
-                        "default": 16,
+                        "default": 32,
                         "min": 1,
                         "max": 256,
                         "step": 1,
                         "tooltip": (
-                            "RTMPose-Face batch size. Larger = faster on "
-                            "large GPUs; reduce if OOM."
+                            "How many frames to feed FaRL per batch. "
+                            "Larger = faster but more GPU memory. "
+                            "32 is a reasonable default for 512×960 "
+                            "frames on a 24 GB GPU."
                         ),
                     },
                 ),
@@ -108,25 +109,13 @@ class FastSAM3DBodyRTMFacePoseNode:
                         "tooltip": (
                             "Target FPS for Fast SAM 3D Body inference. "
                             "Intermediate frames are linearly interpolated. "
-                            "RTMPose-Face always runs per-frame."
+                            "FaRL always runs per-frame."
                         ),
                     },
                 ),
             },
             "optional": {
                 "yolo11_pose": ("YOLO11POSE",),
-                "debug_dump_rtmface_106": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": (
-                            "Save raw 106-pt RTMPose-Face output for the "
-                            "first frame of each person to "
-                            "output/rtmface_106_debug.npz so the "
-                            "LaPa106 → 300W68 map can be calibrated."
-                        ),
-                    },
-                ),
             },
         }
 
@@ -135,9 +124,9 @@ class FastSAM3DBodyRTMFacePoseNode:
     FUNCTION = "estimate_pose"
     CATEGORY = "4dhumans"
 
-    def estimate_pose(self, images, masks, fast_sam_3d_body, rtmpose_face,
-                      fps, batch_size=16, pose_fps=15.0, yolo11_pose=None,
-                      debug_dump_rtmface_106=False):
+    def estimate_pose(self, images, masks, fast_sam_3d_body, farl_face,
+                      fps, face_frame_batch_size=32, pose_fps=15.0,
+                      yolo11_pose=None):
         # ---------------------------------------------------------------
         # Phase 0: input validation + reshape
         # ---------------------------------------------------------------
@@ -149,7 +138,7 @@ class FastSAM3DBodyRTMFacePoseNode:
         M = masks.shape[0]
         if M % B != 0:
             raise ValueError(
-                f"FastSAM3DBody+RTMFace Pose: mask count ({M}) must be a "
+                f"FastSAM3DBody+FaRL Pose: mask count ({M}) must be a "
                 f"multiple of frame count ({B})."
             )
         n_persons = M // B
@@ -158,7 +147,8 @@ class FastSAM3DBodyRTMFacePoseNode:
         images_np_u8 = (rgb.clamp(0, 1) * 255).byte().cpu().numpy()
 
         _logger.info(
-            "FastSAM3DBody+RTMFace: %d frames, %d persons, %dx%d, pose_fps=%.1f (src %.1f)",
+            "FastSAM3DBody+FaRL: %d frames, %d persons, %dx%d, "
+            "pose_fps=%.1f (src %.1f)",
             B, n_persons, img_w, img_h, pose_fps, fps,
         )
 
@@ -180,8 +170,6 @@ class FastSAM3DBodyRTMFacePoseNode:
 
         for t in range(B):
             if t not in sampled_frames:
-                # Still record person slots even though we'll skip; this
-                # keeps the list shape invariant.
                 continue
             for p_idx in range(n_persons):
                 mask_frame = masks_np[t, p_idx]
@@ -199,7 +187,6 @@ class FastSAM3DBodyRTMFacePoseNode:
                 mask_bboxes_per_frame[t].append((x1, y1, x2, y2))
                 person_indices_per_frame[t].append(p_idx)
 
-        # Total work for progress bar: Fast SAM 3D Body frames + face frames
         n_sampled = len(sampled_frames)
         pbar = comfy.utils.ProgressBar(B * 2)
 
@@ -218,13 +205,11 @@ class FastSAM3DBodyRTMFacePoseNode:
             img_w=img_w,
             pbar=pbar,
         )
-        persons_fs = result["persons"]          # list[dict], per-person timelines
-        cam_int_per_frame = result["cam_int"]   # list of (3,3) or None
+        persons_fs = result["persons"]
+        cam_int_per_frame = result["cam_int"]
         fastsam3db_time = result["fastsam3db_time_s"]
         mhr2smpl_time = result["mhr2smpl_time_s"]
 
-        # Scale/offset are always identity for Fast SAM 3D Body (no
-        # padding preprocessing was applied externally).
         scale_per_frame = [1.0 if cam_int_per_frame[t] is not None else None
                            for t in range(B)]
         offset_per_frame = [np.zeros(2, dtype=np.float64)
@@ -254,8 +239,6 @@ class FastSAM3DBodyRTMFacePoseNode:
         # ---------------------------------------------------------------
         # Phase 4: assemble COCO-WB body + feet + hands from MHR
         # ---------------------------------------------------------------
-        # Each person gets a (133, 3) keypoints timeline, face region
-        # (23..90) stays zero for now — RTMPose-Face will fill it.
         coco_wb_body_feet_timeline = [
             [None] * B for _ in range(n_persons)
         ]
@@ -267,7 +250,6 @@ class FastSAM3DBodyRTMFacePoseNode:
                 mhr_kp2d = persons_fs[p_idx]["mhr_kp2d"][t]
                 if mhr_kp2d is None:
                     continue
-                # Upgrade to (70, 3) if needed (MHR outputs 2D only)
                 if mhr_kp2d.shape[-1] == 2:
                     kp2d = np.concatenate(
                         [mhr_kp2d, np.ones((mhr_kp2d.shape[0], 1), dtype=np.float32)],
@@ -285,25 +267,16 @@ class FastSAM3DBodyRTMFacePoseNode:
                 coco_wb_body_feet_timeline[p_idx][t] = body_feet
 
         # ---------------------------------------------------------------
-        # Phase 5: RTMPose-Face for face 68 landmarks
+        # Phase 5: FaRL for 68 face landmarks (COCO-WB 23..90)
         # ---------------------------------------------------------------
-        debug_path = None
-        if debug_dump_rtmface_106:
-            import folder_paths
-            debug_path = os.path.join(
-                folder_paths.get_output_directory(),
-                "rtmface_106_debug.npz",
-            )
-
-        face_kp_68_timeline, rtmface_time = run_rtmpose_face_video(
+        face_kp_68_timeline, farl_time = run_farl_face_video(
             images_np_u8=images_np_u8,
             persons_coco_body_feet_timeline=coco_wb_body_feet_timeline,
-            rtmpose_face_dict=rtmpose_face,
+            farl_face_dict=farl_face,
             img_h=img_h,
             img_w=img_w,
-            batch_size=batch_size,
+            frame_batch_size=face_frame_batch_size,
             pbar=pbar,
-            debug_dump_path=debug_path,
         )
 
         # Fill face slice 23..90 into the 133-layout
@@ -313,7 +286,7 @@ class FastSAM3DBodyRTMFacePoseNode:
                 kp133 = persons_coco_wb_133[p_idx][t]
                 if face68 is None or kp133 is None:
                     continue
-                kp133[23:91] = face68  # 68 face keypoints
+                kp133[23:91] = face68  # 68 face keypoints in 300W order
 
         # ---------------------------------------------------------------
         # Phase 6: assemble POSES "persons" list (with keypoints_raw snapshot)
@@ -346,17 +319,17 @@ class FastSAM3DBodyRTMFacePoseNode:
             "offset": offset_per_frame,
         }
 
-        total = fastsam3db_time + mhr2smpl_time + rtmface_time
+        total = fastsam3db_time + mhr2smpl_time + farl_time
         _logger.info(
-            "FastSAM3DBody+RTMFace Pose: %d frames, %d persons, "
+            "FastSAM3DBody+FaRL Pose: %d frames, %d persons, "
             "pose_fps=%.1f stride=%d | "
             "FastSAM3DBody %.2fs (%d sampled frames) | "
             "MHR2SMPL %.2fs | "
-            "RTMFace %.2fs | total %.2fs",
+            "FaRL %.2fs | total %.2fs",
             B, n_persons, pose_fps, phmr_stride,
             fastsam3db_time, n_sampled,
             mhr2smpl_time,
-            rtmface_time, total,
+            farl_time, total,
         )
 
         return (poses,)

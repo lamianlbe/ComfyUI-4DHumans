@@ -65,7 +65,7 @@ def _require(path, what):
 class LoadFastSAM3DBodyNode:
     """Load the SAM 3D Body estimator plus MHR2SMPL mapper.
 
-    Outputs a dict ready to be consumed by FastSAM3DBodyRTMFacePose.
+    Outputs a dict ready to be consumed by FastSAM3DBodyFaRLPose.
     """
 
     @classmethod
