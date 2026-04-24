@@ -205,7 +205,11 @@ def _affine_preproc(
     # Normalise
     f = padded.astype(np.float32)
     f = (f - _IMG_MEAN) / _IMG_STD
-    chw = f.transpose(2, 0, 1)  # (3, out, out)
+    # IMPORTANT: np.transpose returns a NON-contiguous view. onnxruntime
+    # usually handles that fine, but we have seen MMPose RTMPose face
+    # ONNX return garbled output on non-first frames unless the input
+    # is C-contiguous. Force a copy so every frame's input is clean.
+    chw = np.ascontiguousarray(f.transpose(2, 0, 1))  # (3, out, out)
     # Back-projection parameters
     inv_params = np.array([
         (x2 - x1) / new_w,   # sx: model x -> crop x
@@ -342,8 +346,8 @@ def run_rtmpose_face_video(
             chw, inv = _affine_preproc(images_np_u8[t], bbox, out_size=256)
             tensors.append(chw)
             inv_params_list.append(inv)
-        batch = np.stack(tensors, axis=0)      # (N, 3, 256, 256)
-        inv_params_batch = np.stack(inv_params_list, axis=0)  # (N, 4)
+        batch = np.ascontiguousarray(np.stack(tensors, axis=0))   # (N, 3, 256, 256)
+        inv_params_batch = np.stack(inv_params_list, axis=0)       # (N, 4)
 
         # ONNX forward — expects (N, 3, 256, 256) float32
         outputs = session.run(output_names, {input_name: batch})
@@ -366,15 +370,14 @@ def run_rtmpose_face_video(
 
         kpts_orig = _unmap_to_original(kpts_model, inv_params_batch)
 
-        # Debug dump: save raw 106 points + bbox for the first frame of
-        # each person so the user can help calibrate the LaPa→300W map.
+        # Debug dump: save raw 106 points + bbox for EVERY (person, frame)
+        # pair so we can diagnose frame-to-frame stability issues.
         if debug_dump is not None:
             for i, (p_idx, t, bbox) in enumerate(chunk):
-                if t == 0 or (p_idx not in debug_dump["person_idx"]):
-                    debug_dump["bboxes"].append(np.array(bbox, dtype=np.float32))
-                    debug_dump["kpts_106"].append(kpts_orig[i].astype(np.float32))
-                    debug_dump["frame_idx"].append(int(t))
-                    debug_dump["person_idx"].append(int(p_idx))
+                debug_dump["bboxes"].append(np.array(bbox, dtype=np.float32))
+                debug_dump["kpts_106"].append(kpts_orig[i].astype(np.float32))
+                debug_dump["frame_idx"].append(int(t))
+                debug_dump["person_idx"].append(int(p_idx))
 
         # Map 106 → 68 and scatter back
         K = kpts_orig.shape[1]
