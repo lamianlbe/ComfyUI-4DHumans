@@ -28,12 +28,15 @@ from ._mask_utils import build_debug_overlay, pack_mask, unpack_mask
 _logger = logging.getLogger(__name__)
 
 
-def _coco_decode_rle_np(encoded_rle, h, w):
-    """Decode a CrowdSAM RLE into an (H, W) bool numpy array.
+def _coco_decode_rle_np(encoded_rle):
+    """Decode a single CrowdSAM RLE into a ``(H_enc, W_enc)`` bool ndarray.
 
-    CrowdSAM returns ``{'counts': str, 'size': [h, w]}`` — the utf-8
-    counts string comes from pycocotools' ``encode``, so we use
-    ``pycocotools.mask.decode`` to get back a ``(H, W)`` uint8 array.
+    CrowdSAM stores RLEs as ``{'counts': str, 'size': [h, w]}`` using
+    pycocotools' utf-8-string compression. The decoded shape is the
+    **SAM-preprocessed** resolution (long side resized to
+    ``model.max_size`` = 1024 by default), NOT the original frame
+    size — the caller must resize/pad to the original coords via
+    ``uncrop_masks`` using the ``rles_info`` metadata.
     """
     from pycocotools import mask as _cocomask  # noqa
 
@@ -44,10 +47,81 @@ def _coco_decode_rle_np(encoded_rle, h, w):
         "size": encoded_rle["size"],
     }
     m = _cocomask.decode(rle).astype(bool)
-    # pycocotools can return shape (H, W) or (H, W, 1); collapse.
     if m.ndim == 3:
         m = m[..., 0]
     return m
+
+
+def _decode_and_uncrop_masks(rles, rles_info, target_h, target_w):
+    """Decode CrowdSAM's list of RLEs and lift them to the original
+    image canvas.
+
+    CrowdSAM's pipeline: resize frame to ``max_size`` → SAM at that
+    resolution → encode RLE at SAM-preproc resolution → append
+    ``rles_info = [crop_box, [orig_h, orig_w]]`` once. So all RLEs in
+    a single ``generate()`` call share the same crop + orig dims.
+
+    Returns
+    -------
+    list[np.ndarray]
+        Per-detection ``(target_h, target_w)`` bool arrays, ready to
+        be bit-packed. Uses CrowdSAM's own ``uncrop_masks`` so
+        behaviour matches their visualize_result() reference pipeline.
+    """
+    import torch as _torch
+    from crowdsam.utils import uncrop_masks
+
+    if not rles:
+        return []
+
+    # All RLEs should share the same encoded shape (the SAM-preproc
+    # resolution after resize_image + letterbox). Stack them.
+    decoded = [_coco_decode_rle_np(r) for r in rles]
+    shapes = {m.shape for m in decoded}
+    if len(shapes) > 1:
+        # Shouldn't happen in practice, but guard so a bad RLE can't
+        # break the whole frame. Fall through to per-mask handling.
+        out = []
+        for m in decoded:
+            t = _torch.from_numpy(m).unsqueeze(0)   # (1, h, w)
+            if rles_info is not None:
+                cb, oh_ow = rles_info[0], rles_info[1]
+                t = uncrop_masks(t, list(cb), int(oh_ow[0]), int(oh_ow[1]))
+            arr = t[0].cpu().numpy().astype(bool)
+            if arr.shape != (target_h, target_w):
+                continue
+            out.append(arr)
+        return out
+
+    stacked = np.stack(decoded, axis=0)                     # (N, h, w) bool
+    t_stacked = _torch.from_numpy(stacked)                  # (N, h, w)
+
+    if rles_info is None:
+        # No uncrop info — assume already at original size. Resize only
+        # as a last resort to keep shapes sane.
+        if stacked.shape[1:] != (target_h, target_w):
+            import torch.nn.functional as _F
+            t_stacked = _F.interpolate(
+                t_stacked.unsqueeze(0).float(),
+                size=(target_h, target_w),
+                mode="nearest",
+            )[0].bool()
+    else:
+        crop_box, orig_hw = rles_info[0], rles_info[1]
+        orig_h, orig_w = int(orig_hw[0]), int(orig_hw[1])
+        t_stacked = uncrop_masks(t_stacked, list(crop_box), orig_h, orig_w)
+        if (orig_h, orig_w) != (target_h, target_w):
+            # Caller's target differs from model's orig dims — shouldn't
+            # normally happen. Resize to target for safety.
+            import torch.nn.functional as _F
+            t_stacked = _F.interpolate(
+                t_stacked.unsqueeze(0).float(),
+                size=(target_h, target_w),
+                mode="nearest",
+            )[0].bool()
+
+    arr = t_stacked.cpu().numpy().astype(bool)
+    return [arr[i] for i in range(arr.shape[0])]
 
 
 def _iou_packed(a_packed: np.ndarray, b_packed: np.ndarray) -> float:
@@ -162,36 +236,48 @@ class CrowdSAMInstanceSegmentationNode:
             # flatten to a plain dict so the defaults below work even when
             # upstream didn't populate a key at all.
             result_dict = {k: v for k, v in result.items()}
-            boxes  = np.asarray(result_dict.get("boxes",  np.zeros((0, 4))), dtype=np.float32)
-            scores = np.asarray(result_dict.get("scores", np.zeros((0,))),   dtype=np.float32)
-            rles   = list(result_dict.get("rles", []))
+            boxes     = np.asarray(result_dict.get("boxes",  np.zeros((0, 4))), dtype=np.float32)
+            scores    = np.asarray(result_dict.get("scores", np.zeros((0,))),   dtype=np.float32)
+            rles      = list(result_dict.get("rles", []))
+            rles_info = result_dict.get("rles_info", None)
 
             if not logged_shape and len(rles) > 0:
+                enc_size = rles[0].get("size", None) if isinstance(rles[0], dict) else None
                 _logger.info(
                     "CrowdSAM first-frame output: %d detections before "
-                    "score filter (score range %.2f..%.2f)",
+                    "score filter (score range %.2f..%.2f), RLE "
+                    "encoded at %s, image (%d, %d)",
                     len(rles),
                     float(scores.min()) if scores.size > 0 else 0.0,
                     float(scores.max()) if scores.size > 0 else 0.0,
+                    enc_size, H, W,
                 )
                 logged_shape = True
 
-            # Filter by score threshold before decoding masks (saves
-            # time since RLE decode is non-trivial for big masks).
+            # Filter by score threshold before decoding masks — RLE
+            # decode + uncrop is the expensive step, don't do it for
+            # detections that won't survive anyway.
             keep = scores >= float(score_threshold)
             if not keep.any():
                 pbar.update(1)
                 continue
 
-            kept_rles   = [rles[i]   for i in np.where(keep)[0]]
+            kept_rles   = [rles[i] for i in np.where(keep)[0]]
             kept_scores = scores[keep]
             kept_boxes  = boxes[keep] if boxes.shape[0] == len(rles) else None
 
-            for i, rle in enumerate(kept_rles):
-                mask_bool = _coco_decode_rle_np(rle, H, W)
+            # Decode + lift to original image coords in one shot.
+            masks_bool = _decode_and_uncrop_masks(kept_rles, rles_info, H, W)
+            if len(masks_bool) != len(kept_rles):
+                _logger.warning(
+                    "CrowdSAM frame %d: %d of %d masks dropped by "
+                    "decode/uncrop (target size (%d, %d))",
+                    t, len(kept_rles) - len(masks_bool),
+                    len(kept_rles), H, W,
+                )
+
+            for i, mask_bool in enumerate(masks_bool):
                 if mask_bool.shape != (H, W):
-                    # CrowdSAM should return masks at the original image
-                    # size, but guard against config mismatches.
                     continue
                 per_frame_detections[t].append({
                     "mask_packed": pack_mask(mask_bool),
