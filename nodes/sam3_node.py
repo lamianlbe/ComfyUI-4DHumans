@@ -79,8 +79,15 @@ class TensorVideoLoader:
             raise StopIteration
         im0 = self.frames_bgr[self.count]   # (H, W, 3) BGR uint8
         path = self.paths[self.count]
-        self.frame = self.count
         self.count += 1
+        # Match ultralytics' LoadImagesAndVideos convention: self.frame is
+        # 1-based AT YIELD TIME (they do `self.frame += 1` before yielding).
+        # SAM3 predictor.py does `frame_idx = self.dataset.frame - 1` to
+        # arrive at a 0-based index, so feeding 0-based here makes
+        # frame_idx=-1 on the first yield — which Python happily wraps to
+        # the last list slot, silently writing the first-frame prompt to
+        # the wrong position.
+        self.frame = self.count
         return [path], [im0], [""]
 
     def __len__(self):
@@ -277,6 +284,19 @@ class SAM3VideoSegmentationNode:
             # Ensure model is on GPU (previous run offloaded to CPU)
             from .sam3_image_node import _restore_predictor_to_cuda
             _restore_predictor_to_cuda(predictor)
+
+            # CRITICAL: clear persistent inference_state so init_state
+            # (registered as on_predict_start callback at predict.py:2575)
+            # re-fires and resizes the per-frame buffers for THIS run's
+            # frame count. Without this, the very first segment() call
+            # freezes ``per_frame_geometric_prompt = [None] * num_frames``
+            # and every subsequent call reuses that stale length — any
+            # longer video then crashes with IndexError the moment
+            # frame_idx reaches the old length. SAM3's init_state guards
+            # with ``if len(predictor.inference_state) > 0: return``, so
+            # we have to wipe it ourselves.
+            predictor.inference_state = {}
+
             results_iter = predictor(
                 source=source,
                 text=prompts,
