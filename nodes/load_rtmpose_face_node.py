@@ -92,6 +92,17 @@ class LoadRTMPoseFaceNode:
             input_info.name, input_info.shape, output_infos,
         )
 
+        # Warn when ONNX was exported with a fixed batch dimension
+        # (common for MMPose RTMPose deployment exports); the
+        # inference code will fall back to one-frame-at-a-time runs.
+        if input_info.shape and isinstance(input_info.shape[0], int) \
+                and input_info.shape[0] >= 1:
+            _logger.info(
+                "RTMPose-Face ONNX uses STATIC batch=%d; will run one "
+                "frame per session.run call.",
+                input_info.shape[0],
+            )
+
         return ({
             "session": session,
             "input_name": input_info.name,

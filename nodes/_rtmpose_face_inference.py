@@ -279,9 +279,29 @@ def run_rtmpose_face_video(
     session     = rtmpose_face_dict["session"]
     input_name  = rtmpose_face_dict["input_name"]
     output_names = rtmpose_face_dict["output_names"]
+    input_shape = rtmpose_face_dict.get("input_shape", [])
+
+    # Detect static batch size (e.g. MMPose RTMPose ONNX is commonly
+    # exported with batch=1 for TensorRT deployment). If the ONNX model
+    # was shipped with a fixed batch dimension, calls to session.run
+    # with a larger batch produce correct output only for slot 0 and
+    # garbage for slot 1+ — that's exactly the "f0 correct, f1
+    # scrambled" pattern we observed.
+    static_batch = None
+    if len(input_shape) >= 1:
+        b_dim = input_shape[0]
+        if isinstance(b_dim, int) and b_dim >= 1:
+            static_batch = b_dim
 
     n_persons = len(persons_coco_body_feet_timeline)
     B = images_np_u8.shape[0]
+
+    if static_batch is not None and static_batch < batch_size:
+        _logger.info(
+            "RTMPose-Face ONNX has static batch=%d; reducing runtime "
+            "batch size from %d.", static_batch, batch_size,
+        )
+        batch_size = static_batch
 
     # Pre-allocate output
     face_kp_68_timeline = [
