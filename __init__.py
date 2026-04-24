@@ -30,6 +30,8 @@ from .nodes.load_farl_face_node import LoadFaRLFaceNode
 from .nodes.fastsam3db_farl_pose_node import FastSAM3DBodyFaRLPoseNode
 from .nodes.load_crowdsam_node import LoadCrowdSAMNode
 from .nodes.crowdsam_seg_node import CrowdSAMInstanceSegmentationNode
+from .nodes.load_bmp_node import LoadBMPNode
+from .nodes.bmp_seg_node import BMPInstanceSegmentationNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -56,6 +58,8 @@ NODE_CLASS_MAPPINGS = {
     'FastSAM3DBodyFaRLPose': FastSAM3DBodyFaRLPoseNode,
     'LoadCrowdSAM': LoadCrowdSAMNode,
     'CrowdSAMInstanceSegmentation': CrowdSAMInstanceSegmentationNode,
+    'LoadBMP': LoadBMPNode,
+    'BMPInstanceSegmentation': BMPInstanceSegmentationNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -82,4 +86,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'FastSAM3DBodyFaRLPose': 'Fast SAM 3D Body + FaRL Face Pose',
     'LoadCrowdSAM': 'Load CrowdSAM',
     'CrowdSAMInstanceSegmentation': 'CrowdSAM Instance Segmentation',
+    'LoadBMP': 'Load BBoxMaskPose',
+    'BMPInstanceSegmentation': 'BBoxMaskPose Instance Segmentation',
 }
