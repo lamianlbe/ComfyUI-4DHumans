@@ -173,13 +173,25 @@ class FastSAM3DBodyFaRLPoseNode:
         mask_bboxes_per_frame = [[] for _ in range(B)]
         person_indices_per_frame = [[] for _ in range(B)]
 
+        # Per-frame bbox summary so multi-person regressions are easy to
+        # eyeball. For each frame we log:  t | p_idx [mask_px] (x1,y1,x2,y2) w×h
+        # Skipped persons (empty mask / degenerate bbox) also get a line
+        # with the reason so you can tell "person 1 missing on frame 42"
+        # from "person 1 present but too small".
+        _logger.info(
+            "Phase 1 per-frame bbox dump (B=%d, n_persons=%d, stride=%d):",
+            B, n_persons, phmr_stride,
+        )
         for t in range(B):
             if t not in sampled_frames:
                 continue
+            frame_rows = []
             for p_idx in range(n_persons):
                 mask_frame = masks_np[t, p_idx]
+                mask_px = int(mask_frame.sum())
                 ys, xs = np.where(mask_frame)
                 if len(xs) == 0:
+                    frame_rows.append(f"p{p_idx}:EMPTY")
                     continue
                 x1 = int(xs.min())
                 y1 = int(ys.min())
@@ -187,10 +199,19 @@ class FastSAM3DBodyFaRLPoseNode:
                 y2 = int(ys.max() + 1)
                 x1 = max(0, x1); y1 = max(0, y1)
                 x2 = min(img_w, x2); y2 = min(img_h, y2)
-                if x2 - x1 < 2 or y2 - y1 < 2:
+                w = x2 - x1
+                h = y2 - y1
+                if w < 2 or h < 2:
+                    frame_rows.append(
+                        f"p{p_idx}:TINY({x1},{y1},{x2},{y2}) {w}x{h}"
+                    )
                     continue
                 mask_bboxes_per_frame[t].append((x1, y1, x2, y2))
                 person_indices_per_frame[t].append(p_idx)
+                frame_rows.append(
+                    f"p{p_idx}:[{mask_px}px]({x1},{y1},{x2},{y2}) {w}x{h}"
+                )
+            _logger.info("  frame %4d | %s", t, " | ".join(frame_rows))
 
         n_sampled = len(sampled_frames)
         pbar = comfy.utils.ProgressBar(B * 2)
