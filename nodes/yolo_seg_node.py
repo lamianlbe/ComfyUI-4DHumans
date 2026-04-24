@@ -270,15 +270,26 @@ class YOLOInstanceSegmentationNode:
 
                     # --- Per-frame tracker-output dump --------------------
                     # Logs every detection: YOLO class-conf + tracker ID
-                    # (or 'NONE' if the tracker dropped it) + bbox. Helps
-                    # diagnose track-ID swaps, false positives, and the
-                    # "ids is None" fallback_id injection below.
+                    # (or 'NONE' if the tracker dropped it) + bbox + mask
+                    # pixel count. The mask px is the SIGNAL we actually
+                    # care about — a bbox can be huge because of one
+                    # stray mask pixel in the corner; the pixel count
+                    # tells us whether the mask is a real person-sized
+                    # blob or a thin scattering of noise pixels.
                     boxes_xyxy = r.boxes.xyxy.cpu().numpy() \
                         if r.boxes.xyxy is not None else None
                     confs = r.boxes.conf.cpu().numpy() \
                         if r.boxes.conf is not None else None
                     ids_cpu = ids.cpu().numpy().astype(int) \
                         if ids is not None else None
+
+                    # Mask pixel count at YOLO's native mask resolution
+                    # (pre-resize). masks_data is uint8 in {0, 1}.
+                    mask_shape = tuple(masks_data.shape[-2:])  # (H', W')
+                    per_det_px = masks_data.reshape(masks_data.shape[0], -1) \
+                        .sum(dim=1).cpu().numpy().astype(int)
+                    mask_total = int(mask_shape[0] * mask_shape[1])
+
                     det_lines = []
                     N_det = int(masks_data.shape[0])
                     for k in range(N_det):
@@ -290,17 +301,25 @@ class YOLOInstanceSegmentationNode:
                         if boxes_xyxy is not None:
                             x1, y1, x2, y2 = boxes_xyxy[k]
                             bbox_str = (
-                                f"({int(x1)},{int(y1)},"
+                                f"bbox=({int(x1)},{int(y1)},"
                                 f"{int(x2)},{int(y2)})"
                             )
                         else:
-                            bbox_str = "(?)"
+                            bbox_str = "bbox=(?)"
+                        # Mask fill ratio = px / (H' * W'). Useful for
+                        # spotting over-segmentation (e.g. >40% of frame
+                        # is suspicious for a single person).
+                        pct = (
+                            100.0 * per_det_px[k] / mask_total
+                            if mask_total > 0 else 0.0
+                        )
                         det_lines.append(
-                            f"{tid_str} conf={conf:.2f} {bbox_str}"
+                            f"{tid_str} conf={conf:.2f} {bbox_str} "
+                            f"mask_px={int(per_det_px[k])} ({pct:.1f}%)"
                         )
                     _logger.info(
-                        "  YOLO-seg frame %4d: %d det(s) | %s",
-                        t, N_det,
+                        "  YOLO-seg frame %4d: %d det(s) | mask_shape=%s | %s",
+                        t, N_det, mask_shape,
                         " | ".join(det_lines) if det_lines else "(none)",
                     )
 
