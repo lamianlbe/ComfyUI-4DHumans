@@ -16,6 +16,7 @@ Model checkpoint (``sam3.pt``) is loaded from ``models/sam3/``.
 import glob
 import logging
 import os
+import time
 
 import numpy as np
 from ._mask_utils import pack_mask, unpack_mask
@@ -261,6 +262,11 @@ class SAM3VideoSegmentationNode:
             # Ensure model is on GPU (previous run offloaded to CPU)
             from .sam3_image_node import _restore_predictor_to_cuda
             _restore_predictor_to_cuda(predictor)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _t_infer = time.perf_counter()
+
             results_iter = predictor(
                 source=source,
                 text=prompts,
@@ -273,6 +279,7 @@ class SAM3VideoSegmentationNode:
 
             frame_idx = 0
             logged_shape = False
+            _t_last_log = time.perf_counter()
             for r in results_iter:
                 if frame_idx >= B:
                     break
@@ -285,10 +292,11 @@ class SAM3VideoSegmentationNode:
                     if not logged_shape:
                         _logger.info(
                             "SAM3 mask shape: %s, dtype: %s, range: [%.2f, %.2f], "
-                            "image shape: (%d, %d)",
+                            "image shape: (%d, %d), masks.device=%s, boxes.device=%s",
                             tuple(masks_data.shape), masks_data.dtype,
                             float(masks_data.min()), float(masks_data.max()),
                             H, W,
+                            masks_data.device, r.boxes.data.device,
                         )
                         logged_shape = True
 
@@ -318,9 +326,28 @@ class SAM3VideoSegmentationNode:
 
                 frame_idx += 1
                 pbar.update(1)
+
+                # Per-batch (every 32 frames) log so slowness is visible
+                # in real time, not just at the end.
+                if frame_idx % 32 == 0:
+                    _now = time.perf_counter()
+                    _logger.info(
+                        "SAM3 video: %d/%d frames done, last 32 frames in %.2fs "
+                        "(%.3fs/frame)",
+                        frame_idx, B, _now - _t_last_log,
+                        (_now - _t_last_log) / 32.0,
+                    )
+                    _t_last_log = _now
         finally:
             # Restore original setup_source to avoid polluting the predictor
             predictor.setup_source = original_setup_source
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _logger.info(
+                "SAM3 video inference: %d frames in %.2fs",
+                frame_idx, time.perf_counter() - _t_infer,
+            )
 
             # Offload SAM3 model to CPU so downstream nodes
             # (PromptHMR + Sapiens) have VRAM available.

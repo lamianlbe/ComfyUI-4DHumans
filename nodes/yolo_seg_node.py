@@ -14,6 +14,7 @@ changes.
 
 import logging
 import os
+import time
 
 import numpy as np
 import torch
@@ -21,6 +22,7 @@ import torch
 import comfy.utils
 from folder_paths import models_dir
 
+from ._device_probe import log_probe as _dp
 from ._mask_utils import pack_mask, unpack_mask
 
 # Hardcoded checkpoint path: <ComfyUI models/>/reface/yolo26x-seg.pt
@@ -201,13 +203,21 @@ class YOLOInstanceSegmentationNode:
         logged_shape = False
 
         try:
-            # Ensure model is on GPU (previous run offloaded to CPU)
+            _dp(model, "YOLO-seg BEFORE restore-to-cuda")
+
+            # Ensure model is on GPU (previous run offloaded to CPU).
+            # Prefer the wrapper `.to()` so ultralytics' cached `.device`
+            # attribute gets refreshed alongside the weight move.
             if torch.cuda.is_available():
                 try:
-                    if hasattr(model, "model") and model.model is not None:
+                    if hasattr(model, "to"):
+                        model.to("cuda")
+                    elif hasattr(model, "model") and model.model is not None:
                         model.model.to("cuda")
                 except Exception as e:
                     _logger.warning("YOLO restore-to-CUDA failed: %s", e)
+
+            _dp(model, "YOLO-seg AFTER restore-to-cuda")
 
             # Process the video in chunks to bound peak VRAM.  Use
             # persist=True so ByteTrack / BoT-SORT carry their state
@@ -218,7 +228,7 @@ class YOLOInstanceSegmentationNode:
                 chunk_end = min(chunk_start + chunk_size, B)
                 chunk = source_cpu[chunk_start:chunk_end]
 
-                results_iter = model.track(
+                track_kwargs = dict(
                     source=chunk,
                     stream=True,
                     imgsz=yolo["imgsz"],
@@ -230,13 +240,24 @@ class YOLOInstanceSegmentationNode:
                     persist=(chunk_start > 0),
                     verbose=False,
                 )
+                if torch.cuda.is_available():
+                    # Override any stale cached device selection.
+                    track_kwargs["device"] = "cuda"
 
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _tc = time.perf_counter()
+
+                results_iter = model.track(**track_kwargs)
+
+                chunk_frames_done = 0
                 for r in results_iter:
                     if t >= B:
                         break
 
                     if r.masks is None or r.boxes is None:
                         t += 1
+                        chunk_frames_done += 1
                         pbar.update(1)
                         continue
 
@@ -246,10 +267,13 @@ class YOLOInstanceSegmentationNode:
                     if not logged_shape:
                         _logger.info(
                             "YOLO mask shape: %s, dtype: %s, range: [%.2f, %.2f], "
-                            "image shape: (%d, %d), chunk_size=%d",
+                            "image shape: (%d, %d), chunk_size=%d, "
+                            "masks.device=%s, boxes.device=%s",
                             tuple(masks_data.shape), masks_data.dtype,
                             float(masks_data.min()), float(masks_data.max()),
                             H, W, chunk_size,
+                            masks_data.device,
+                            r.boxes.data.device,
                         )
                         logged_shape = True
 
@@ -281,7 +305,16 @@ class YOLOInstanceSegmentationNode:
                         all_track_ids.add(int(tid))
 
                     t += 1
+                    chunk_frames_done += 1
                     pbar.update(1)
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _logger.info(
+                    "YOLO-seg chunk %d..%d (%d frames): %.3fs",
+                    chunk_start, chunk_end - 1, chunk_frames_done,
+                    time.perf_counter() - _tc,
+                )
 
                 # Force-release per-chunk intermediate tensors (Results
                 # objects, heatmaps, resized masks still on GPU) before
@@ -290,14 +323,18 @@ class YOLOInstanceSegmentationNode:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         finally:
+            _dp(model, "YOLO-seg BEFORE offload-to-cpu")
             # Offload YOLO to CPU so downstream nodes have VRAM available
             try:
-                if hasattr(model, "model") and model.model is not None:
+                if hasattr(model, "to"):
+                    model.to("cpu")
+                elif hasattr(model, "model") and model.model is not None:
                     model.model.to("cpu")
             except Exception as e:
                 _logger.warning("YOLO VRAM offload failed: %s", e)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            _dp(model, "YOLO-seg AFTER offload-to-cpu")
 
         if not all_track_ids:
             _logger.warning(

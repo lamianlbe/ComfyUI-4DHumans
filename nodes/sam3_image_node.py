@@ -59,15 +59,18 @@ def _get_or_build_image_predictor(sam3_dict):
 
 def _offload_sam3_to_cpu(sam3_dict):
     """Move SAM3 predictors to CPU and empty CUDA cache to free VRAM."""
+    from ._device_probe import log_probe as _dp
     for key in ("predictor", "_image_predictor"):
         pred = sam3_dict.get(key)
         if pred is not None and hasattr(pred, "model") and pred.model is not None:
+            _dp(pred, f"SAM3[{key}] BEFORE offload-to-cpu")
             try:
                 pred.model.to("cpu")
             except Exception as e:
                 _logger.warning(
                     "SAM3 VRAM offload failed for %s: %s", key, e
                 )
+            _dp(pred, f"SAM3[{key}] AFTER offload-to-cpu")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -78,13 +81,17 @@ def _restore_predictor_to_cuda(predictor):
     We offload to CPU after each run; this puts it back before the next run.
     No-op when no CUDA is available.
     """
+    from ._device_probe import log_probe as _dp
+    _dp(predictor, "SAM3 BEFORE restore-to-cuda")
     if not torch.cuda.is_available():
+        _dp(predictor, "SAM3 AFTER restore-to-cuda (cuda unavailable)")
         return
     try:
         if hasattr(predictor, "model") and predictor.model is not None:
             predictor.model.to("cuda")
     except Exception as e:
         _logger.warning("SAM3 restore-to-CUDA failed: %s", e)
+    _dp(predictor, "SAM3 AFTER restore-to-cuda")
 
 
 class SAM3ImageSegmentationNode:
