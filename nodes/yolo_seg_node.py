@@ -153,11 +153,28 @@ class YOLOInstanceSegmentationNode:
                         "tooltip": "NMS IoU threshold for suppressing duplicate boxes.",
                     },
                 ),
+                "debug_overlay": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Output a second IMAGE where each person's "
+                            "mask is color-coded and alpha-blended onto "
+                            "the original frames, with a matching bbox "
+                            "outline + track-id text label. Lets you "
+                            "eyeball mask quality and track-ID stability "
+                            "directly. Off by default (adds a CPU pass "
+                            "per frame). When off, the debug_overlay "
+                            "output is just the input images passed "
+                            "through unchanged."
+                        ),
+                    },
+                ),
             },
         }
 
-    RETURN_TYPES = ("MASK",)
-    RETURN_NAMES = ("masks",)
+    RETURN_TYPES = ("MASK", "IMAGE")
+    RETURN_NAMES = ("masks", "debug_overlay")
     FUNCTION = "segment"
     CATEGORY = "4dhumans"
 
@@ -166,7 +183,27 @@ class YOLOInstanceSegmentationNode:
     # activations, tracker state, and per-frame mask accumulators.
     _CHUNK_SIZE = 128
 
-    def segment(self, images, yolo, class_ids, tracker, iou):
+    # Debug palette (RGB, uint8). One color per tracked-person slot.
+    # 12 distinct hues — more than enough for typical scenes; after
+    # this we wrap so two tracks may share a color, but the tid= text
+    # label still disambiguates them.
+    _DEBUG_PALETTE_RGB = np.array([
+        [255,  60,  60],   # red
+        [ 60, 200,  60],   # green
+        [ 60, 120, 255],   # blue
+        [255, 200,  40],   # yellow-orange
+        [255,  70, 200],   # magenta
+        [ 60, 220, 220],   # cyan
+        [220, 110, 255],   # purple
+        [180, 180,  60],   # olive
+        [255, 140,  40],   # orange
+        [110, 255, 160],   # mint
+        [255, 160, 200],   # pink
+        [160, 200, 255],   # light blue
+    ], dtype=np.uint8)
+
+    def segment(self, images, yolo, class_ids, tracker, iou,
+                debug_overlay=False):
         chunk_size = self._CHUNK_SIZE
         model = yolo["model"]
 
@@ -388,7 +425,9 @@ class YOLOInstanceSegmentationNode:
                 "Returning single empty mask per frame.",
                 class_list,
             )
-            return (torch.zeros(B, H, W),)
+            # Pass-through for the debug output so downstream graph
+            # wiring doesn't need to know whether anything was detected.
+            return (torch.zeros(B, H, W), images)
 
         # Map track IDs → contiguous slot indices (0, 1, 2, ...)
         sorted_ids = sorted(all_track_ids)
@@ -408,6 +447,18 @@ class YOLOInstanceSegmentationNode:
                     mask_bool.astype(np.float32)
                 )
 
+        # Build the colored-mask overlay before dropping per_frame, so
+        # we still have per-frame track lookups available. Returns the
+        # original images unchanged when debug_overlay is off (keeps
+        # the output signature consistent).
+        overlay_out = self._build_debug_overlay(
+            images=images,
+            per_frame=per_frame,
+            id_to_slot=id_to_slot,
+            sorted_ids=sorted_ids,
+            H=H, W=W,
+        ) if debug_overlay else images
+
         del per_frame
 
         _logger.info(
@@ -416,4 +467,77 @@ class YOLOInstanceSegmentationNode:
             B, class_list, n_persons, tuple(masks_out.shape),
         )
 
-        return (masks_out,)
+        return (masks_out, overlay_out)
+
+    def _build_debug_overlay(self, images, per_frame, id_to_slot,
+                             sorted_ids, H, W):
+        """Render a color-coded mask overlay for visual inspection.
+
+        Returns a ``(B, H, W, 3)`` float32 tensor in [0, 1] where each
+        tracked person's mask is alpha-blended into the original image
+        with a distinct color, plus a matching bbox outline and a
+        ``tid=N slot=M`` text label. All work is on CPU / numpy — the
+        overlay is a debug aid, not a hot path.
+        """
+        import cv2  # ultralytics ships cv2, so this is always available
+
+        palette = self._DEBUG_PALETTE_RGB  # (P, 3) uint8 RGB
+        alpha = 0.45
+        B = int(images.shape[0])
+
+        # Log the slot -> color legend once so reading the overlay is
+        # unambiguous (the text label also prints slot, but eyeballing
+        # color-to-person is what makes this fast to scan).
+        color_names = [
+            "red", "green", "blue", "yellow", "magenta", "cyan",
+            "purple", "olive", "orange", "mint", "pink", "light-blue",
+        ]
+        legend_parts = []
+        for slot, tid in enumerate(sorted_ids):
+            c = color_names[slot % len(color_names)]
+            legend_parts.append(f"slot{slot}(tid={tid})={c}")
+        _logger.info(
+            "YOLO-seg debug overlay legend: %s", " | ".join(legend_parts),
+        )
+
+        # Work in uint8 so cv2's drawing functions behave naturally.
+        dbg = (images.detach().cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
+        dbg = np.ascontiguousarray(dbg)  # cv2 requires contiguous
+
+        for t in range(B):
+            frame = dbg[t]  # (H, W, 3) uint8, view (in-place edits OK)
+            for tid, packed in per_frame[t].items():
+                slot = id_to_slot[tid]
+                color = palette[slot % len(palette)]            # (3,) uint8
+                color_list = [int(c) for c in color.tolist()]   # for cv2
+
+                mask_bool = unpack_mask(packed, H, W)           # (H, W) bool
+                if not mask_bool.any():
+                    continue
+
+                # 1. Alpha-blend colored mask.
+                # Vectorized blend only on mask pixels keeps things
+                # cheap and avoids bleeding outside the silhouette.
+                sel = mask_bool
+                f = frame[sel].astype(np.float32)
+                blended = f * (1.0 - alpha) + color.astype(np.float32) * alpha
+                frame[sel] = np.clip(blended, 0, 255).astype(np.uint8)
+
+                # 2. Bbox outline (from mask tight bounds).
+                ys, xs = np.where(mask_bool)
+                x1, y1 = int(xs.min()), int(ys.min())
+                x2, y2 = int(xs.max()), int(ys.max())
+                cv2.rectangle(
+                    frame, (x1, y1), (x2, y2), color_list, thickness=2,
+                )
+
+                # 3. Text label: track ID + slot index.
+                label = f"tid={tid} slot={slot}"
+                ty = max(0, y1 - 6)
+                cv2.putText(
+                    frame, label, (x1 + 2, ty + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_list,
+                    thickness=2, lineType=cv2.LINE_AA,
+                )
+
+        return torch.from_numpy(dbg.astype(np.float32) / 255.0)
