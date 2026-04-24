@@ -12,15 +12,24 @@ Additionally, FaRL outputs 68 landmarks in the standard 300W (iBUG)
 convention — a perfect match for COCO-WholeBody indices 23..90 with
 zero remapping.
 
-Model weights auto-download to `~/.cache/torch/hub/checkpoints/` via
-``pyfacer`` on first use (roughly ~120 MB). License: MIT (FaRL) and
-MIT (pyfacer).
+Hardcoded path (ComfyUI convention — no torch hub auto-download):
+    models/farl/face_alignment.farl.ibug300w.main_ema_jit.pt
+
+Download manually from:
+    https://github.com/FacePerceiver/facer/releases/download/models-v1/face_alignment.farl.ibug300w.main_ema_jit.pt
+(~617 MB TorchScript, includes both the aligner head and the ViT-B
+backbone state_dict embedded as an extra_files entry.)
+
+License: MIT (FaRL) + MIT (pyfacer).
 
 Install:
     pip install pyfacer
 """
 
 import logging
+import os
+
+from folder_paths import models_dir
 
 _logger = logging.getLogger(__name__)
 
@@ -29,6 +38,21 @@ _logger = logging.getLogger(__name__)
 # Other 'farl/...' aligners in pyfacer target parsing masks, not
 # landmarks, so we hard-code the ibug300w checkpoint here.
 _FARL_FACE_ALIGNER_NAME = "farl/ibug300w/448"
+
+# The local checkpoint we expect. The filename MUST still contain "jit"
+# because pyfacer's loader branches on that substring to pick
+# torch.jit.load vs torch.load — we keep the upstream filename verbatim
+# so this isn't an issue.
+FARL_FACE_CHECKPOINT_FILENAME = (
+    "face_alignment.farl.ibug300w.main_ema_jit.pt"
+)
+FARL_FACE_CHECKPOINT_URL = (
+    "https://github.com/FacePerceiver/facer/releases/download/"
+    "models-v1/" + FARL_FACE_CHECKPOINT_FILENAME
+)
+FARL_FACE_CHECKPOINT = os.path.join(
+    models_dir, "farl", FARL_FACE_CHECKPOINT_FILENAME,
+)
 
 
 class LoadFaRLFaceNode:
@@ -43,7 +67,7 @@ class LoadFaRLFaceNode:
                     {
                         "default": "cuda",
                         "tooltip": (
-                            "Inference device. FaRL is a ~120 MB ViT "
+                            "Inference device. FaRL is a ~617 MB ViT-B "
                             "and runs in <20 ms per frame batch on a "
                             "modern GPU; CPU works but is ~10× slower."
                         ),
@@ -58,14 +82,25 @@ class LoadFaRLFaceNode:
     CATEGORY = "4dhumans"
 
     def load(self, device):
+        if not os.path.isfile(FARL_FACE_CHECKPOINT):
+            raise FileNotFoundError(
+                f"FaRL face checkpoint not found at:\n"
+                f"  {FARL_FACE_CHECKPOINT}\n\n"
+                f"Download it manually (~617 MB) from:\n"
+                f"  {FARL_FACE_CHECKPOINT_URL}\n\n"
+                f"and place it at the path above. Typical shell command:\n"
+                f"  mkdir -p {os.path.dirname(FARL_FACE_CHECKPOINT)}\n"
+                f"  wget -O {FARL_FACE_CHECKPOINT} \\\n"
+                f"    {FARL_FACE_CHECKPOINT_URL}"
+            )
+
         try:
             import torch
             import facer
         except ImportError as e:
             raise ImportError(
                 "pyfacer required. Install with:\n"
-                "  pip install pyfacer\n"
-                "pyfacer will auto-download FaRL checkpoints on first use."
+                "  pip install pyfacer"
             ) from e
 
         device_str = (
@@ -80,15 +115,19 @@ class LoadFaRLFaceNode:
             )
 
         _logger.info(
-            "Loading FaRL face aligner (%s) on device=%s",
-            _FARL_FACE_ALIGNER_NAME, device_str,
+            "Loading FaRL face aligner (%s) on device=%s from %s",
+            _FARL_FACE_ALIGNER_NAME, device_str, FARL_FACE_CHECKPOINT,
         )
 
+        # ``model_path`` forwards through to FaRLFaceAlignment.__init__
+        # which calls pyfacer's download_jit helper — the helper detects
+        # a non-URL path and skips downloading, loading torch.jit.load
+        # directly from our local file.
         face_aligner = facer.face_aligner(
-            _FARL_FACE_ALIGNER_NAME, device=device_str,
+            _FARL_FACE_ALIGNER_NAME,
+            device=device_str,
+            model_path=FARL_FACE_CHECKPOINT,
         )
-        # Ensure eval mode — pyfacer already does this in its constructor
-        # on recent versions, but belt and braces.
         try:
             face_aligner.eval()
         except AttributeError:
@@ -103,4 +142,5 @@ class LoadFaRLFaceNode:
             "aligner": face_aligner,
             "device": device_str,
             "model_name": _FARL_FACE_ALIGNER_NAME,
+            "model_path": FARL_FACE_CHECKPOINT,
         },)
