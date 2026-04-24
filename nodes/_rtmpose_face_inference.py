@@ -60,31 +60,65 @@ _logger = logging.getLogger(__name__)
 # exact definition differs (documented per-slot so it's easy to fix).
 # =============================================================================
 
+# LaPa 106-point region boundaries inferred from MMPose's lapa.py swap
+# table (pairs like 0↔32, 33↔46, 66↔79, etc.):
+#
+#   0-32   : face contour (33 pts, 16 is chin center)
+#   33-41  : LEFT eyebrow (9 pts; 33-37 pair with right 42-46)
+#   42-50  : RIGHT eyebrow (9 pts)
+#   51-54  : nose bridge (4 pts, no swap = center line)
+#   55-65  : nose bottom / nostrils (11 pts; 55↔65, 60 center)
+#   66-74  : LEFT eye (9 pts; 66-70 pair with right 75-79)
+#   75-83  : RIGHT eye (9 pts)
+#   84-95  : outer lip (12 pts; 84↔90, 87 center top, 93 center bottom)
+#   96-105 : inner lip (10 pts; 96↔100, 98 center)
+#
+# Within each region the best-fit 300W pick is a judgement call on which
+# LaPa points are on the silhouette the 300W 68 convention expects.  A
+# final tune-up may still be needed after visual inspection of raw 106
+# output — enable `debug_dump_rtmface_106` on the node to save it.
 _LAPA106_TO_300W68 = np.array([
-    # Jaw 0-16 (subsample 33 contour points every other)
+    # --- Jaw 17 pts (300W 0-16) from LaPa 0-32 ---
+    # Every-other sampling gives 17 evenly spaced contour points.
     0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32,
-    # Left brow 17-21
-    33, 34, 36, 38, 40,
-    # Right brow 22-26
-    43, 44, 46, 48, 50,
-    # Nose bridge 27-30
-    53, 54, 55, 56,
-    # Nose horizontal 31-35
-    58, 59, 60, 61, 62,
-    # Left eye 36-41
-    63, 64, 66, 68, 70, 72,
-    # Right eye 42-47
-    75, 76, 78, 80, 82, 84,
-    # Outer lip 48-59
-    87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98,
-    # Inner lip 60-67
-    99, 100, 101, 102, 103, 104, 105, 87,  # last 87 is placeholder
-], dtype=np.int64)
 
-# Note: the last slot (67) should map to a distinct inner-lip point; if
-# the model's inner-lip convention has only 7 points we reuse 87 as a
-# harmless placeholder.  This is easy to patch once the real model's
-# output is inspected.
+    # --- Left eyebrow 5 pts (300W 17-21) from LaPa 33-41 ---
+    # 33-37 = top-edge pair with right brow's 42-46 (swap confirms).
+    # Use those 5 consecutive indices.
+    33, 34, 35, 36, 37,
+
+    # --- Right eyebrow 5 pts (300W 22-26) from LaPa 42-50 ---
+    42, 43, 44, 45, 46,
+
+    # --- Nose bridge 4 pts (300W 27-30) from LaPa 51-54 ---
+    # Direct 4→4 mapping on the center line.
+    51, 52, 53, 54,
+
+    # --- Nose horizontal / nostrils 5 pts (300W 31-35) from LaPa 55-65 ---
+    # LaPa 55↔65 endpoints, 60 center. Evenly sample 5 points.
+    55, 57, 60, 63, 65,
+
+    # --- Left eye 6 pts (300W 36-41) from LaPa 66-74 ---
+    # 66-70 upper-edge (5 pts pair with right 75-79),
+    # 71-74 lower-edge (4 pts).
+    # 300W 36-41 order: outer_corner, upper_outer, upper_inner,
+    #                   inner_corner, lower_inner, lower_outer
+    66, 67, 68, 70, 73, 71,
+
+    # --- Right eye 6 pts (300W 42-47) from LaPa 75-83 ---
+    # Mirror of left-eye pattern.
+    75, 76, 77, 79, 82, 80,
+
+    # --- Outer lip 12 pts (300W 48-59) from LaPa 84-95 ---
+    # LaPa outer lip has 12 pts directly (swap: 84↔90, 87 center top,
+    # 91↔95, 93 center bottom).  Direct 12→12 map.
+    84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95,
+
+    # --- Inner lip 8 pts (300W 60-67) from LaPa 96-103 ---
+    # LaPa inner lip has 10 pts.  Skip 104-105 which appear to be
+    # lip-corner commissures not in 300W's inner contour.
+    96, 97, 98, 99, 100, 101, 102, 103,
+], dtype=np.int64)
 
 
 # =============================================================================
