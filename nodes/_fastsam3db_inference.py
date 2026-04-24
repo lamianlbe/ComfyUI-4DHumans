@@ -490,8 +490,18 @@ def run_fastsam3db_video(
             kp2d = kp2d[:70] if len(kp2d) > 70 else kp2d
             kp3d = kp3d[:70] if len(kp3d) > 70 else kp3d
 
+            # IMPORTANT: pred_keypoints_3d is in CANONICAL frame (pelvis at
+            # origin). To align with PromptHMR / NLF output format that
+            # downstream nodes expect (NLF renderer, SCAIL transforms, the
+            # Pose Editor 3D-distance code, etc.), we need to translate it
+            # into CAMERA space via:
+            #     j3d_cam = j3d_canonical + pred_cam_t
+            # This mirrors what camera_head.py:perspective_projection does
+            # internally before projecting to 2D.
+            kp3d_cam = kp3d + cam_t[None, :]
+
             persons[p_idx]["body_joints2d"][t] = mhr70_to_openpose25(kp2d)
-            persons[p_idx]["body_joints"][t]   = mhr70_to_openpose25(kp3d)
+            persons[p_idx]["body_joints"][t]   = mhr70_to_openpose25(kp3d_cam)
             persons[p_idx]["mhr_kp2d"][t]      = kp2d
             persons[p_idx]["mhr_vertices"][t]  = verts
             persons[p_idx]["mhr_cam_t"][t]     = cam_t
@@ -511,6 +521,14 @@ def run_fastsam3db_video(
 
     # -------------------------------------------------------------------
     # MHR → SMPL, per person SEQUENTIAL (smoother is stateful)
+    #
+    # NOTE: MHR2SMPLMultiView.infer_smpl_joints internally does
+    #       `j -= j[0:1]` so the returned 24 joints are *pelvis-centered
+    #       canonical* (pelvis at origin). Downstream (NLF renderer,
+    #       SCAIL transforms, POSES format in general) expect camera-
+    #       space coordinates where the pelvis sits at the person's
+    #       actual depth. Add pred_cam_t back so the canonical pelvis
+    #       lines up with where the body actually is in the scene.
     # -------------------------------------------------------------------
     mhr2smpl_time_s = 0.0
     t0 = time.perf_counter()
@@ -525,7 +543,9 @@ def run_fastsam3db_video(
                 views=[(verts, cam_t)],
                 smpl_model_path=smpl_pkl,
             )
-            persons[p_idx]["smpl_j3d"][t] = joints24.astype(np.float32)
+            # Translate canonical → camera space
+            joints24_cam = joints24.astype(np.float32) + cam_t[None, :]
+            persons[p_idx]["smpl_j3d"][t] = joints24_cam
     mhr2smpl_time_s = time.perf_counter() - t0
 
     return {
