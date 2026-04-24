@@ -148,14 +148,23 @@ def _resolve_local_or_url(local_path: str, fallback_url: str, what: str) -> str:
 
 def _write_patched_config(src_yaml_path: str,
                           det_checkpoint: str,
-                          sam2_checkpoint: str) -> str:
+                          sam2_checkpoint: str,
+                          sam2_config_abs: str) -> str:
     """Read BMP's packaged config YAML, swap the detector + SAM2
-    checkpoint paths for the ones we picked (local file or URL), write
+    checkpoint paths + SAM2 config path for the ones we picked, write
     the result to a temp YAML file, return its path.
 
     We don't touch the ``pose_estimator`` section because our load flow
     constructs PMPose ourselves and injects it via ``pose_model=``, so
     BBoxMaskPose.__init__ skips its own pose_checkpoint lookup entirely.
+
+    The ``sam2_config_abs`` swap-in uses an absolute path. BBoxMaskPose
+    resolves sam2_config via
+    ``os.path.join(BMP_ROOT, "bboxmaskpose", "sam2", sam2_config)`` —
+    Python's os.path.join discards the prefix when the second arg is
+    absolute, so feeding an absolute path bypasses the broken lookup
+    into site-packages/bboxmaskpose/sam2/configs/ (which is missing in
+    the pip install).
     """
     import yaml
 
@@ -164,6 +173,7 @@ def _write_patched_config(src_yaml_path: str,
 
     cfg["detector"]["det_checkpoint"] = det_checkpoint
     cfg["sam2"]["sam2_checkpoint"] = sam2_checkpoint
+    cfg["sam2"]["sam2_config"] = sam2_config_abs
 
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".yaml", prefix="bmp_cfg_", delete=False,
@@ -171,6 +181,15 @@ def _write_patched_config(src_yaml_path: str,
     yaml.safe_dump(cfg, tmp)
     tmp.close()
     return tmp.name
+
+
+# Mapping: BMP config name → (our vendored BMP yaml, SAM2 config path
+# the yaml references). Pre-computing here keeps the load path simple.
+_BMP_TO_SAM2_CONFIG = {
+    "bmp_v2": "sam-pose2seg/sam-pose2seg_hiera_b+.yaml",
+    "bmp_D3": "samurai/sam2.1_hiera_b+.yaml",
+    "bmp_J1": "samurai/sam2.1_hiera_b+.yaml",
+}
 
 
 class LoadBMPNode:
@@ -337,21 +356,46 @@ class LoadBMPNode:
         # ----------------------------------------------------------------
         # Step 2: Patch BMP's YAML config with our resolved detector +
         # SAM2 paths, then build BBoxMaskPose off the patched file.
+        #
+        # We use the VENDORED copy under bmp_configs/bmp/ — NOT the
+        # pip-installed one at site-packages/bboxmaskpose/configs/ —
+        # because some pip wheels of bboxmaskpose don't ship the yaml
+        # data files (same bug that hit PMPose above). Vendoring makes
+        # this robust regardless of whether the pip install is clean.
         # ----------------------------------------------------------------
-        # Locate the source YAML inside the installed BMP package.
-        import bboxmaskpose
-        bmp_pkg_root = os.path.dirname(bboxmaskpose.__file__)
-        src_yaml = os.path.join(bmp_pkg_root, "configs", f"{config}.yaml")
+        src_yaml = os.path.join(BMP_CONFIGS_ROOT, "bmp", f"{config}.yaml")
         if not os.path.isfile(src_yaml):
             raise FileNotFoundError(
-                f"BMP config not found at {src_yaml}. Is bboxmaskpose "
-                f"installed correctly?"
+                f"Vendored BMP config missing: {src_yaml}\n"
+                f"Should ship with the repo under bmp_configs/bmp/. "
+                f"Reinstall/pull the repo, or copy from "
+                f"BBoxMaskPose/bboxmaskpose/configs/ manually."
             )
+
+        # Resolve SAM2 config (also vendored) to an absolute path so
+        # BBoxMaskPose's internal os.path.join-under-site-packages
+        # lookup gets bypassed.
+        sam2_config_rel = _BMP_TO_SAM2_CONFIG.get(config)
+        if sam2_config_rel is None:
+            raise ValueError(
+                f"No SAM2 config mapping for BMP config '{config}'. "
+                f"Known: {list(_BMP_TO_SAM2_CONFIG)}"
+            )
+        sam2_config_abs = os.path.join(
+            BMP_CONFIGS_ROOT, "sam2", sam2_config_rel,
+        )
+        if not os.path.isfile(sam2_config_abs):
+            raise FileNotFoundError(
+                f"Vendored SAM2 config missing: {sam2_config_abs}\n"
+                f"Should ship with the repo under bmp_configs/sam2/."
+            )
+        _logger.info("  SAM2 config     : vendored  %s", sam2_config_abs)
 
         patched_yaml = _write_patched_config(
             src_yaml_path=src_yaml,
             det_checkpoint=det_ckpt,
             sam2_checkpoint=sam2_ckpt,
+            sam2_config_abs=sam2_config_abs,
         )
         _logger.info("BMP config patched → %s", patched_yaml)
 
