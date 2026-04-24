@@ -73,16 +73,61 @@ class LoadRTMPoseFaceNode:
                 "  pip install onnxruntime       (CPU-only build)"
             ) from e
 
+        # We observed a reproducible alternating-frame bug with
+        # CUDAExecutionProvider on MMPose's RTMPose-Face ONNX: on 4
+        # consecutive calls the 106-pt output on slots 0 and 2 was
+        # correct while slots 1 and 3 were a ~bilaterally-mirrored
+        # version.  The input bboxes were essentially identical, so
+        # the root cause is almost certainly CUDA EP non-determinism
+        # (cuDNN algo search / memory pattern reuse picking different
+        # kernels across calls, which for a near-symmetric face nudges
+        # SimCC argmax between the true peak and its mirror peak).
+        #
+        # Neutralise by locking every knob that can introduce
+        # call-to-call variation:
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = 1
+        sess_options.inter_op_num_threads = 1
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        # These two are the big ones for non-determinism across
+        # consecutive session.run() calls:
+        #   enable_mem_pattern: pre-plans tensor allocations from the
+        #       first run and reuses that pattern. If the second run
+        #       lands slightly different, the reused layout can cause
+        #       stale data to leak into the next op.
+        #   enable_cpu_mem_arena: similar pooling on CPU.
+        sess_options.enable_mem_pattern = False
+        sess_options.enable_cpu_mem_arena = False
+        # Keep optimisations but avoid aggressive fusions that could
+        # bake in assumptions about repeated buffers.
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+
         if provider == "cuda":
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            # Pin cuDNN to a fixed conv algorithm ("DEFAULT" = cuDNN's
+            # default, not a per-input heuristic search). HEURISTIC /
+            # EXHAUSTIVE pick different kernels depending on workspace
+            # availability, which is a common source of
+            # call-to-call output drift on near-identical inputs.
+            cuda_provider_options = {
+                "cudnn_conv_algo_search": "DEFAULT",
+                "do_copy_in_default_stream": True,
+                "arena_extend_strategy": "kNextPowerOfTwo",
+            }
+            providers = [
+                ("CUDAExecutionProvider", cuda_provider_options),
+                "CPUExecutionProvider",
+            ]
         else:
             providers = ["CPUExecutionProvider"]
 
         _logger.info(
-            "Loading RTMPose-Face ONNX from %s (providers=%s)",
+            "Loading RTMPose-Face ONNX from %s (providers=%s, sequential, "
+            "single-threaded)",
             RTMPOSE_FACE_ONNX, providers,
         )
-        session = ort.InferenceSession(RTMPOSE_FACE_ONNX, providers=providers)
+        session = ort.InferenceSession(
+            RTMPOSE_FACE_ONNX, sess_options=sess_options, providers=providers,
+        )
 
         # Inspect I/O to confirm expected shape & make it available downstream.
         input_info = session.get_inputs()[0]
