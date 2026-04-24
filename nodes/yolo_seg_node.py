@@ -193,6 +193,12 @@ class YOLOInstanceSegmentationNode:
         # (Sending the whole (B, 3, H, W) tensor in one call makes
         # ultralytics allocate ~B * H * W * 12 bytes of VRAM up front.)
         source_cpu = images.permute(0, 3, 1, 2).contiguous().float()
+        _logger.info(
+            "YOLO-seg input: images.device=%s images.dtype=%s "
+            "-> source_cpu.device=%s source_cpu.dtype=%s shape=%s",
+            images.device, images.dtype,
+            source_cpu.device, source_cpu.dtype, tuple(source_cpu.shape),
+        )
 
         pbar = comfy.utils.ProgressBar(B)
 
@@ -251,9 +257,26 @@ class YOLOInstanceSegmentationNode:
                 results_iter = model.track(**track_kwargs)
 
                 chunk_frames_done = 0
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _t_frame = time.perf_counter()
                 for r in results_iter:
                     if t >= B:
                         break
+
+                    # Per-frame timing (cuda-sync'd) so we can tell if
+                    # slowness is uniform-per-frame (compute bottleneck)
+                    # vs first-frame-only (warmup / cudnn-benchmark /
+                    # kernel JIT).
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _dt_frame = time.perf_counter() - _t_frame
+                    if t < 5 or t % 32 == 0:
+                        _logger.info(
+                            "YOLO-seg frame %d: %.3fs (cumulative chunk=%.2fs)",
+                            t, _dt_frame, time.perf_counter() - _tc,
+                        )
+                    _t_frame = time.perf_counter()
 
                     if r.masks is None or r.boxes is None:
                         t += 1

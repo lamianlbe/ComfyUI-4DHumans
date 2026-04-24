@@ -124,7 +124,9 @@
       "Bash(python -c \"import facer; print\\(facer.__file__\\)\")",
       "Bash(python -c ' *)",
       "Bash(/usr/bin/python3 -c ' *)",
-      "Bash(/usr/bin/python3 -c \"import ast; ast.parse\\(open\\('nodes/_farl_face_inference.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(/usr/bin/python3 -c \"import ast; ast.parse\\(open\\('nodes/_farl_face_inference.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(/usr/bin/python3 -c \"import ast; ast.parse\\(open\\('nodes/yolo_seg_node.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(/usr/bin/python3 -c \"import ast; ast.parse\\(open\\('nodes/load_farl_face_node.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

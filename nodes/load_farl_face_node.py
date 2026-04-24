@@ -176,6 +176,17 @@ class LoadFaRLFaceNode:
                 "is False — falling back to CPU."
             )
 
+        # pyfacer's RetinaFace loader (facer/face_detection/retinaface.py
+        # :load_net) unconditionally sets ``torch.backends.cudnn.benchmark
+        # = True`` as a GLOBAL side-effect. That flag tells cuDNN to
+        # benchmark every conv shape on first use — fine for models that
+        # see a single fixed input shape, but catastrophic for pipelines
+        # like YOLO-seg / SAM3 tracking where letterboxed batch shapes
+        # vary frame-to-frame: each new shape triggers an algorithm
+        # search that blows seconds, for NO throughput gain on repeated
+        # calls. Restore the user's original value after load.
+        cudnn_benchmark_before = torch.backends.cudnn.benchmark
+
         # RetinaFace first (cheap). Passing ``model_path`` through to
         # RetinaFaceDetector → load_net → load_model routes the weights
         # through torch.load against our local file, so no torch hub
@@ -220,6 +231,23 @@ class LoadFaRLFaceNode:
             "pts in 300W/iBUG convention (matches COCO-WholeBody 23..90).",
             float(detection_threshold),
         )
+
+        # Undo the global cudnn.benchmark flip pyfacer's load_net() did.
+        # See the note above — leaving benchmark=True ON tanks downstream
+        # YOLO / SAM3 tracking performance because they see varying
+        # letterboxed shapes and re-benchmark per shape. FaRL itself does
+        # not meaningfully benefit from benchmark=True (the aligner's ViT
+        # has consistent 448 px input; RetinaFace anchor conv is
+        # lightweight either way).
+        if torch.backends.cudnn.benchmark != cudnn_benchmark_before:
+            _logger.info(
+                "LoadFaRLFace: restoring torch.backends.cudnn.benchmark "
+                "from %s back to %s (pyfacer flipped it as a global side "
+                "effect — leaving it ON causes YOLO / SAM3 tracking to "
+                "re-benchmark per shape and slow down massively).",
+                torch.backends.cudnn.benchmark, cudnn_benchmark_before,
+            )
+            torch.backends.cudnn.benchmark = cudnn_benchmark_before
 
         return ({
             "detector": face_detector,
