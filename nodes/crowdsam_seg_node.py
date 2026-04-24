@@ -158,9 +158,13 @@ class CrowdSAMInstanceSegmentationNode:
                 pbar.update(1)
                 continue
 
-            boxes  = np.asarray(result.get("boxes",  np.zeros((0, 4))), dtype=np.float32)
-            scores = np.asarray(result.get("scores", np.zeros((0,))),   dtype=np.float32)
-            rles   = list(result.get("rles", []))
+            # ``MaskData`` implements __getitem__ + items() but no .get();
+            # flatten to a plain dict so the defaults below work even when
+            # upstream didn't populate a key at all.
+            result_dict = {k: v for k, v in result.items()}
+            boxes  = np.asarray(result_dict.get("boxes",  np.zeros((0, 4))), dtype=np.float32)
+            scores = np.asarray(result_dict.get("scores", np.zeros((0,))),   dtype=np.float32)
+            rles   = list(result_dict.get("rles", []))
 
             if not logged_shape and len(rles) > 0:
                 _logger.info(
