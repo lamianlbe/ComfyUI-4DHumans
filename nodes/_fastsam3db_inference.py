@@ -33,6 +33,72 @@ from ..fastsam3dbody_lib import ensure_lib_importable
 _logger = logging.getLogger(__name__)
 
 
+def _process_one_image_with_yolo_pose(
+    estimator, img, bboxes, masks=None, cam_int=None,
+    inference_type="full", hand_box_source="body_decoder",
+    yolo_pose_keypoints=None, yolo_pose_body_boxes=None,
+):
+    """Replica of SAM3DBodyEstimator.process_one_image that exposes
+    yolo_pose_keypoints and yolo_pose_body_boxes as arguments.
+
+    Upstream's process_one_image only plumbs these through when the
+    estimator has its own yolo-pose detector attached. We don't attach
+    one (our bboxes + optional yolo-pose come from outside), so we
+    bypass process_one_image and call model.run_inference directly.
+
+    Only the fields we actually consume downstream are returned.
+    """
+    from sam_3d_body.data.utils.prepare_batch import prepare_batch
+    from sam_3d_body.utils import recursive_to
+
+    height, width = img.shape[:2]
+
+    masks_score = None
+    if masks is not None:
+        masks = masks.reshape(-1, height, width, 1).astype(np.uint8)
+        masks_score = np.ones(len(masks), dtype=np.float32)
+
+    batch = prepare_batch(img, estimator.transform, bboxes, masks, masks_score)
+    batch = recursive_to(batch, "cuda")
+    estimator.model._initialize_batch(batch)
+
+    if cam_int is not None:
+        cam_int = cam_int.to(batch["img"])
+        batch["cam_int"] = cam_int.clone()
+
+    outputs = estimator.model.run_inference(
+        img,
+        batch,
+        inference_type=inference_type,
+        transform_hand=estimator.transform_hand,
+        thresh_wrist_angle=estimator.thresh_wrist_angle,
+        hand_box_source=hand_box_source,
+        yolo_pose_keypoints=yolo_pose_keypoints,
+        yolo_pose_body_boxes=yolo_pose_body_boxes,
+    )
+
+    if inference_type == "full":
+        pose_output, _, _, _, _ = outputs
+    else:
+        pose_output = outputs
+
+    out = pose_output["mhr"]
+    out = recursive_to(out, "cpu")
+    out = recursive_to(out, "numpy")
+
+    all_out = []
+    for idx in range(batch["img"].shape[1]):
+        all_out.append({
+            "bbox": batch["bbox"][0, idx].cpu().numpy(),
+            "focal_length": out["focal_length"][idx],
+            "pred_keypoints_3d": out["pred_keypoints_3d"][idx],
+            "pred_keypoints_2d": out["pred_keypoints_2d"][idx],
+            "pred_vertices": out["pred_vertices"][idx],
+            "pred_cam_t": out["pred_cam_t"][idx],
+        })
+    return all_out
+
+
 @contextlib.contextmanager
 def _suppress_stdout():
     """Redirect both Python-level stdout and C-level fd-1 writes.
@@ -421,18 +487,15 @@ def run_fastsam3db_video(
                 per_frame[k] = (masks_np[t, p_idx] > 0.5).astype(np.uint8) * 255
             masks_arr = per_frame
 
-        # YOLO11-Pose alignment (stored on the frame but NOT yet injected
-        # into Fast SAM 3D Body — its `process_one_image` reads
-        # yolo_pose_keypoints only when the detector is of type
-        # "yolo_pose", which requires a detector we deliberately don't
-        # wire up.  Step 3 runs hand_box_source="body_decoder".  Step 4
-        # will monkey-patch run_inference so external keypoints get
-        # forwarded.  The YOLO pass still runs for validation/timing.
+        # YOLO11-Pose alignment → feed directly into Fast SAM 3D Body's
+        # hand decoder via hand_box_source="yolo_pose". Improves finger
+        # joint accuracy on complex hand poses.
         yolo_kp, yolo_bx = None, None
         if yolo_results_per_frame[t] is not None:
             yolo_kp, yolo_bx = _align_yolo_pose_to_mask_bboxes(
                 yolo_results_per_frame[t], mbboxes_np
             )
+        hand_box_source = "yolo_pose" if yolo_kp is not None else "body_decoder"
 
         # RGB frame as ndarray — estimator expects RGB when given ndarray
         img_rgb = images_np_u8[t]  # (H, W, 3) uint8 RGB
@@ -442,16 +505,16 @@ def run_fastsam3db_video(
         t0 = time.perf_counter()
 
         with _suppress_stdout():
-            outputs = estimator.process_one_image(
+            outputs = _process_one_image_with_yolo_pose(
+                estimator=estimator,
                 img=img_rgb,
                 bboxes=mbboxes_np,
                 masks=masks_arr,
-                cam_int=None,   # use default focal = sqrt(H^2 + W^2)
-                bbox_thr=0.0,
-                nms_thr=0.3,
-                use_mask=masks_arr is not None,
+                cam_int=None,
                 inference_type="full",
-                hand_box_source="body_decoder",
+                hand_box_source=hand_box_source,
+                yolo_pose_keypoints=yolo_kp,
+                yolo_pose_body_boxes=yolo_bx,
             )
 
         if torch.cuda.is_available():
@@ -522,13 +585,22 @@ def run_fastsam3db_video(
     # -------------------------------------------------------------------
     # MHR → SMPL, per person SEQUENTIAL (smoother is stateful)
     #
-    # NOTE: MHR2SMPLMultiView.infer_smpl_joints internally does
-    #       `j -= j[0:1]` so the returned 24 joints are *pelvis-centered
-    #       canonical* (pelvis at origin). Downstream (NLF renderer,
-    #       SCAIL transforms, POSES format in general) expect camera-
-    #       space coordinates where the pelvis sits at the person's
-    #       actual depth. Add pred_cam_t back so the canonical pelvis
-    #       lines up with where the body actually is in the scene.
+    # Two frame-alignment problems to solve:
+    #
+    # 1. MHR's canonical frame is NOT pelvis-at-origin (its canonical
+    #    pelvis sits at approx (0, -0.908, 0) for an average body), so
+    #    pred_cam_t absorbs that offset. MHR2SMPL explicitly re-centres
+    #    its output via `j -= j[0:1]`, so its 24 joints have pelvis AT
+    #    origin. Naively adding pred_cam_t therefore mis-places SMPL's
+    #    pelvis by the (0, -0.908, 0) offset — we observed ~0.9 m Y
+    #    discrepancy vs MHR body_joints MidHip.
+    # 2. SMPL's canonical axes are +Y up / +Z forward, while MHR's
+    #    camera frame is +Y down / +Z into the scene. Signs need a flip.
+    #
+    # Fix: use MHR's OWN camera-space MidHip (OP8) as the pelvis anchor
+    # for SMPL, and flip SMPL's Y and Z before translating. This keeps
+    # SMPL 24 joints and MHR body_joints geometrically consistent in
+    # the same camera-space coordinate system.
     # -------------------------------------------------------------------
     mhr2smpl_time_s = 0.0
     t0 = time.perf_counter()
@@ -537,14 +609,22 @@ def run_fastsam3db_video(
         for t in range(B):
             verts = persons[p_idx]["mhr_vertices"][t]
             cam_t = persons[p_idx]["mhr_cam_t"][t]
-            if verts is None or cam_t is None:
+            body_joints_op25 = persons[p_idx]["body_joints"][t]  # camera space
+            if verts is None or cam_t is None or body_joints_op25 is None:
                 continue
             _, _, _, _, joints24 = mhr2smpl.infer_smpl_joints(
                 views=[(verts, cam_t)],
                 smpl_model_path=smpl_pkl,
             )
-            # Translate canonical → camera space
-            joints24_cam = joints24.astype(np.float32) + cam_t[None, :]
+            # Flip Y and Z to convert from SMPL canonical (+Y up, +Z fwd)
+            # to camera convention (+Y down, +Z depth).
+            joints24_flipped = joints24.astype(np.float32).copy()
+            joints24_flipped[:, 1] *= -1
+            joints24_flipped[:, 2] *= -1
+            # Anchor SMPL pelvis to MHR's camera-space MidHip (OP25[8])
+            # so both skeletons agree on where the body is in the scene.
+            midhip_cam = body_joints_op25[8].astype(np.float32)
+            joints24_cam = joints24_flipped + midhip_cam[None, :]
             persons[p_idx]["smpl_j3d"][t] = joints24_cam
     mhr2smpl_time_s = time.perf_counter() - t0
 
