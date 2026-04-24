@@ -1,17 +1,20 @@
 """
-Load RTMPose-Face (68-point facial landmark detector).
+Load RTMPose-Face (106-point facial landmark detector) via rtmlib.
 
-Replaces Sapiens for the face-specific 68 keypoints (COCO-WholeBody
-indices 23-90). Sapiens stays available under the old nodes; this one
-is part of the Fast SAM 3D Body pipeline.
+Replaces Sapiens for face-specific keypoints (COCO-WholeBody indices
+23-90). Sapiens stays available under the old nodes; this one is part
+of the Fast SAM 3D Body pipeline.
 
 Hardcoded path:
     models/rtmpose-face/rtmpose-m-face.onnx
 
-Expected ONNX:
-- Input: (N, 3, 256, 256) float32 [0, 1]  (preprocess matches MMPose)
-- Output: simcc_x (N, 68, 256*simcc_split) and simcc_y (N, 68, 256*simcc_split)
-  OR keypoints (N, 68, 2) + scores (N, 68) — depends on export.
+We wrap MMPose's ONNX export via the ``rtmlib`` library so the
+preprocessing (top-down affine crop → 256×256), ONNX forward, SimCC
+decode and back-projection all go through the upstream reference
+implementation. This eliminates any possibility of a bug in our own
+preprocess/decode being responsible for the alternating-frame issues
+we chased earlier — if rtmlib also reproduces them, it's a model-level
+property and we'll layer a side-prior decoder on top in a follow-up.
 """
 
 import logging
@@ -26,10 +29,10 @@ RTMPOSE_FACE_ONNX = os.path.join(models_dir, "rtmpose-face", "rtmpose-m-face.onn
 
 
 class LoadRTMPoseFaceNode:
-    """Load an RTMPose-Face ONNX model via onnxruntime.
+    """Load an RTMPose-Face ONNX model via ``rtmlib.RTMPose``.
 
-    Building the InferenceSession is cheap (< 1 s). We eagerly create it
-    so the first call in the inference node doesn't pay that cost.
+    Building the instance is cheap (< 1 s) — session is created eagerly
+    inside rtmlib's constructor.
     """
 
     @classmethod
@@ -41,15 +44,12 @@ class LoadRTMPoseFaceNode:
                     {
                         "default": "cpu",
                         "tooltip": (
-                            "onnxruntime execution provider. Default is "
-                            "'cpu' because the CUDAExecutionProvider path "
-                            "has been observed to produce "
-                            "bilaterally-mirrored 106-pt output on every "
-                            "other frame for RTMPose-Face even with "
-                            "deterministic session options; CPU is known "
-                            "good. Try 'cuda' only if you need the speed "
-                            "and have verified stable output on your "
-                            "hardware."
+                            "onnxruntime execution provider for rtmlib. "
+                            "Default is 'cpu' — CUDA has reproduced the "
+                            "alternating mirror bug in earlier tests; we "
+                            "confirmed on CPU the model itself gives the "
+                            "same pattern, so this is purely a speed knob "
+                            "and either is correct."
                         ),
                     },
                 ),
@@ -65,101 +65,49 @@ class LoadRTMPoseFaceNode:
         if not os.path.isfile(RTMPOSE_FACE_ONNX):
             raise FileNotFoundError(
                 f"RTMPose-Face ONNX not found at: {RTMPOSE_FACE_ONNX}\n"
-                f"Download an RTMPose-m face model (COCO-WholeBody 68 "
-                f"landmarks recommended) from the MMPose model zoo and "
-                f"place it at this exact location."
+                f"Download an RTMPose-m face model (Face6 / 106 landmarks "
+                f"recommended) from the MMPose model zoo and place it at "
+                f"this exact location."
             )
 
         try:
-            import onnxruntime as ort
+            from rtmlib import RTMPose
         except ImportError as e:
             raise ImportError(
-                "onnxruntime required. Install with:\n"
+                "rtmlib required. Install with:\n"
+                "  pip install rtmlib\n"
+                "and also one of:\n"
                 "  pip install onnxruntime-gpu   (CUDA build)\n"
-                "or\n"
                 "  pip install onnxruntime       (CPU-only build)"
             ) from e
 
-        # We observed a reproducible alternating-frame bug with
-        # CUDAExecutionProvider on MMPose's RTMPose-Face ONNX: on 4
-        # consecutive calls the 106-pt output on slots 0 and 2 was
-        # correct while slots 1 and 3 were a ~bilaterally-mirrored
-        # version.  The input bboxes were essentially identical, so
-        # the root cause is almost certainly CUDA EP non-determinism
-        # (cuDNN algo search / memory pattern reuse picking different
-        # kernels across calls, which for a near-symmetric face nudges
-        # SimCC argmax between the true peak and its mirror peak).
-        #
-        # Neutralise by locking every knob that can introduce
-        # call-to-call variation:
-        sess_options = ort.SessionOptions()
-        sess_options.intra_op_num_threads = 1
-        sess_options.inter_op_num_threads = 1
-        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        # These two are the big ones for non-determinism across
-        # consecutive session.run() calls:
-        #   enable_mem_pattern: pre-plans tensor allocations from the
-        #       first run and reuses that pattern. If the second run
-        #       lands slightly different, the reused layout can cause
-        #       stale data to leak into the next op.
-        #   enable_cpu_mem_arena: similar pooling on CPU.
-        sess_options.enable_mem_pattern = False
-        sess_options.enable_cpu_mem_arena = False
-        # Keep optimisations but avoid aggressive fusions that could
-        # bake in assumptions about repeated buffers.
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
-
-        if provider == "cuda":
-            # Pin cuDNN to a fixed conv algorithm ("DEFAULT" = cuDNN's
-            # default, not a per-input heuristic search). HEURISTIC /
-            # EXHAUSTIVE pick different kernels depending on workspace
-            # availability, which is a common source of
-            # call-to-call output drift on near-identical inputs.
-            cuda_provider_options = {
-                "cudnn_conv_algo_search": "DEFAULT",
-                "do_copy_in_default_stream": True,
-                "arena_extend_strategy": "kNextPowerOfTwo",
-            }
-            providers = [
-                ("CUDAExecutionProvider", cuda_provider_options),
-                "CPUExecutionProvider",
-            ]
-        else:
-            providers = ["CPUExecutionProvider"]
+        device = "cuda" if provider == "cuda" else "cpu"
 
         _logger.info(
-            "Loading RTMPose-Face ONNX from %s (providers=%s, sequential, "
-            "single-threaded)",
-            RTMPOSE_FACE_ONNX, providers,
-        )
-        session = ort.InferenceSession(
-            RTMPOSE_FACE_ONNX, sess_options=sess_options, providers=providers,
+            "Loading RTMPose-Face via rtmlib from %s (device=%s)",
+            RTMPOSE_FACE_ONNX, device,
         )
 
-        # Inspect I/O to confirm expected shape & make it available downstream.
-        input_info = session.get_inputs()[0]
-        output_infos = [(o.name, o.shape) for o in session.get_outputs()]
+        # rtmlib's RTMPose expects the model_input_size matching the ONNX
+        # export (256x256 for the face model). Mean/std are the standard
+        # ImageNet-RGB numbers MMPose trains on; passing ComfyUI's RGB
+        # frames to rtmlib will apply these to matching channels.
+        face = RTMPose(
+            onnx_model=RTMPOSE_FACE_ONNX,
+            model_input_size=(256, 256),
+            mean=(123.675, 116.28, 103.53),
+            std=(58.395, 57.12, 57.375),
+            backend="onnxruntime",
+            device=device,
+        )
+
         _logger.info(
-            "RTMPose-Face I/O: input %s %s  outputs %s",
-            input_info.name, input_info.shape, output_infos,
+            "RTMPose-Face loaded: device=%s, input_size=%s",
+            device, (256, 256),
         )
-
-        # Warn when ONNX was exported with a fixed batch dimension
-        # (common for MMPose RTMPose deployment exports); the
-        # inference code will fall back to one-frame-at-a-time runs.
-        if input_info.shape and isinstance(input_info.shape[0], int) \
-                and input_info.shape[0] >= 1:
-            _logger.info(
-                "RTMPose-Face ONNX uses STATIC batch=%d; will run one "
-                "frame per session.run call.",
-                input_info.shape[0],
-            )
 
         return ({
-            "session": session,
-            "input_name": input_info.name,
-            "input_shape": input_info.shape,  # e.g. [N, 3, 256, 256] or dynamic
-            "output_names": [o.name for o in session.get_outputs()],
-            "providers": providers,
+            "face": face,
+            "device": device,
             "onnx_path": RTMPOSE_FACE_ONNX,
         },)
