@@ -45,8 +45,16 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 _logger = logging.getLogger(__name__)
+
+
+# RetinaFace MobileNet-0.25 doesn't benefit from >640 px input for
+# typical human-sized faces, and its anchor grid / NMS cost is
+# O(H*W). Downscale the detector input (NOT the aligner input — FaRL
+# still runs on the full-res frame so 68-pt accuracy is preserved).
+_DETECTOR_MAX_SIDE = 640
 
 
 def _match_faces_to_persons(
@@ -164,29 +172,102 @@ def run_farl_face_video(
     if B == 0 or n_persons == 0:
         return face_kp_68_timeline, 0.0
 
+    # --- Pre-filter: drop frames that have no tracked persons ----------
+    # RetinaFace + FaRL are the biggest per-frame cost in this node.
+    # Running them on frames where every mask is empty was wasted work
+    # (the earlier pipeline already filtered by MHR head-kp availability,
+    # which effectively gated on mask presence upstream).
+    if masks_np.size > 0:
+        active_any = np.any(masks_np.reshape(B, -1), axis=1)
+        active_frames_all = np.where(active_any)[0].tolist()
+    else:
+        active_frames_all = []
+
+    if pbar is not None and len(active_frames_all) < B:
+        # Advance the progress bar for the frames we're skipping so the
+        # caller's `ProgressBar(B * 2)` budget stays accurate.
+        pbar.update(B - len(active_frames_all))
+
+    if not active_frames_all:
+        return face_kp_68_timeline, 0.0
+
+    # --- Detector downscale factor -------------------------------------
+    # RetinaFace MobileNet-0.25's anchor + NMS cost is O(H*W). A 640-
+    # side cap drops a 1080p frame's detector cost by ~9× and a 4K
+    # frame's by ~36× with no meaningful recall hit for human-sized
+    # faces. The FaRL aligner still runs on the FULL-resolution frame
+    # (landmark accuracy depends on real pixel fidelity), so this
+    # optimization is detector-only.
+    det_scale = min(
+        float(_DETECTOR_MAX_SIDE) / float(max(img_h, img_w)), 1.0,
+    )
+    det_h = max(1, int(round(img_h * det_scale)))
+    det_w = max(1, int(round(img_w * det_scale)))
+
+    _logger.info(
+        "FaRL: processing %d/%d active frames; detector input "
+        "%dx%d (scale %.3f), aligner input %dx%d",
+        len(active_frames_all), B, det_h, det_w, det_scale, img_h, img_w,
+    )
+
+    # --- GPU-aware sub-step timers --------------------------------------
+    # Without cuda.synchronize() every op looks instant because kernels
+    # are queued asynchronously. Force a sync at every measurement edge
+    # so the numbers reflect real wall time.
+    is_cuda = isinstance(device, str) and device.startswith("cuda") \
+              or (isinstance(device, torch.device) and device.type == "cuda")
+    def _sync():
+        if is_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    t_prep = 0.0         # numpy -> tensor -> device
+    t_det_resize = 0.0   # optional downscale for detector
+    t_det_fwd = 0.0      # RetinaFace forward
+    t_det_unpack = 0.0   # detector outputs -> numpy (includes cpu sync)
+    t_match = 0.0        # face -> person via mask
+    t_align_fwd = 0.0    # FaRL aligner forward
+    t_align_unpack = 0.0 # alignment -> numpy (includes cpu sync)
+    t_scatter = 0.0      # assign into face_kp_68_timeline
+
+    n_chunks = 0
+    n_det_faces = 0
+    n_matched = 0
+
     t_start = time.perf_counter()
 
-    for chunk_start in range(0, B, frame_batch_size):
-        chunk_end = min(chunk_start + frame_batch_size, B)
-        chunk_frames = list(range(chunk_start, chunk_end))
+    for chunk_start in range(0, len(active_frames_all), frame_batch_size):
+        chunk_frames = active_frames_all[chunk_start:chunk_start + frame_batch_size]
         M = len(chunk_frames)
+        n_chunks += 1
 
-        # (M, H, W, 3) uint8 RGB -> (M, 3, H, W) uint8 RGB on device.
-        # pyfacer's detector does ``images.float()`` internally and
-        # subtracts the [104, 117, 123] mean; its own samples feed RGB
-        # (read via PIL → RGB), so we follow the same convention.
-        # ``images.clone()`` inside RetinaFaceDetector.forward keeps
-        # subsequent aligner calls from seeing a mutated tensor, but we
-        # also avoid any in-place surprises by keeping our reference
-        # separate.
+        # --- Prep: numpy slice + tensor build + host->device -----------------
+        _sync(); _t = time.perf_counter()
         chunk_imgs = images_np_u8[chunk_frames]
         images_bchw = torch.from_numpy(chunk_imgs).permute(0, 3, 1, 2).contiguous()
         images_bchw = images_bchw.to(device)
+        _sync(); t_prep += time.perf_counter() - _t
 
-        # --- RetinaFace -----------------------------------------------------
+        # --- (Optional) downscale for detector -------------------------------
+        _sync(); _t = time.perf_counter()
+        if det_scale < 1.0:
+            # F.interpolate doesn't accept uint8; go through float once.
+            # The detector's batch_detect does `images.float()` anyway, so
+            # feeding float here is a no-op on its side.
+            det_input = F.interpolate(
+                images_bchw.float(),
+                size=(det_h, det_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+        else:
+            det_input = images_bchw
+        _sync(); t_det_resize += time.perf_counter() - _t
+
+        # --- RetinaFace forward ----------------------------------------------
+        _sync(); _t = time.perf_counter()
         try:
             with torch.inference_mode():
-                faces_det: Dict[str, torch.Tensor] = detector(images_bchw)
+                faces_det: Dict[str, torch.Tensor] = detector(det_input)
         except Exception as e:
             _logger.error(
                 "RetinaFace failed on frames %d..%d: %s",
@@ -195,6 +276,7 @@ def run_farl_face_video(
             if pbar is not None:
                 pbar.update(M)
             continue
+        _sync(); t_det_fwd += time.perf_counter() - _t
 
         # Empty result → no faces in this chunk, move on.
         if (
@@ -205,12 +287,21 @@ def run_farl_face_video(
                 pbar.update(M)
             continue
 
+        # --- Detector output -> numpy (GPU->CPU sync) -----------------------
+        _t = time.perf_counter()
         all_image_ids = faces_det["image_ids"].detach().cpu().numpy().astype(np.int64)
         all_rects     = faces_det["rects"].detach().cpu().numpy().astype(np.float32)
         all_points    = faces_det["points"].detach().cpu().numpy().astype(np.float32)
         all_scores    = faces_det["scores"].detach().cpu().numpy().astype(np.float32)
+        if det_scale < 1.0:
+            inv = 1.0 / det_scale
+            all_rects  = all_rects * inv
+            all_points = all_points * inv
+        t_det_unpack += time.perf_counter() - _t
+        n_det_faces += len(all_image_ids)
 
         # --- Match detections to persons ------------------------------------
+        _t = time.perf_counter()
         m_image_ids, m_det_idx, m_meta = _match_faces_to_persons(
             image_ids=all_image_ids,
             rects=all_rects,
@@ -221,13 +312,16 @@ def run_farl_face_video(
             img_h=img_h,
             img_w=img_w,
         )
+        t_match += time.perf_counter() - _t
 
         if not m_image_ids:
             if pbar is not None:
                 pbar.update(M)
             continue
+        n_matched += len(m_image_ids)
 
         # --- FaRL aligner on matched subset ---------------------------------
+        _sync(); _t = time.perf_counter()
         matched_points = all_points[np.asarray(m_det_idx, dtype=np.int64)]  # (K', 5, 2)
         aligner_in = {
             "image_ids": torch.as_tensor(
@@ -249,10 +343,15 @@ def run_farl_face_video(
             if pbar is not None:
                 pbar.update(M)
             continue
+        _sync(); t_align_fwd += time.perf_counter() - _t
 
+        # --- Alignment -> numpy (GPU->CPU sync) ------------------------------
+        _t = time.perf_counter()
         alignment = (
             aligner_out["alignment"].detach().cpu().numpy().astype(np.float32)
         )
+        t_align_unpack += time.perf_counter() - _t
+
         if alignment.ndim != 3 or alignment.shape[1] != 68:
             _logger.warning(
                 "FaRL returned alignment shape %s on chunk starting at "
@@ -274,10 +373,36 @@ def run_farl_face_video(
             kpts_xyz = alignment
 
         # --- Scatter to per-person timeline ---------------------------------
+        _t = time.perf_counter()
         for i, (t_global, p_idx) in enumerate(m_meta):
             face_kp_68_timeline[p_idx][t_global] = kpts_xyz[i]
+        t_scatter += time.perf_counter() - _t
 
         if pbar is not None:
             pbar.update(M)
 
-    return face_kp_68_timeline, time.perf_counter() - t_start
+        # Per-chunk line — emit the FIRST chunk (picks up cudnn benchmark
+        # + JIT warmup cost) and then every 10th chunk for live signal.
+        if n_chunks == 1 or n_chunks % 10 == 0:
+            _logger.info(
+                "FaRL chunk %d: frames=%d, det_faces=%d, matched=%d | "
+                "prep=%.3fs det_resize=%.3fs det_fwd=%.3fs det_unpack=%.3fs "
+                "match=%.3fs align_fwd=%.3fs align_unpack=%.3fs scatter=%.3fs",
+                n_chunks, M, len(all_image_ids), len(m_image_ids),
+                t_prep, t_det_resize, t_det_fwd, t_det_unpack,
+                t_match, t_align_fwd, t_align_unpack, t_scatter,
+            )
+
+    total = time.perf_counter() - t_start
+    _logger.info(
+        "FaRL TOTAL (%d chunks, %d det faces, %d matched): "
+        "prep=%.2fs det_resize=%.2fs det_fwd=%.2fs det_unpack=%.2fs | "
+        "match=%.2fs | align_fwd=%.2fs align_unpack=%.2fs scatter=%.2fs | "
+        "wall=%.2fs",
+        n_chunks, n_det_faces, n_matched,
+        t_prep, t_det_resize, t_det_fwd, t_det_unpack,
+        t_match, t_align_fwd, t_align_unpack, t_scatter,
+        total,
+    )
+
+    return face_kp_68_timeline, total
