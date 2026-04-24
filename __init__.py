@@ -28,6 +28,8 @@ from .nodes.load_fast_sam_3d_body_node import LoadFastSAM3DBodyNode
 from .nodes.load_yolo11_pose_node import LoadYOLO11PoseNode
 from .nodes.load_farl_face_node import LoadFaRLFaceNode
 from .nodes.fastsam3db_farl_pose_node import FastSAM3DBodyFaRLPoseNode
+from .nodes.load_crowdsam_node import LoadCrowdSAMNode
+from .nodes.crowdsam_seg_node import CrowdSAMInstanceSegmentationNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -52,6 +54,8 @@ NODE_CLASS_MAPPINGS = {
     'LoadYOLO11Pose': LoadYOLO11PoseNode,
     'LoadFaRLFace': LoadFaRLFaceNode,
     'FastSAM3DBodyFaRLPose': FastSAM3DBodyFaRLPoseNode,
+    'LoadCrowdSAM': LoadCrowdSAMNode,
+    'CrowdSAMInstanceSegmentation': CrowdSAMInstanceSegmentationNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -76,4 +80,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'LoadYOLO11Pose': 'Load YOLO11m-Pose',
     'LoadFaRLFace': 'Load FaRL Face',
     'FastSAM3DBodyFaRLPose': 'Fast SAM 3D Body + FaRL Face Pose',
+    'LoadCrowdSAM': 'Load CrowdSAM',
+    'CrowdSAMInstanceSegmentation': 'CrowdSAM Instance Segmentation',
 }
