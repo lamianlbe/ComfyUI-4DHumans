@@ -37,12 +37,19 @@ class LoadRTMPoseFaceNode:
         return {
             "required": {
                 "provider": (
-                    ["cuda", "cpu"],
+                    ["cpu", "cuda"],
                     {
-                        "default": "cuda",
+                        "default": "cpu",
                         "tooltip": (
-                            "onnxruntime execution provider. 'cuda' uses "
-                            "CUDAExecutionProvider; 'cpu' falls back to CPU."
+                            "onnxruntime execution provider. Default is "
+                            "'cpu' because the CUDAExecutionProvider path "
+                            "has been observed to produce "
+                            "bilaterally-mirrored 106-pt output on every "
+                            "other frame for RTMPose-Face even with "
+                            "deterministic session options; CPU is known "
+                            "good. Try 'cuda' only if you need the speed "
+                            "and have verified stable output on your "
+                            "hardware."
                         ),
                     },
                 ),
