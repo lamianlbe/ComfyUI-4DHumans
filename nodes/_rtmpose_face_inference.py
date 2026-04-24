@@ -333,9 +333,15 @@ def run_rtmpose_face_video(
 
     # Optional debug: collect raw 106-pt output from the first frame of
     # each person so we can manually calibrate the LaPa106 → 300W68 map.
+    # Also dump the actual 256×256 tensor fed to ONNX (reconstructed as
+    # uint8 RGB) so we can visually verify the preprocessing.
     debug_dump = None
     if debug_dump_path is not None:
-        debug_dump = {"bboxes": [], "kpts_106": [], "frame_idx": [], "person_idx": []}
+        debug_dump = {
+            "bboxes": [], "kpts_106": [],
+            "frame_idx": [], "person_idx": [],
+            "preproc_u8": [],  # (256, 256, 3) uint8, what ONNX sees
+        }
 
     # Process in batches
     for chunk_start in range(0, len(requests), batch_size):
@@ -370,14 +376,22 @@ def run_rtmpose_face_video(
 
         kpts_orig = _unmap_to_original(kpts_model, inv_params_batch)
 
-        # Debug dump: save raw 106 points + bbox for EVERY (person, frame)
-        # pair so we can diagnose frame-to-frame stability issues.
+        # Debug dump: save raw 106 points + bbox + preproc image for
+        # EVERY (person, frame) pair so we can diagnose frame-to-frame
+        # stability issues.
         if debug_dump is not None:
             for i, (p_idx, t, bbox) in enumerate(chunk):
                 debug_dump["bboxes"].append(np.array(bbox, dtype=np.float32))
                 debug_dump["kpts_106"].append(kpts_orig[i].astype(np.float32))
                 debug_dump["frame_idx"].append(int(t))
                 debug_dump["person_idx"].append(int(p_idx))
+                # Reverse the ImageNet normalisation so what we save is
+                # literally "the pixels ONNX got to see".
+                chw = batch[i]  # (3, 256, 256) float32 normalised
+                hwc = chw.transpose(1, 2, 0)
+                rgb = (hwc * _IMG_STD + _IMG_MEAN)
+                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                debug_dump["preproc_u8"].append(rgb)
 
         # Map 106 → 68 and scatter back
         K = kpts_orig.shape[1]
@@ -417,9 +431,11 @@ def run_rtmpose_face_video(
             kpts_106=np.stack(debug_dump["kpts_106"]),
             frame_idx=np.array(debug_dump["frame_idx"], dtype=np.int32),
             person_idx=np.array(debug_dump["person_idx"], dtype=np.int32),
+            preproc_u8=np.stack(debug_dump["preproc_u8"]),  # (N, 256, 256, 3)
         )
         _logger.info(
-            "RTMPose-Face raw 106-pt debug dump saved to %s  (%d entries)",
+            "RTMPose-Face raw 106-pt debug dump saved to %s  (%d entries, "
+            "with preproc_u8 tensor)",
             debug_dump_path, len(debug_dump["kpts_106"]),
         )
 
