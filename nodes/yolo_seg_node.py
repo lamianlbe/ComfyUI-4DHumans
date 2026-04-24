@@ -14,7 +14,6 @@ changes.
 
 import logging
 import os
-import time
 
 import numpy as np
 import torch
@@ -22,7 +21,6 @@ import torch
 import comfy.utils
 from folder_paths import models_dir
 
-from ._device_probe import log_probe as _dp
 from ._mask_utils import pack_mask, unpack_mask
 
 # Hardcoded checkpoint path: <ComfyUI models/>/reface/yolo26x-seg.pt
@@ -193,12 +191,6 @@ class YOLOInstanceSegmentationNode:
         # (Sending the whole (B, 3, H, W) tensor in one call makes
         # ultralytics allocate ~B * H * W * 12 bytes of VRAM up front.)
         source_cpu = images.permute(0, 3, 1, 2).contiguous().float()
-        _logger.info(
-            "YOLO-seg input: images.device=%s images.dtype=%s "
-            "-> source_cpu.device=%s source_cpu.dtype=%s shape=%s",
-            images.device, images.dtype,
-            source_cpu.device, source_cpu.dtype, tuple(source_cpu.shape),
-        )
 
         pbar = comfy.utils.ProgressBar(B)
 
@@ -209,8 +201,6 @@ class YOLOInstanceSegmentationNode:
         logged_shape = False
 
         try:
-            _dp(model, "YOLO-seg BEFORE restore-to-cuda")
-
             # Ensure model is on GPU (previous run offloaded to CPU).
             # Prefer the wrapper `.to()` so ultralytics' cached `.device`
             # attribute gets refreshed alongside the weight move.
@@ -222,8 +212,6 @@ class YOLOInstanceSegmentationNode:
                         model.model.to("cuda")
                 except Exception as e:
                     _logger.warning("YOLO restore-to-CUDA failed: %s", e)
-
-            _dp(model, "YOLO-seg AFTER restore-to-cuda")
 
             # Process the video in chunks to bound peak VRAM.  Use
             # persist=True so ByteTrack / BoT-SORT carry their state
@@ -247,40 +235,18 @@ class YOLOInstanceSegmentationNode:
                     verbose=False,
                 )
                 if torch.cuda.is_available():
-                    # Override any stale cached device selection.
+                    # Explicit override in case ultralytics' cached
+                    # device selection is stale after a CPU offload.
                     track_kwargs["device"] = "cuda"
-
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                _tc = time.perf_counter()
 
                 results_iter = model.track(**track_kwargs)
 
-                chunk_frames_done = 0
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                _t_frame = time.perf_counter()
                 for r in results_iter:
                     if t >= B:
                         break
 
-                    # Per-frame timing (cuda-sync'd) so we can tell if
-                    # slowness is uniform-per-frame (compute bottleneck)
-                    # vs first-frame-only (warmup / cudnn-benchmark /
-                    # kernel JIT).
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    _dt_frame = time.perf_counter() - _t_frame
-                    if t < 5 or t % 32 == 0:
-                        _logger.info(
-                            "YOLO-seg frame %d: %.3fs (cumulative chunk=%.2fs)",
-                            t, _dt_frame, time.perf_counter() - _tc,
-                        )
-                    _t_frame = time.perf_counter()
-
                     if r.masks is None or r.boxes is None:
                         t += 1
-                        chunk_frames_done += 1
                         pbar.update(1)
                         continue
 
@@ -290,13 +256,10 @@ class YOLOInstanceSegmentationNode:
                     if not logged_shape:
                         _logger.info(
                             "YOLO mask shape: %s, dtype: %s, range: [%.2f, %.2f], "
-                            "image shape: (%d, %d), chunk_size=%d, "
-                            "masks.device=%s, boxes.device=%s",
+                            "image shape: (%d, %d), chunk_size=%d",
                             tuple(masks_data.shape), masks_data.dtype,
                             float(masks_data.min()), float(masks_data.max()),
                             H, W, chunk_size,
-                            masks_data.device,
-                            r.boxes.data.device,
                         )
                         logged_shape = True
 
@@ -328,16 +291,7 @@ class YOLOInstanceSegmentationNode:
                         all_track_ids.add(int(tid))
 
                     t += 1
-                    chunk_frames_done += 1
                     pbar.update(1)
-
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                _logger.info(
-                    "YOLO-seg chunk %d..%d (%d frames): %.3fs",
-                    chunk_start, chunk_end - 1, chunk_frames_done,
-                    time.perf_counter() - _tc,
-                )
 
                 # Force-release per-chunk intermediate tensors (Results
                 # objects, heatmaps, resized masks still on GPU) before
@@ -346,7 +300,6 @@ class YOLOInstanceSegmentationNode:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         finally:
-            _dp(model, "YOLO-seg BEFORE offload-to-cpu")
             # Offload YOLO to CPU so downstream nodes have VRAM available
             try:
                 if hasattr(model, "to"):
@@ -357,7 +310,6 @@ class YOLOInstanceSegmentationNode:
                 _logger.warning("YOLO VRAM offload failed: %s", e)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            _dp(model, "YOLO-seg AFTER offload-to-cpu")
 
         if not all_track_ids:
             _logger.warning(

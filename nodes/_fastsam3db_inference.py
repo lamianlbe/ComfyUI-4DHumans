@@ -432,18 +432,13 @@ def run_fastsam3db_video(
     # -------------------------------------------------------------------
     yolo_results_per_frame = [None] * B
     if yolo11pose_dict is not None:
-        from ._device_probe import log_probe as _dp
-
         yolo_model = yolo11pose_dict["model"]
 
-        _dp(yolo_model, "YOLO11m-Pose BEFORE restore-to-cuda")
-
         # Move to GPU if not already (LoadYOLO could have offloaded previously).
-        # IMPORTANT: Call `.to("cuda")` on the Ultralytics wrapper itself
-        # (not just `.model`) when that method exists — the wrapper
-        # caches a `.device` attribute that stays stale otherwise, and
-        # some ultralytics versions pick inference device from that
-        # cache rather than from the weights' actual device.
+        # Prefer the Ultralytics wrapper's own `.to()` when present so the
+        # wrapper's cached `.device` attribute gets refreshed alongside
+        # the weight move — some ultralytics versions use that cache to
+        # pick the inference device rather than the weights' real device.
         if torch.cuda.is_available():
             try:
                 if hasattr(yolo_model, "to"):
@@ -453,52 +448,25 @@ def run_fastsam3db_video(
             except Exception as e:
                 _logger.warning("YOLO11 restore-to-CUDA failed: %s", e)
 
-        _dp(yolo_model, "YOLO11m-Pose AFTER restore-to-cuda")
-
         # YOLO runs on uint8 HWC RGB directly (cv2 convention == ours).
         # ultralytics accepts a list of np arrays.
         frame_list_bgr = [images_np_u8[t, :, :, ::-1] for t in range(B)]  # RGB→BGR
         t0 = time.perf_counter()
-        first_probe_logged = False
         for chunk_start in range(0, B, batch_size_yolo):
             chunk = frame_list_bgr[chunk_start:chunk_start + batch_size_yolo]
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            _tc = time.perf_counter()
-            # Explicit `device="cuda"` overrides any stale cached device
-            # selection inside Ultralytics.
             predict_kwargs = dict(
                 source=chunk, verbose=False, classes=[0], conf=0.25, stream=False,
             )
             if torch.cuda.is_available():
+                # Explicit override in case ultralytics' cached device
+                # selection is stale after a CPU offload.
                 predict_kwargs["device"] = "cuda"
             results = list(yolo_model.predict(**predict_kwargs))
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            chunk_dt = time.perf_counter() - _tc
-            _logger.info(
-                "YOLO11m-Pose chunk %d..%d (%d frames): %.3fs",
-                chunk_start, chunk_start + len(chunk) - 1, len(chunk), chunk_dt,
-            )
-            if not first_probe_logged and results:
-                r0 = results[0]
-                try:
-                    kp_dev = r0.keypoints.data.device if r0.keypoints is not None else "n/a"
-                    bx_dev = r0.boxes.data.device if r0.boxes is not None else "n/a"
-                    _logger.info(
-                        "YOLO11m-Pose first result: keypoints.device=%s, boxes.device=%s",
-                        kp_dev, bx_dev,
-                    )
-                except Exception as e:
-                    _logger.info("YOLO11m-Pose first-result device inspect failed: %s", e)
-                first_probe_logged = True
             for i, r in enumerate(results):
                 yolo_results_per_frame[chunk_start + i] = r
         _logger.info(
             "YOLO11m-Pose on %d frames: %.2fs", B, time.perf_counter() - t0
         )
-
-        _dp(yolo_model, "YOLO11m-Pose BEFORE offload-to-cpu")
 
         # Offload YOLO back to CPU to free VRAM for Fast SAM 3D Body
         try:
@@ -510,8 +478,6 @@ def run_fastsam3db_video(
                 torch.cuda.empty_cache()
         except Exception:
             pass
-
-        _dp(yolo_model, "YOLO11m-Pose AFTER offload-to-cpu")
 
     # -------------------------------------------------------------------
     # Fast SAM 3D Body per-frame inference
