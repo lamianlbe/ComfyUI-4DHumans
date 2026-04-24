@@ -246,6 +246,11 @@ class YOLOInstanceSegmentationNode:
                         break
 
                     if r.masks is None or r.boxes is None:
+                        _logger.info(
+                            "  YOLO-seg frame %4d: NO masks/boxes (YOLO "
+                            "found nothing for classes=%s)",
+                            t, class_list,
+                        )
                         t += 1
                         pbar.update(1)
                         continue
@@ -263,10 +268,57 @@ class YOLOInstanceSegmentationNode:
                         )
                         logged_shape = True
 
+                    # --- Per-frame tracker-output dump --------------------
+                    # Logs every detection: YOLO class-conf + tracker ID
+                    # (or 'NONE' if the tracker dropped it) + bbox. Helps
+                    # diagnose track-ID swaps, false positives, and the
+                    # "ids is None" fallback_id injection below.
+                    boxes_xyxy = r.boxes.xyxy.cpu().numpy() \
+                        if r.boxes.xyxy is not None else None
+                    confs = r.boxes.conf.cpu().numpy() \
+                        if r.boxes.conf is not None else None
+                    ids_cpu = ids.cpu().numpy().astype(int) \
+                        if ids is not None else None
+                    det_lines = []
+                    N_det = int(masks_data.shape[0])
+                    for k in range(N_det):
+                        conf = float(confs[k]) if confs is not None else -1.0
+                        tid_str = (
+                            f"tid={int(ids_cpu[k])}"
+                            if ids_cpu is not None else "tid=NONE"
+                        )
+                        if boxes_xyxy is not None:
+                            x1, y1, x2, y2 = boxes_xyxy[k]
+                            bbox_str = (
+                                f"({int(x1)},{int(y1)},"
+                                f"{int(x2)},{int(y2)})"
+                            )
+                        else:
+                            bbox_str = "(?)"
+                        det_lines.append(
+                            f"{tid_str} conf={conf:.2f} {bbox_str}"
+                        )
+                    _logger.info(
+                        "  YOLO-seg frame %4d: %d det(s) | %s",
+                        t, N_det,
+                        " | ".join(det_lines) if det_lines else "(none)",
+                    )
+
                     # Tracker may skip IDs on noisy detections; assign
                     # one-shot placeholder IDs so those masks still
                     # appear in their own slot rather than being merged.
                     if ids is None:
+                        _logger.warning(
+                            "  YOLO-seg frame %4d: tracker returned "
+                            "r.boxes.id=None for all %d detections — "
+                            "injecting fallback IDs %d..%d. This creates "
+                            "PHANTOM slots (one per detection, unmergeable "
+                            "with real tracks) and is the #1 cause of "
+                            "inflated n_persons when BoT-SORT hasn't yet "
+                            "confirmed its tracks.",
+                            t, N_det, fallback_id,
+                            fallback_id + N_det - 1,
+                        )
                         ids = torch.arange(masks_data.shape[0]) + fallback_id
                         fallback_id += masks_data.shape[0]
 
