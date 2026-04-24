@@ -1,18 +1,31 @@
 """
 FaRL face inference helper.
 
-Given per-person face bboxes derived from Fast SAM 3D Body's head
-keypoints, run FaRL (via pyfacer) to get 68-point face landmarks in
-the 300W / iBUG convention — exactly what COCO-WholeBody indices
-23..90 expect.
+Given per-person head keypoints from Fast SAM 3D Body (COCO-WB
+indices 0..4: nose, L_eye, R_eye, L_ear, R_ear), run FaRL (via
+pyfacer) to get 68-point face landmarks in the 300W / iBUG
+convention — exactly what COCO-WholeBody indices 23..90 expect.
+
+IMPORTANT: pyfacer's FaRLFaceAlignment is a REFINEMENT model, not a
+bbox-based detector. It requires ``faces['points']`` with shape
+(N, 5, 2) in RetinaFace order
+``[L_eye, R_eye, nose, L_mouth, R_mouth]`` (where L/R are IMAGE
+left/right, not subject's own); it uses them to compute a similarity
+alignment matrix to the canonical 448×448 template before running
+the ViT. Our upstream only gives us nose + eyes + ears, so we
+synthesize the 2 mouth corners from facial geometry (see
+``_mhr_head_to_retinaface_5_points`` — ratios read off the canonical
+template in ``facer/transform.py::_standard_face_pts``:
+nose-below-eyes = 0.50*eye_dist, mouth-below-nose = 0.62*eye_dist,
+mouth-half-width = 0.30*eye_dist).
 
 FaRL returns landmarks already in ORIGINAL image pixel coords, so no
 back-projection is needed.
 
 Pipeline per frame-chunk:
-  1. collect all (frame_idx, person_idx, bbox) slots
-  2. build a (M, 3, H, W) uint8 image tensor for M frames in the chunk
-  3. build rects (N, 4) + image_ids (N,) mapping each face to its frame
+  1. collect all (frame_idx, person_idx, 5-point array) slots
+  2. build (M, 3, H, W) uint8 image tensor for M frames in the chunk
+  3. build points (N, 5, 2) + image_ids (N,) mapping each face to its frame
   4. one call to ``face_aligner(images, faces)`` processes them all
   5. scatter the (N, 68, 2) output back into per-(person, frame) slots
 """
@@ -27,45 +40,79 @@ import torch
 _logger = logging.getLogger(__name__)
 
 
-def _get_face_bbox_from_coco_wb_head(
+def _mhr_head_to_retinaface_5_points(
     coco_wb_body_feet: np.ndarray,  # (23, 3) or (23, 2)
-    img_h: int,
-    img_w: int,
-    expand_ratio: float = 1.8,
-) -> Optional[Tuple[int, int, int, int]]:
-    """Derive a square face bbox from the 5 head keypoints (nose + eyes
-    + ears, COCO-WB 0..4).
+) -> Optional[np.ndarray]:
+    """Build a (5, 2) RetinaFace-order landmark array from the COCO-WB
+    head keypoints we have from MHR (nose, L_eye, R_eye, L_ear, R_ear).
 
-    Returns ``None`` when head keypoints are too sparse to locate a face.
+    pyfacer's FaRL face_aligner needs 5 landmarks in the order
+    ``[L_eye, R_eye, nose, L_mouth, R_mouth]`` to compute its
+    similarity alignment matrix. MHR gives us 3 real points (nose +
+    both eyes) and two that aren't useful (ears). We synthesize the
+    mouth corners from facial geometry so the alignment transform
+    gets real rotation + scale info from the actual eye/nose triangle
+    rather than canonical guesses inside a bbox.
+
+    Ratios taken from pyfacer's canonical template (in
+    ``facer/transform.py::_standard_face_pts``), which in 256×256
+    pixel basis is:
+        L_eye (196, 226), R_eye (316, 226)   -> eye_dist = 120
+        nose  (256, 286)                     -> nose below eyes by 60 px
+        L_mouth (220, 360.4), R_mouth (292, 360.4)
+                                              -> mouth below nose by 74.4 px
+                                              -> mouth half-width   = 36 px
+    Relative to ``eye_dist``:
+        mouth-below-nose   = 74.4 / 120 = 0.62
+        mouth-half-width   = 36.0 / 120 = 0.30
+    The mouth-center is placed along the face-midline (extension of
+    the eye-midpoint → nose vector) so the synthesis respects real
+    head tilt/roll, not just image-axis assumptions.
+
+    Returns ``None`` when we don't have enough valid head kps to
+    produce a stable alignment.
     """
     head = coco_wb_body_feet[:5]
     if head.shape[1] >= 3:
         conf = head[:, 2]
     else:
         conf = np.ones(5, dtype=np.float32)
-    valid = conf > 0.1
-    if valid.sum() < 2:
+
+    # We need nose + both eyes to estimate face geometry reliably.
+    if conf[0] < 0.1 or conf[1] < 0.1 or conf[2] < 0.1:
         return None
 
-    pts = head[valid, :2]
-    cx = float(np.mean(pts[:, 0]))
-    cy = float(np.mean(pts[:, 1]))
-    if len(pts) >= 2:
-        dists = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
-        base = float(dists.max()) + 1.0
+    nose  = head[0, :2].astype(np.float32)
+    l_eye = head[1, :2].astype(np.float32)
+    r_eye = head[2, :2].astype(np.float32)
+
+    eye_dist = float(np.linalg.norm(r_eye - l_eye))
+    if eye_dist < 5.0:
+        # Face too small / eye points degenerate — skip.
+        return None
+
+    eye_mid = (l_eye + r_eye) * 0.5
+    down    = nose - eye_mid
+    down_norm = float(np.linalg.norm(down))
+    if down_norm < 1e-3:
+        # Nose coincides with eye midpoint — use a default downward
+        # axis aligned with image y (upright face assumption).
+        down_unit = np.array([0.0, 1.0], dtype=np.float32)
     else:
-        base = max(img_h, img_w) * 0.05
-    half = 0.5 * base * expand_ratio
+        down_unit = down / down_norm
 
-    x1 = int(round(cx - half))
-    y1 = int(round(cy - half))
-    x2 = int(round(cx + half))
-    y2 = int(round(cy + half))
-    x1 = max(0, x1); y1 = max(0, y1)
-    x2 = min(img_w, x2); y2 = min(img_h, y2)
-    if x2 - x1 < 8 or y2 - y1 < 8:
-        return None
-    return (x1, y1, x2, y2)
+    # Face-right is a 90° CW rotation of the down axis in image coords
+    # (y increases downward). (dx, dy) -> (dy, -dx).
+    right_unit = np.array([down_unit[1], -down_unit[0]], dtype=np.float32)
+
+    mouth_center = nose + down_unit * eye_dist * 0.62
+    half_mouth   = right_unit * eye_dist * 0.30
+    l_mouth = mouth_center - half_mouth   # image-left mouth corner
+    r_mouth = mouth_center + half_mouth   # image-right mouth corner
+
+    return np.stack(
+        [l_eye, r_eye, nose, l_mouth, r_mouth], axis=0,
+    ).astype(np.float32)
 
 
 def run_farl_face_video(
@@ -84,7 +131,7 @@ def run_farl_face_video(
     -------
     face_kp_68_timeline : list[list[np.ndarray | None]]
         face_kp_68_timeline[p_idx][t] = (68, 3) with (x, y, 1.0)
-        or None when no valid face bbox.
+        or None when no valid head keypoints for alignment.
     time_s : float
     """
     aligner = farl_face_dict["aligner"]
@@ -97,19 +144,24 @@ def run_farl_face_video(
     face_kp_68_timeline = [[None] * B for _ in range(n_persons)]
 
     # Build request list grouped by frame so we can chunk across frames
-    # for batched GPU inference.
-    per_frame = {}  # t -> list[(p_idx, bbox)]
+    # for batched GPU inference. Each request carries a (5, 2) RetinaFace
+    # order landmark array used by FaRL to compute the alignment matrix.
+    per_frame = {}  # t -> list[(p_idx, pts_5)]
     for p_idx in range(n_persons):
         for t in range(B):
             head = persons_coco_body_feet_timeline[p_idx][t]
             if head is None:
                 continue
-            bbox = _get_face_bbox_from_coco_wb_head(head, img_h, img_w)
-            if bbox is None:
+            pts_5 = _mhr_head_to_retinaface_5_points(head)
+            if pts_5 is None:
                 continue
-            per_frame.setdefault(t, []).append((p_idx, bbox))
+            per_frame.setdefault(t, []).append((p_idx, pts_5))
 
     if not per_frame:
+        _logger.warning(
+            "FaRL: no valid face alignment input on any frame — "
+            "all head keypoints have confidence < 0.1 or are degenerate."
+        )
         return face_kp_68_timeline, 0.0
 
     frame_idx_sorted = sorted(per_frame.keys())
@@ -119,33 +171,44 @@ def run_farl_face_video(
     for chunk_start in range(0, len(frame_idx_sorted), frame_batch_size):
         chunk_frames = frame_idx_sorted[chunk_start:chunk_start + frame_batch_size]
 
-        # Assemble image batch (M, 3, H, W) uint8 on device
+        # Assemble image batch (M, 3, H, W) uint8 on device. pyfacer's
+        # FaRLFaceAlignment.forward does ``images = images.float() / 255.0``
+        # internally, so uint8 RGB is the expected input format.
         chunk_imgs = images_np_u8[chunk_frames]  # (M, H, W, 3) uint8 RGB
         images_bchw = torch.from_numpy(chunk_imgs).permute(0, 3, 1, 2).contiguous()
         images_bchw = images_bchw.to(device)
 
-        # Assemble rects + image_ids + metadata (person & global frame idx)
-        rects_list = []
+        # Assemble points (N, 5, 2) + image_ids (N,) + metadata
+        pts5_list = []
         image_ids_list = []
-        face_meta = []  # aligned with rects: (t_global, p_idx)
+        face_meta = []  # aligned with pts5_list: (t_global, p_idx)
         for local_b, t_global in enumerate(chunk_frames):
-            for p_idx, bbox in per_frame[t_global]:
-                rects_list.append(list(bbox))
+            for p_idx, pts_5 in per_frame[t_global]:
+                pts5_list.append(pts_5)
                 image_ids_list.append(local_b)
                 face_meta.append((t_global, p_idx))
 
-        if not rects_list:
+        if not pts5_list:
             # Shouldn't happen — we filtered to frames that have faces.
             if pbar is not None:
                 pbar.update(len(chunk_frames))
             continue
 
-        rects_t     = torch.tensor(rects_list,     dtype=torch.float32, device=device)
-        image_ids_t = torch.tensor(image_ids_list, dtype=torch.long,    device=device)
+        points_t    = torch.tensor(
+            np.stack(pts5_list, axis=0), dtype=torch.float32, device=device,
+        )  # (N, 5, 2)
+        image_ids_t = torch.tensor(image_ids_list, dtype=torch.long, device=device)
 
+        # pyfacer FaRLFaceAlignment.forward consumes:
+        #   data['image_ids']: (N,) long indexing into images batch
+        #   data['points']:    (N, 5, 2) float RetinaFace-order landmarks
+        #                      (L_eye, R_eye, nose, L_mouth, R_mouth)
+        # It IGNORES 'rects' entirely — passing them was the bug that
+        # kept the face region of the POSES dict empty in the previous
+        # revision of this module.
         faces_in = {
-            "rects":     rects_t,
             "image_ids": image_ids_t,
+            "points":    points_t,
         }
 
         try:
@@ -154,7 +217,7 @@ def run_farl_face_video(
         except Exception as e:
             _logger.error(
                 "FaRL face_aligner failed on frames %d..%d (%d faces): %s",
-                chunk_frames[0], chunk_frames[-1], len(rects_list), e,
+                chunk_frames[0], chunk_frames[-1], len(pts5_list), e,
             )
             if pbar is not None:
                 pbar.update(len(chunk_frames))
