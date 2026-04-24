@@ -37,6 +37,7 @@ hub download happens at runtime.
 
 import logging
 import os
+import sys
 
 import torch
 
@@ -45,6 +46,56 @@ from folder_paths import models_dir
 from ..crowdsam_lib import DINOV2_REPO_PATH, ensure_lib_importable
 
 _logger = logging.getLogger(__name__)
+
+
+def _disable_xformers_for_dinov2():
+    """Force DINOv2 to use its native torch attention fallback instead of
+    xformers' memory_efficient_attention.
+
+    Why this exists: xformers' dispatcher has three backends (fa2F, fa3F,
+    cutlassF). On Blackwell GPUs (SM 10+ / cap >= (10, 0)) and newer
+    none of them currently accept float32 inputs:
+
+      - fa3F rejects cap > 9.0 as "too new"
+      - cutlassF same story
+      - fa2F is shape/cap agnostic but float16/bfloat16 only
+
+    CrowdSAM feeds DINOv2 in fp32 (set_image preprocess pipeline), so on
+    Blackwell the xformers path raises ``NotImplementedError`` on the
+    very first forward. DINOv2's native attention works on any device
+    and any dtype, it's just ~30% slower — a good trade.
+
+    We do this by monkey-patching ``XFORMERS_AVAILABLE = False`` on the
+    three DINOv2 modules that check it. Setting the ``XFORMERS_DISABLED``
+    env var doesn't help after the fact because those modules cache the
+    flag at import time, and DINOv2 has already been imported by
+    CrowdSAM's constructor by the time our load() runs.
+
+    Affects ONLY DINOv2's internal attention path. Other libraries that
+    import xformers independently (e.g. ComfyUI model patching, other
+    custom nodes) see no change.
+    """
+    patched = []
+    for mod_name in (
+        "dinov2.layers.attention",
+        "dinov2.layers.block",
+        "dinov2.layers.swiglu_ffn",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            # Not yet imported — nothing to patch. DINOv2 will set the
+            # flag based on its environment when it imports.
+            continue
+        if getattr(mod, "XFORMERS_AVAILABLE", False):
+            mod.XFORMERS_AVAILABLE = False
+            patched.append(mod_name)
+    if patched:
+        _logger.info(
+            "DINOv2 xformers disabled on: %s (fallback torch attention; "
+            "required on Blackwell GPUs where xformers has no kernel "
+            "that covers SM>=10 + float32)",
+            ", ".join(patched),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +391,13 @@ class LoadCrowdSAMNode:
             "CrowdHuman 10-shot adapter)", device_str,
         )
 
+        # Belt: the env var is checked at attention.py import time, so
+        # set it BEFORE CrowdSAM's constructor fires torch.hub.load.
+        # Suspenders: we also monkey-patch `XFORMERS_AVAILABLE = False`
+        # after load, in case DINOv2 was already imported elsewhere in
+        # the process and its attention module cached xformers=True.
+        os.environ.setdefault("XFORMERS_DISABLED", "1")
+
         # Lazy import: the vendored package touches torch.hub (for
         # DINOv2) at construction time, so we defer until paths are
         # validated. CrowdSAM's ``__init__`` also takes a ``logger``
@@ -348,6 +406,10 @@ class LoadCrowdSAMNode:
         from crowdsam.model import CrowdSAM
 
         model = CrowdSAM(config, _logger)
+
+        # Disable xformers on any DINOv2 attention/block/ffn module that
+        # got imported (works whether or not the env var took effect).
+        _disable_xformers_for_dinov2()
 
         _logger.info(
             "CrowdSAM ready (max_prompts=%d, points_per_batch=%d, "
