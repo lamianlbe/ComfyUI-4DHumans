@@ -452,89 +452,118 @@ class BMPInstanceSegmentationNode:
     CATEGORY = "4dhumans"
 
     @staticmethod
-    def _predict_full_image_all_iters(
+    def _predict_iterative_orchestrated(
         bmp_model,
         image_bgr: np.ndarray,
-        full_image_bbox: np.ndarray,
         max_iters: int,
-        H: int, W: int,
+        full_image_iters: int,
     ) -> dict:
-        """Orchestrate BMP iter-by-iter ourselves with a fixed full-
-        image bbox each time, manually blacking out the returned
-        masks between iterations.
+        """Manually drive BMP's pose+SAM cycle so we can inject a full-
+        image bbox + an all-True mask on early iterations.
 
-        Side-effect: mutates ``bmp_model.config.num_bmp_iters`` to 1
-        for the duration of this call, restored afterwards in a
-        finally. Safe because predict() reads num_bmp_iters at the
-        top of each call and we run synchronously per-frame.
+        Why we can't just call ``bmp.predict(bboxes=full_image_bbox)``:
+        BMP's predict() forwards external bboxes through
+        ``InstanceData(masks=None, ...)``. PMPose's test pipeline then
+        runs the ``MaskBackground`` transform with
+        ``continue_on_failure=False``, which raises on
+        ``segmentation=None``. To make pose work without a real
+        segmentation, the cleanest path is to provide an all-True mask
+        (entire bbox is "foreground"), which mmpose's
+        ``inference_topdown`` then converts to a polygon covering the
+        whole frame — MaskBackground succeeds and PMPose runs as a
+        normal ViTPose-style estimator over the full image.
+
+        Iters split:
+          - ``[0, full_image_iters)`` → full image bbox + all-True mask
+          - ``[full_image_iters, max_iters)`` → RTMDet on the blacked-
+            out image (BMP standard)
+
+        SAM refinement, Pose-NMS and final formatting are unchanged
+        from BMP's predict() — we just call its internal methods
+        directly. Read-only access to the public-by-convention
+        ``bmp_model._method`` names; no source vendoring.
         """
-        original_iters = bmp_model.config.num_bmp_iters
-        bmp_model.config.num_bmp_iters = 1
+        from bboxmaskpose.demo_utils import concat_instances
+        from mmengine.structures import InstanceData
 
-        masked = image_bgr.copy()
-        agg_bboxes = []
-        agg_masks = []
-        agg_keypoints = []
-        agg_presence = []
-        agg_visibility = []
+        H, W = image_bgr.shape[:2]
+        full_bbox = np.array(
+            [[0.0, 0.0, float(W), float(H)]], dtype=np.float32,
+        )
+        # All-True mask (1, H, W) uint8 — tells PMPose's MaskBackground
+        # "the entire frame is the person", which with alpha=0.25 leaves
+        # the input image untouched (img * 0.75 + img * 0.25 == img).
+        full_mask = np.ones((1, H, W), dtype=np.uint8)
 
-        try:
-            for it in range(max_iters):
-                res = bmp_model.predict(
-                    image=masked,
-                    bboxes=full_image_bbox,
-                    return_intermediates=False,
+        img_orig = image_bgr
+        # Used as the "image fed to PMPose" on full-image iters > 0:
+        # BMP's RTMDet path normally re-scans a blacked-out image to
+        # find the next person, but in full-image mode we have no
+        # detector — so we feed the blacked image directly to PMPose
+        # so its top-down argmax surfaces the next visible person
+        # instead of repeatedly returning the strongest one.
+        img_for_pose_blacked = image_bgr.copy()
+        all_detections = None
+
+        for it in range(max_iters):
+            if it < full_image_iters:
+                det_instances = InstanceData(
+                    bboxes=full_bbox.copy(),
+                    bbox_scores=np.ones(1, dtype=np.float32),
+                    masks=full_mask.copy(),
+                )
+                img_for_pose = (
+                    img_for_pose_blacked
+                    if all_detections is not None else img_orig
+                )
+            else:
+                # Detector mode (matches BMP's standard behaviour
+                # post-full-image-iters). RTMDet sees the blacked-out
+                # image so it finds remaining uncovered people.
+                detector = (
+                    bmp_model.detector
+                    if it == full_image_iters
+                    else bmp_model.detector_prime
+                )
+                img_for_det = (
+                    bmp_model._mask_out_image(img_orig, all_detections)
+                    if all_detections is not None else img_orig
+                )
+                det_instances = bmp_model._run_detector(
+                    detector, img_for_det,
+                )
+                img_for_pose = img_orig
+
+            if len(det_instances.bboxes) == 0:
+                continue
+
+            pose_instances = bmp_model._run_pose_estimation(
+                img_for_pose, det_instances,
+            )
+            # SAM refinement always uses the ORIGINAL image (clean
+            # silhouette extraction). Pose keypoints from a blacked-
+            # out crop carry over fine — they're in the same image
+            # coordinate system.
+            new_dets, old_dets = bmp_model._refine_with_sam(
+                img_orig, pose_instances, all_detections,
+            )
+
+            if all_detections is None:
+                all_detections = new_dets
+            else:
+                all_detections = concat_instances(old_dets, new_dets)
+
+            # Refresh blacked image for the NEXT full-image iter (if
+            # any). Using SAM-refined masks via _mask_out_image, same
+            # behaviour BMP would do internally.
+            if (it + 1 < full_image_iters) and all_detections is not None:
+                img_for_pose_blacked = bmp_model._mask_out_image(
+                    img_orig, all_detections,
                 )
 
-                # res is a dict with bboxes / masks / keypoints / etc.
-                # In single-iter mode with one bbox we expect 0 or 1
-                # detections per call (PMPose's top-down picks the
-                # strongest visible person; SAM2 generates one mask
-                # for that pose).
-                bboxes_it = np.asarray(
-                    res.get("bboxes", np.zeros((0, 4))), dtype=np.float32,
-                )
-                if bboxes_it.shape[0] == 0:
-                    # Nothing left to find — no point iterating more.
-                    break
-
-                masks_it     = np.asarray(res.get("masks", np.zeros((0, H, W), dtype=np.uint8)))
-                kpts_it      = np.asarray(res.get("keypoints", np.zeros((0, 17, 3))))
-                presence_it  = np.asarray(res.get("presence", np.zeros((0, 17, 1))))
-                visibility_it = np.asarray(res.get("visibility", np.zeros((0, 17, 1))))
-
-                agg_bboxes.append(bboxes_it)
-                agg_masks.append(masks_it)
-                agg_keypoints.append(kpts_it)
-                agg_presence.append(presence_it)
-                agg_visibility.append(visibility_it)
-
-                # Black out using SAM2-refined per-instance masks. Same
-                # behaviour as BMP's internal _mask_out_image, just on
-                # the image we own.
-                for m in masks_it:
-                    m_bool = m.astype(bool)
-                    if m_bool.shape == (H, W) and m_bool.any():
-                        masked[m_bool] = 0
-        finally:
-            bmp_model.config.num_bmp_iters = original_iters
-
-        if not agg_bboxes:
-            return {
-                "bboxes":     np.zeros((0, 4), dtype=np.float32),
-                "masks":      np.zeros((0, H, W), dtype=np.uint8),
-                "keypoints":  np.zeros((0, 17, 3), dtype=np.float32),
-                "presence":   np.zeros((0, 17, 1), dtype=np.float32),
-                "visibility": np.zeros((0, 17, 1), dtype=np.float32),
-            }
-
-        return {
-            "bboxes":     np.concatenate(agg_bboxes, axis=0),
-            "masks":      np.concatenate(agg_masks, axis=0),
-            "keypoints":  np.concatenate(agg_keypoints, axis=0),
-            "presence":   np.concatenate(agg_presence, axis=0),
-            "visibility": np.concatenate(agg_visibility, axis=0),
-        }
+        return bmp_model._format_result(
+            all_detections, img_orig.shape[:2],
+        )
 
     def segment(self, images, bmp, score_threshold, iou_threshold,
                 bbox_source="default", max_iters_full_image=3,
@@ -568,12 +597,6 @@ class BMPInstanceSegmentationNode:
         replay_cache: List[Optional[_BMPResult]] = [None] * B
         logged_once = False
 
-        # Pre-compute the (1, 4) full-image bbox used by both
-        # full_image_* modes; constant per video so build it once.
-        full_image_bbox = np.array(
-            [[0.0, 0.0, float(W), float(H)]], dtype=np.float32,
-        )
-
         for t in range(B):
             try:
                 if bbox_source == "default":
@@ -585,26 +608,35 @@ class BMPInstanceSegmentationNode:
                     )
                 elif bbox_source == "full_image_iter0":
                     # iter 0 uses full-image bbox (PMPose top-down
-                    # argmax picks strongest person), iter 1+ falls
-                    # back to RTMDet on the blacked-out residual —
-                    # this is exactly what BMP's predict() already
-                    # does when given external bboxes.
-                    result = bmp_model.predict(
-                        image=bgr_u8[t].copy(),
-                        bboxes=full_image_bbox,
-                        return_intermediates=False,
-                    )
-                elif bbox_source == "full_image_all_iters":
-                    # Every iter uses full-image bbox. We orchestrate
-                    # the loop ourselves: call BMP with num_bmp_iters=1
-                    # repeatedly, blacking out the returned masks
-                    # between calls. RTMDet is bypassed entirely.
-                    result = self._predict_full_image_all_iters(
+                    # argmax picks the strongest person); iter 1+
+                    # falls back to RTMDet on the blacked-out residual
+                    # (BMP standard).
+                    #
+                    # We can't just call ``bmp.predict(bboxes=full)``:
+                    # BMP wires external bboxes through
+                    # InstanceData(masks=None), and PMPose's
+                    # MaskBackground transform raises on missing
+                    # segmentation. Drive BMP's internal stages
+                    # ourselves — see _predict_iterative_orchestrated
+                    # for the full reasoning.
+                    result = self._predict_iterative_orchestrated(
                         bmp_model,
                         bgr_u8[t].copy(),
-                        full_image_bbox,
-                        max_iters=max_iters_full_image,
-                        H=H, W=W,
+                        max_iters=int(bmp_model.config.num_bmp_iters),
+                        full_image_iters=1,
+                    )
+                elif bbox_source == "full_image_all_iters":
+                    # Every iter uses full-image bbox + all-True mask;
+                    # RTMDet is bypassed entirely. PMPose argmax picks
+                    # the strongest visible person each pass; iter 1+
+                    # sees the previous detections blacked out so the
+                    # next-strongest surfaces. Same mechanism as
+                    # Sapiens2InstancePose's start_with_full_image.
+                    result = self._predict_iterative_orchestrated(
+                        bmp_model,
+                        bgr_u8[t].copy(),
+                        max_iters=int(max_iters_full_image),
+                        full_image_iters=int(max_iters_full_image),
                     )
                 else:
                     raise ValueError(f"Unknown bbox_source: {bbox_source}")
