@@ -377,14 +377,30 @@ class Sapiens2PosePipeline:
         )
         inputs = _normalize_for_network(crops).to(self.device)
 
+        # Match the model's parameter dtype. LoadSapiens2Node may have
+        # cast the model to bf16/fp16 to halve VRAM and ~2x throughput
+        # on Blackwell tensor cores; if it did, the input must follow
+        # or conv2d throws "Input type (float) and bias type
+        # (BFloat16) should be the same". Look up dtype from a
+        # representative parameter (first conv weight in patch_embed)
+        # so we don't depend on a stashed attribute that could go
+        # stale after a `.to()` call.
+        param_dtype = next(self.model.parameters()).dtype
+        if param_dtype != inputs.dtype:
+            inputs = inputs.to(dtype=param_dtype)
+
         # Forward in batches to bound VRAM
         heatmaps_list = []
         N = inputs.shape[0]
         for i in range(0, N, batch_size):
             chunk = inputs[i:i + batch_size]
             hm = self.model(chunk)            # (b, K, hm_h, hm_w)
-            heatmaps_list.append(hm.detach().to("cpu", non_blocking=True))
-        heatmaps = torch.cat(heatmaps_list, dim=0).float().numpy()
+            # Always upcast back to fp32 for the codec — UDP heatmap
+            # decoding uses cv2 + numpy which expects fp32 anyway, and
+            # the precision loss from bf16 is irrelevant by this stage
+            # (we only need argmax + sub-pixel refinement).
+            heatmaps_list.append(hm.detach().float().to("cpu", non_blocking=True))
+        heatmaps = torch.cat(heatmaps_list, dim=0).numpy()
 
         # UDP decode: heatmaps (N, K, hm_h, hm_w) → (N, K, 2) in input
         # crop coords + (N, K) scores.
