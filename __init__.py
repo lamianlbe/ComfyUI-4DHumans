@@ -32,6 +32,8 @@ from .nodes.load_crowdsam_node import LoadCrowdSAMNode
 from .nodes.crowdsam_seg_node import CrowdSAMInstanceSegmentationNode
 from .nodes.load_bmp_node import LoadBMPNode
 from .nodes.bmp_seg_node import BMPInstanceSegmentationNode
+from .nodes.load_sapiens2_node import LoadSapiens2Node
+from .nodes.sapiens2_pose_node import Sapiens2InstancePoseNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -60,6 +62,8 @@ NODE_CLASS_MAPPINGS = {
     'CrowdSAMInstanceSegmentation': CrowdSAMInstanceSegmentationNode,
     'LoadBMP': LoadBMPNode,
     'BMPInstanceSegmentation': BMPInstanceSegmentationNode,
+    'LoadSapiens2': LoadSapiens2Node,
+    'Sapiens2InstancePose': Sapiens2InstancePoseNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -88,4 +92,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'CrowdSAMInstanceSegmentation': 'CrowdSAM Instance Segmentation',
     'LoadBMP': 'Load BBoxMaskPose',
     'BMPInstanceSegmentation': 'BBoxMaskPose Instance Segmentation',
+    'LoadSapiens2': 'Load Sapiens2 (308-keypoint)',
+    'Sapiens2InstancePose': 'Sapiens2 Instance Pose (SAM3 + iterate)',
 }
