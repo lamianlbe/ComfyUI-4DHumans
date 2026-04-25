@@ -71,6 +71,99 @@ from ._mask_utils import build_debug_overlay, pack_mask, unpack_mask
 _logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------------
+# BMP / mmengine compatibility patch
+# --------------------------------------------------------------------------
+#
+# Bug location: bboxmaskpose/api.py:225
+#
+#   det_instances = InstanceData(
+#       bboxes=bboxes,
+#       bbox_scores=np.ones(len(bboxes)),
+#       masks=None,            # ← this
+#   )
+#
+# Some mmengine versions (≥ ~0.10) tightened InstanceData.__setattr__ to
+# reject None values with the error
+#
+#     value must contain `__len__` attribute, but got <class 'NoneType'>
+#
+# BMP's `bboxes is None` branch never hits this line (the detector
+# returns proper masks or numpy arrays), so `bbox_source="default"`
+# works. The `bboxes is not None` branch — which our full_image_iter0
+# and full_image_all_iters modes need — does, and crashes every frame.
+#
+# Patching strategy: replace ``bboxmaskpose.api.InstanceData`` with a
+# subclass that:
+#   1. Silently drops None kwargs from ``__init__`` so they never
+#      trigger mmengine's validation.
+#   2. Returns ``None`` from ``__getattr__`` for those dropped names,
+#      so downstream ``if det_instances.masks is None`` checks behave
+#      identically to the original intent.
+#
+# Idempotent: a flag on the class prevents double-patching if the
+# module reloads.
+
+def _install_bmp_instance_data_patch() -> bool:
+    """Patch ``bboxmaskpose.api.InstanceData`` to tolerate None kwargs.
+
+    Returns True if patched (or already patched), False if BMP isn't
+    installed. Safe to call from module top-level.
+    """
+    try:
+        import bboxmaskpose.api as _bmp_api
+    except ImportError:
+        return False
+
+    OrigID = _bmp_api.InstanceData
+    if getattr(OrigID, "_bmp_node_patched", False):
+        return True
+
+    class _NoneTolerantInstanceData(OrigID):  # type: ignore[misc, valid-type]
+        """Drop-in replacement of mmengine's ``InstanceData`` that
+        accepts None kwargs (which BMP's api.py passes for `masks` on
+        the iter-0-with-external-bboxes path)."""
+
+        _bmp_node_patched = True
+
+        def __init__(self, *, metainfo=None, **kwargs):
+            none_keys = [k for k, v in kwargs.items() if v is None]
+            kwargs = {k: v for k, v in kwargs.items() if v is not None}
+            super().__init__(metainfo=metainfo, **kwargs)
+            # object.__setattr__ to bypass InstanceData's validation
+            # AND to keep this name out of _data_fields (so mmengine's
+            # length-consistency checks across fields don't see it).
+            object.__setattr__(
+                self, "_bmp_passthrough_nones", set(none_keys),
+            )
+
+        def __getattr__(self, name):
+            # Only consulted when the regular lookup chain missed the
+            # name — i.e. when downstream BMP code accesses ``.masks``
+            # but we dropped the None at __init__ time.
+            try:
+                nones = object.__getattribute__(
+                    self, "_bmp_passthrough_nones",
+                )
+                if name in nones:
+                    return None
+            except AttributeError:
+                pass
+            raise AttributeError(name)
+
+    _bmp_api.InstanceData = _NoneTolerantInstanceData
+    _logger.info(
+        "Patched bboxmaskpose.api.InstanceData to tolerate None kwargs "
+        "(works around mmengine's strict __len__ validation)."
+    )
+    return True
+
+
+# Install eagerly so any BMP call site sees the patched class without
+# the user having to load LoadBMPNode first.
+_install_bmp_instance_data_patch()
+
+
 # COCO-17 skeleton edges (for debug viz). Index pairs into the 17
 # keypoints in standard COCO ordering.
 _COCO17_EDGES = [
