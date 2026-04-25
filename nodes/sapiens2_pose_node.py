@@ -410,14 +410,49 @@ class Sapiens2InstancePoseNode:
                     {
                         "default": 2,
                         "min": 1,
-                        "max": 3,
+                        "max": 8,
                         "step": 1,
                         "tooltip": (
                             "Iteration cap for the BMP-style 'black "
-                            "out covered, re-run' loop. 2 matches BMP "
-                            "and is sufficient for two-person POV "
-                            "occlusion. Going higher is rarely "
-                            "useful and roughly doubles cost."
+                            "out covered, re-run' loop. Behaviour "
+                            "depends on start_with_full_image:\n"
+                            "  • Default (False): 2 matches BMP and "
+                            "    is sufficient for two-person POV "
+                            "    occlusion. Each iter produces "
+                            "    one pose per group, so iter 2 mostly "
+                            "    catches occluded fragments.\n"
+                            "  • start_with_full_image=True: each "
+                            "    iter produces EXACTLY one pose "
+                            "    (Sapiens2's top-down picks the "
+                            "    strongest person), so this is the "
+                            "    upper bound on # of people "
+                            "    detected per frame. Set to N+1 "
+                            "    where N is max expected headcount."
+                        ),
+                    },
+                ),
+                "start_with_full_image": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "When True, each iteration sends the "
+                            "WHOLE image to Sapiens2 with a single "
+                            "bbox = (0, 0, W, H), ignoring SAM3-mask-"
+                            "derived bboxes for the bbox source. "
+                            "Sapiens2's top-down argmax picks the "
+                            "strongest person per pass; iter 2+ runs "
+                            "on the blacked-out residual to surface "
+                            "the next-strongest. SAM3 masks are still "
+                            "used to attribute the resulting poses + "
+                            "decide what to black out.\n\n"
+                            "Use when SAM3 produces unreliable bboxes "
+                            "(over-segmentation, fragmentation, "
+                            "merging two people into one mask). Costs "
+                            "exactly max_iters Sapiens2 forwards per "
+                            "frame regardless of how many people are "
+                            "present (vs. the default mode where N "
+                            "merged bboxes = N forwards per iter)."
                         ),
                     },
                 ),
@@ -491,7 +526,7 @@ class Sapiens2InstancePoseNode:
 
     def run(self, images, sam3_masks, sapiens2,
             bbox_iou_merge_thresh, score_threshold,
-            extra_claim_keypoints, max_iters,
+            extra_claim_keypoints, max_iters, start_with_full_image,
             oks_track_thresh, track_buffer_frames, sapiens2_batch_size,
             debug_overlay):
         pipe = sapiens2["pipeline"]
@@ -540,31 +575,51 @@ class Sapiens2InstancePoseNode:
                 if not uncovered_slots:
                     break
 
-                # Compute per-slot bbox (from each remaining mask)
-                slot_bboxes = []
-                kept_slots = []
-                for p in uncovered_slots:
-                    bb = _bbox_from_mask(frame_masks_per_slot[p],
-                                          padding_frac=0.10)
-                    if bb is None:
-                        continue
-                    # Clip to image
-                    bb[0] = max(0, bb[0]); bb[1] = max(0, bb[1])
-                    bb[2] = min(W, bb[2]); bb[3] = min(H, bb[3])
-                    if bb[2] - bb[0] < 5 or bb[3] - bb[1] < 5:
-                        continue
-                    slot_bboxes.append(bb)
-                    kept_slots.append(p)
+                if start_with_full_image:
+                    # Single full-frame bbox; ALL uncovered masks are
+                    # candidates for attribution. Sapiens2's top-down
+                    # argmax will pick the strongest person; iter 2+
+                    # runs on the blacked-out residual to surface
+                    # later people.
+                    merged_bboxes = np.array(
+                        [[0.0, 0.0, float(W), float(H)]],
+                        dtype=np.float32,
+                    )
+                    kept_slots = list(uncovered_slots)
+                    groups: List[List[int]] = [list(range(len(kept_slots)))]
+                else:
+                    # Default: derive one bbox per uncovered SAM3 mask,
+                    # then union-find merge any pair whose IoU exceeds
+                    # the merge threshold so tightly-overlapping people
+                    # share a single Sapiens2 forward (Sapiens2 picks
+                    # one per crop, BMP-iter-style attribution then
+                    # picks the right mask).
+                    slot_bboxes = []
+                    kept_slots = []
+                    for p in uncovered_slots:
+                        bb = _bbox_from_mask(frame_masks_per_slot[p],
+                                              padding_frac=0.10)
+                        if bb is None:
+                            continue
+                        # Clip to image
+                        bb[0] = max(0, bb[0]); bb[1] = max(0, bb[1])
+                        bb[2] = min(W, bb[2]); bb[3] = min(H, bb[3])
+                        if bb[2] - bb[0] < 5 or bb[3] - bb[1] < 5:
+                            continue
+                        slot_bboxes.append(bb)
+                        kept_slots.append(p)
 
-                if not slot_bboxes:
-                    break
+                    if not slot_bboxes:
+                        break
 
-                # Group by bbox IoU; each group → one Sapiens2 forward
-                groups = _union_find_groups(slot_bboxes, bbox_iou_merge_thresh)
-                merged_bboxes = np.stack(
-                    [_union_bboxes([slot_bboxes[i] for i in g]) for g in groups],
-                    axis=0,
-                )
+                    groups = _union_find_groups(
+                        slot_bboxes, bbox_iou_merge_thresh,
+                    )
+                    merged_bboxes = np.stack(
+                        [_union_bboxes([slot_bboxes[i] for i in g])
+                         for g in groups],
+                        axis=0,
+                    )
 
                 # ---- Sapiens2 forward on the merged bboxes --------------
                 # Mask out covered regions in the (already mutated)
