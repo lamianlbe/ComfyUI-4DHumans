@@ -137,6 +137,25 @@ def _union_find_groups(bboxes: List[np.ndarray], iou_thresh: float) -> List[List
     return list(groups.values())
 
 
+def _count_keypoints_in_mask(
+    visible_xy: np.ndarray,        # (V, 2) already-filtered visible keypoints
+    mask: np.ndarray,              # (H, W) bool
+    H: int, W: int,
+    early_stop: Optional[int] = None,
+) -> int:
+    """Count how many of ``visible_xy`` fall inside ``mask``. Optional
+    short-circuit when the count reaches ``early_stop`` — useful when
+    the caller only needs to know "≥ N", not the exact count."""
+    hits = 0
+    for x, y in visible_xy:
+        ix, iy = int(round(x)), int(round(y))
+        if 0 <= iy < H and 0 <= ix < W and mask[iy, ix]:
+            hits += 1
+            if early_stop is not None and hits >= early_stop:
+                return hits
+    return hits
+
+
 def _attribute_pose_to_mask(
     pose_xy: np.ndarray,           # (K, 2)
     pose_scores: np.ndarray,       # (K,)
@@ -361,6 +380,31 @@ class Sapiens2InstancePoseNode:
                         ),
                     },
                 ),
+                "extra_claim_keypoints": (
+                    "INT",
+                    {
+                        "default": 5,
+                        "min": 0,
+                        "max": 50,
+                        "step": 1,
+                        "tooltip": (
+                            "After a pose's main mask wins, ALSO mark "
+                            "as covered any other uncovered mask whose "
+                            "interior catches at least this many "
+                            "visible keypoints from the same pose. "
+                            "Catches the case where SAM3 splits one "
+                            "person into multiple disjoint masks "
+                            "(torso + arm + leg). Set to 0 to disable "
+                            "(only winner mask covered, like BMP). "
+                            "Tighter (≥10) = more conservative, may "
+                            "leave fragments uncovered for iter 2 to "
+                            "spuriously re-detect. Looser (≤3) = may "
+                            "incorrectly absorb a touching second "
+                            "person's mask whose few stray pixels "
+                            "caught a couple of edge keypoints."
+                        ),
+                    },
+                ),
                 "max_iters": (
                     "INT",
                     {
@@ -446,7 +490,8 @@ class Sapiens2InstancePoseNode:
     CATEGORY = "4dhumans"
 
     def run(self, images, sam3_masks, sapiens2,
-            bbox_iou_merge_thresh, score_threshold, max_iters,
+            bbox_iou_merge_thresh, score_threshold,
+            extra_claim_keypoints, max_iters,
             oks_track_thresh, track_buffer_frames, sapiens2_batch_size,
             debug_overlay):
         pipe = sapiens2["pipeline"]
@@ -531,22 +576,64 @@ class Sapiens2InstancePoseNode:
                     batch_size=sapiens2_batch_size,
                 )
 
-                # ---- Attribute each pose to a mask within its group ----
+                # ---- Attribute poses to masks ---------------------------
+                # We process poses in DESCENDING quality order so that:
+                #   (1) higher-quality poses claim their masks first
+                #   (2) duplicate / split-mask poses arriving later
+                #       see their target mask already covered → skipped
+                # Quality = sum of visible keypoint confidences.
+                pose_quality = []
+                for g_idx in range(len(groups)):
+                    sc = scores_n308[g_idx]
+                    visible = sc >= score_threshold
+                    pose_quality.append(
+                        float(sc[visible].sum()) if visible.any() else -1.0
+                    )
+                g_order = sorted(range(len(groups)),
+                                  key=lambda i: -pose_quality[i])
+
                 newly_covered_slots = set()
-                for g_idx, g in enumerate(groups):
+                n_extra_claims_this_iter = 0
+                n_dupes_skipped_this_iter = 0
+
+                for g_idx in g_order:
+                    if pose_quality[g_idx] < 0:
+                        # Pose has no visible keypoints — drop.
+                        continue
+
+                    g = groups[g_idx]
                     pose_xy = kpts_n308x2[g_idx]      # (308, 2)
                     pose_sc = scores_n308[g_idx]      # (308,)
-                    masks_for_g = [frame_masks_per_slot[kept_slots[i]] for i in g]
+
+                    # Step 1: in-group attribution, but ONLY among masks
+                    # not already covered by an earlier-processed pose
+                    # this iteration.
+                    in_group_uncovered = [
+                        i for i in g
+                        if kept_slots[i] not in newly_covered_slots
+                    ]
+                    if not in_group_uncovered:
+                        # Every mask in this group was claimed by a
+                        # higher-quality pose's main + extra-claim. This
+                        # pose is a duplicate → drop without stashing.
+                        n_dupes_skipped_this_iter += 1
+                        continue
+
+                    masks_for_g = [
+                        frame_masks_per_slot[kept_slots[i]]
+                        for i in in_group_uncovered
+                    ]
                     winner_local = _attribute_pose_to_mask(
                         pose_xy, pose_sc, masks_for_g, H, W,
                         conf_thresh=score_threshold,
                     )
                     if winner_local is None:
-                        # No mask in this group caught any keypoint.
-                        # Discard the pose to avoid attributing a
-                        # spurious skeleton to the wrong person.
+                        # Pose has visible keypoints but none fall in
+                        # any uncovered mask of its own group. This is
+                        # the symptom the user observed earlier — drop
+                        # rather than attribute to the wrong mask.
                         continue
-                    winner_slot = kept_slots[g[winner_local]]
+                    winner_slot = kept_slots[in_group_uncovered[winner_local]]
                     newly_covered_slots.add(winner_slot)
 
                     # Stash the detection
@@ -560,6 +647,40 @@ class Sapiens2InstancePoseNode:
                         "slot":        winner_slot,
                         "iter":        it,
                     })
+
+                    # Step 2: extra-claim. The winner's pose can also
+                    # cover OTHER uncovered masks (across the whole
+                    # frame, not just this group) if those masks catch
+                    # at least `extra_claim_keypoints` visible
+                    # keypoints from this pose. Catches SAM3-fragmented
+                    # masks of the same person.
+                    if extra_claim_keypoints > 0:
+                        visible_mask = pose_sc >= score_threshold
+                        if visible_mask.any():
+                            visible_xy = pose_xy[visible_mask]
+                            for other_slot in uncovered_slots:
+                                if other_slot in newly_covered_slots:
+                                    continue
+                                hits = _count_keypoints_in_mask(
+                                    visible_xy,
+                                    frame_masks_per_slot[other_slot],
+                                    H, W,
+                                    early_stop=extra_claim_keypoints,
+                                )
+                                if hits >= extra_claim_keypoints:
+                                    newly_covered_slots.add(other_slot)
+                                    n_extra_claims_this_iter += 1
+
+                if n_dupes_skipped_this_iter or n_extra_claims_this_iter:
+                    _logger.debug(
+                        "Sapiens2 frame %d iter %d: %d poses kept, %d "
+                        "dupes skipped (mask already taken), %d extra-"
+                        "claimed masks (SAM3 fragments absorbed).",
+                        t, it,
+                        len(newly_covered_slots) - n_extra_claims_this_iter,
+                        n_dupes_skipped_this_iter,
+                        n_extra_claims_this_iter,
+                    )
 
                 if not newly_covered_slots:
                     # Nothing got attributed this iteration; further
