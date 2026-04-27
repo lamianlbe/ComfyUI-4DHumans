@@ -58,8 +58,90 @@ import comfy.utils
 
 from .fastsam3db_farl_pose_node import _linear_interp_timeline
 from ._fastsam3db_inference import run_fastsam3db_video
+from .bmp_seg_node import _BMPResult, _BMPReplayModel
 
 _logger = logging.getLogger(__name__)
+
+
+def _yolo_pose_from_input_poses(
+    input_poses: dict,
+    bbox_by_slot: List[List[Optional[np.ndarray]]],
+    n_persons: int,
+    B: int,
+) -> dict:
+    """Build a YOLO11POSE-compatible dict from the input POSES'
+    composite 2D keypoints, so Fast SAM 3D Body can use the user's
+    BMP/ViTPose/RTMW-fused wrist data as ``yolo_pose_keypoints``
+    without requiring a separate LoadYOLO11Pose connection.
+
+    The output dict matches the shape FastSAM3DBody's
+    ``yolo11_pose["model"]`` consumer expects: a callable model with
+    ``.to(device)`` + ``.predict(source=chunk)`` returning
+    Ultralytics-Result-like objects (each with ``.boxes`` and
+    ``.keypoints``). We reuse the same replay-model machinery
+    BMPInstanceSegmentation already uses for ``bmp_pose``.
+
+    bbox source preference per (slot, frame):
+      1. mask-derived bbox from ``bbox_by_slot[t][p]`` (preferred —
+         tight body extent matches BMP's IoU tracking)
+      2. derived from visible body keypoints (fallback for slots/
+         frames where BMP missed the mask but ViTPose's full-image
+         fallback fired in BMPRTMWPose; we still have keypoints,
+         just no mask)
+      3. skip the slot for that frame (not enough data)
+    """
+    persons_in = input_poses.get("persons", [])
+    cache: List[Optional[_BMPResult]] = [None] * B
+
+    for t in range(B):
+        bboxes  = []
+        scores  = []
+        kpts17s = []
+        for p_idx in range(n_persons):
+            if p_idx >= len(persons_in):
+                continue
+            kp_list = persons_in[p_idx].get("keypoints", [])
+            if t >= len(kp_list):
+                continue
+            kp133 = kp_list[t]
+            if kp133 is None:
+                continue
+            kp17 = np.asarray(kp133[:17, :3], dtype=np.float32)
+
+            # Pick bbox: prefer mask-derived, else derive from visible body kpts
+            bb = bbox_by_slot[t][p_idx]
+            if bb is None:
+                vis = kp17[:, 2] > 0.1
+                if int(vis.sum()) < 3:
+                    continue   # too few visible joints to make a meaningful bbox
+                xs = kp17[vis, 0]
+                ys = kp17[vis, 1]
+                pad_x = max(1.0, (float(xs.max()) - float(xs.min())) * 0.20)
+                pad_y = max(1.0, (float(ys.max()) - float(ys.min())) * 0.20)
+                bb = np.array([
+                    float(xs.min()) - pad_x, float(ys.min()) - pad_y,
+                    float(xs.max()) + pad_x, float(ys.max()) + pad_y,
+                ], dtype=np.float32)
+
+            score = float(kp17[:, 2].mean())
+            bboxes.append(np.asarray(bb, dtype=np.float32))
+            scores.append(score)
+            kpts17s.append(kp17)
+
+        if bboxes:
+            cache[t] = _BMPResult(
+                np.stack(bboxes,  axis=0),
+                np.array(scores, dtype=np.float32),
+                np.stack(kpts17s, axis=0),
+            )
+
+    n_frames_with_data = sum(1 for r in cache if r is not None)
+    return {
+        "model":             _BMPReplayModel(cache),
+        "checkpoint_path":   "<auto from input POSES (BMP/ViTPose/RTMW composite)>",
+        "_bmp_cache":        cache,
+        "_n_frames_filled":  n_frames_with_data,
+    }
 
 
 class Pose3DUpgradeNode:
@@ -94,7 +176,22 @@ class Pose3DUpgradeNode:
                 ),
             },
             "optional": {
-                "yolo11_pose": ("YOLO11POSE",),
+                "yolo11_pose": (
+                    "YOLO11POSE",
+                    {
+                        "tooltip": (
+                            "Optional. Wired into Fast SAM 3D Body's "
+                            "hand-bbox decoder for slightly more "
+                            "accurate SMPL hand pose. If NOT connected, "
+                            "Pose3DUpgrade auto-builds an equivalent "
+                            "dict from the input POSES' composite 2D "
+                            "keypoints (BMP/ViTPose/RTMW fusion), "
+                            "which is typically HIGHER quality than a "
+                            "standalone YOLO11m-Pose anyway. Most "
+                            "users should leave this disconnected."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -177,12 +274,19 @@ class Pose3DUpgradeNode:
         if B > 0:
             sampled_frames.add(B - 1)
 
+        # Two structures:
+        #   mask_bboxes_per_frame / person_indices_per_frame:
+        #       flat lists for SAMPLED frames only (fed to Fast SAM 3D Body)
+        #   bbox_by_slot[t][p]:
+        #       per-slot indexed dict for ALL frames (used to build the
+        #       auto-extracted yolo_pose dict when yolo11_pose is None)
         mask_bboxes_per_frame: List[list] = [[] for _ in range(B)]
         person_indices_per_frame: List[list] = [[] for _ in range(B)]
+        bbox_by_slot: List[List[Optional[np.ndarray]]] = [
+            [None] * n_persons for _ in range(B)
+        ]
 
         for t in range(B):
-            if t not in sampled_frames:
-                continue
             for p_idx in range(n_persons):
                 mask_frame = masks_np[t, p_idx]
                 ys, xs = np.where(mask_frame)
@@ -194,12 +298,40 @@ class Pose3DUpgradeNode:
                 x2 = min(img_w, x2); y2 = min(img_h, y2)
                 if x2 - x1 < 2 or y2 - y1 < 2:
                     continue
-                mask_bboxes_per_frame[t].append((x1, y1, x2, y2))
-                person_indices_per_frame[t].append(p_idx)
+                bbox_by_slot[t][p_idx] = np.array(
+                    [x1, y1, x2, y2], dtype=np.float32,
+                )
+                if t in sampled_frames:
+                    mask_bboxes_per_frame[t].append((x1, y1, x2, y2))
+                    person_indices_per_frame[t].append(p_idx)
 
         n_sampled = len(sampled_frames)
         pbar = comfy.utils.ProgressBar(B + 1)
         t0 = time.perf_counter()
+
+        # ---------------------------------------------------------------
+        # Auto-build yolo11_pose from input POSES when not connected.
+        # Uses the composite 2D keypoints (BMP / ViTPose / RTMW fusion)
+        # which are higher quality than what a standalone YOLO11m-Pose
+        # would produce — and saves the user a separate node load.
+        # ---------------------------------------------------------------
+        yolo_pose_was_auto = False
+        if yolo11_pose is None:
+            yolo11_pose = _yolo_pose_from_input_poses(
+                input_poses=poses,
+                bbox_by_slot=bbox_by_slot,
+                n_persons=n_persons,
+                B=B,
+            )
+            yolo_pose_was_auto = True
+            n_filled = yolo11_pose.get("_n_frames_filled", 0)
+            _logger.info(
+                "Pose3DUpgrade: auto-built yolo11_pose from input POSES "
+                "composite (%d frames with detections). Fast SAM 3D "
+                "Body will use BMP/ViTPose/RTMW-fused wrist data for "
+                "hand-bbox derivation.",
+                n_filled,
+            )
 
         # ---------------------------------------------------------------
         # Phase 2: Fast SAM 3D Body + MHR2SMPL
@@ -318,11 +450,14 @@ class Pose3DUpgradeNode:
         elapsed = time.perf_counter() - t0
         cam_filled = sum(1 for v in cam_int_per_frame if v is not None)
         _logger.info(
-            "Pose3DUpgrade: %d frames, %d persons | FastSAM3DBody "
-            "%.2fs (%d sampled) | MHR2SMPL %.2fs | body_joints "
-            "filled: %d (slot,frame) | smpl_j3d filled: %d | "
-            "cam_int filled: %d | total %.2fs",
-            B, n_persons, fastsam3db_time, n_sampled,
+            "Pose3DUpgrade: %d frames, %d persons | yolo_pose=%s | "
+            "FastSAM3DBody %.2fs (%d sampled) | MHR2SMPL %.2fs | "
+            "body_joints filled: %d (slot,frame) | smpl_j3d filled: "
+            "%d | cam_int filled: %d | total %.2fs",
+            B, n_persons,
+            "auto-from-POSES" if yolo_pose_was_auto
+            else ("user-connected" if yolo11_pose is not None else "none"),
+            fastsam3db_time, n_sampled,
             mhr2smpl_time, body_filled, smpl_filled,
             cam_filled, elapsed,
         )
