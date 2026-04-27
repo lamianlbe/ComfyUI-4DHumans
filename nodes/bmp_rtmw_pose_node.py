@@ -1124,24 +1124,64 @@ class BMPRTMWPoseNode:
 
             # Group fallback requests by frame so each ViTPose forward
             # runs all that frame's missing-body bboxes in one shot.
-            requests_by_frame: Dict[int, List[Tuple[int, np.ndarray]]] = (
-                defaultdict(list)
-            )
+            #
+            # Each request: (slot_idx, bbox_xyxy, source_tag).
+            # source_tag is just for logging — "mask_bbox" or
+            # "full_image" depending on where the bbox came from.
+            requests_by_frame: Dict[
+                int, List[Tuple[int, np.ndarray, str]]
+            ] = defaultdict(list)
+
+            full_image_fallback_count = 0
+
             for t in range(B):
+                # Pass 1: slots with valid mask-derived bboxes
+                any_slot_has_bbox = any(
+                    bbox_per_frame[t][q] is not None
+                    for q in range(n_persons)
+                )
+
                 for p in range(n_persons):
                     if body_source[p][t] is not None:
                         continue   # Already claimed by BMP
-                    kp133 = persons_133[p][t]
-                    if kp133 is None:
-                        continue
                     bb = bbox_per_frame[t][p]
-                    if bb is None:
+                    if bb is not None:
+                        requests_by_frame[t].append((p, bb, "mask_bbox"))
                         continue
-                    requests_by_frame[t].append((p, bb))
 
-            for t, slot_bbox_pairs in requests_by_frame.items():
-                slots = [pair[0] for pair in slot_bbox_pairs]
-                bboxes_for_vt = [pair[1] for pair in slot_bbox_pairs]
+                    # Slot has no mask bbox. If ANY other slot in this
+                    # frame has a bbox, skip this one — we don't know
+                    # which person ViTPose would find with a full-image
+                    # bbox, and assigning to a slot that's missing
+                    # mask but has neighbours risks duplicating an
+                    # already-detected person.
+                    #
+                    # If NO slot has a bbox (BMP completely failed
+                    # this frame), use full-image bbox and assign to
+                    # slot 0 only. ViTPose's top-down argmax finds
+                    # the strongest person; that's the best we can
+                    # do without a detector.
+                    if not any_slot_has_bbox and p == 0:
+                        bb_full = np.array(
+                            [0.0, 0.0, float(W), float(H)],
+                            dtype=np.float32,
+                        )
+                        requests_by_frame[t].append(
+                            (p, bb_full, "full_image"),
+                        )
+                        full_image_fallback_count += 1
+
+            if full_image_fallback_count > 0:
+                _logger.info(
+                    "ViTPose fallback: %d frames had NO BMP mask in "
+                    "any slot — using full-image bbox for slot 0 in "
+                    "those frames.",
+                    full_image_fallback_count,
+                )
+
+            for t, requests in requests_by_frame.items():
+                slots         = [r[0] for r in requests]
+                bboxes_for_vt = [r[1] for r in requests]
 
                 # _run_vitpose_batch returns (N, K, 3); K is the
                 # loaded model's keypoint count (17 body-only or 133
@@ -1157,10 +1197,6 @@ class BMPRTMWPoseNode:
                 has_hands = K_returned >= 133
 
                 for i, p_idx in enumerate(slots):
-                    kp133 = persons_133[p_idx][t]
-                    if kp133 is None:
-                        continue
-
                     new_kp = vt_out[i].astype(np.float32)
                     body_new = new_kp[:17]
                     body_new_max = float(body_new[:, 2].max())
@@ -1170,6 +1206,16 @@ class BMPRTMWPoseNode:
                     # entire (p, t).
                     if body_new_max < float(score_threshold):
                         continue
+
+                    # If RTMW didn't fill this slot (no bbox to crop),
+                    # there's no kp133 array yet — create one. Indices
+                    # we don't fill below stay zeroed. Phase 2.8 won't
+                    # null this entry because body_source becomes
+                    # "vit" below.
+                    kp133 = persons_133[p_idx][t]
+                    if kp133 is None:
+                        kp133 = np.zeros((133, 3), dtype=np.float32)
+                        persons_133[p_idx][t] = kp133
 
                     # Body 0..16
                     kp133[0:17] = body_new
