@@ -182,34 +182,81 @@ class Pose3DUpgradeNLFNode:
         )
 
         # ---------------------------------------------------------------
-        # Phase 1: per-frame mask → bbox (used only for IoU matching;
-        # NLF detects on the full frame). We compute bboxes for ALL
-        # frames so that an interpolated frame can still recover its
-        # slot identity if NLF is later asked to run there too — but
-        # we only feed sampled-frame bboxes into run_nlf_video.
+        # Phase 1: per-frame slot bbox for IoU matching against NLF
+        # detections. Two sources:
+        #   1. BMP mask (preferred — tightest, covers full body extent)
+        #   2. Body keypoints 0..16 from input POSES (fallback — fires
+        #      when BMP failed entirely but ViTPose's full-image bbox
+        #      path filled the slot upstream; we still have keypoints
+        #      to bound, just no mask).
+        # NLF self-detects on the full frame either way; the bbox here
+        # is purely for matching detections back to BMP-tracked slot
+        # IDs. So #2 is a strictly safe fallback — when BMP is gone we
+        # lose nothing by switching to a kpt-derived bbox.
         # ---------------------------------------------------------------
         sampled_set = set(sampled_frames)
+        in_persons_for_bbox = list(poses.get("persons", []))
         mask_bboxes_per_frame = [[] for _ in range(B)]
         person_indices_per_frame = [[] for _ in range(B)]
+        bbox_source_counts = {"mask": 0, "kpts": 0}
+
         for t in range(B):
             if t not in sampled_set:
                 continue
             for p_idx in range(n_persons):
+                bb = None
+
                 mask_frame = masks_np[t, p_idx]
                 ys, xs = np.where(mask_frame)
-                if len(xs) == 0:
+                if len(xs) > 0:
+                    x1 = int(xs.min()); y1 = int(ys.min())
+                    x2 = int(xs.max() + 1); y2 = int(ys.max() + 1)
+                    x1 = max(0, x1); y1 = max(0, y1)
+                    x2 = min(img_w, x2); y2 = min(img_h, y2)
+                    if x2 - x1 >= 2 and y2 - y1 >= 2:
+                        bb = (x1, y1, x2, y2)
+                        bbox_source_counts["mask"] += 1
+
+                if bb is None and p_idx < len(in_persons_for_bbox):
+                    kp_list = in_persons_for_bbox[p_idx].get("keypoints", [])
+                    if t < len(kp_list) and kp_list[t] is not None:
+                        kp = np.asarray(kp_list[t], dtype=np.float32)
+                        if kp.shape[0] >= 17 and kp.shape[1] >= 3:
+                            kp17 = kp[:17]
+                            vis = kp17[:, 2] > 0.1
+                            if int(vis.sum()) >= 3:
+                                xs17 = kp17[vis, 0]
+                                ys17 = kp17[vis, 1]
+                                xmin = float(xs17.min()); xmax = float(xs17.max())
+                                ymin = float(ys17.min()); ymax = float(ys17.max())
+                                # 20% pad gives NLF's full-body det a
+                                # reasonable IoU floor against a body-
+                                # only kpt extent (which doesn't include
+                                # head/feet on its own).
+                                pad_x = max(1.0, (xmax - xmin) * 0.20)
+                                pad_y = max(1.0, (ymax - ymin) * 0.20)
+                                x1 = max(0, int(round(xmin - pad_x)))
+                                y1 = max(0, int(round(ymin - pad_y)))
+                                x2 = min(img_w, int(round(xmax + pad_x)))
+                                y2 = min(img_h, int(round(ymax + pad_y)))
+                                if x2 - x1 >= 2 and y2 - y1 >= 2:
+                                    bb = (x1, y1, x2, y2)
+                                    bbox_source_counts["kpts"] += 1
+
+                if bb is None:
                     continue
-                x1 = int(xs.min()); y1 = int(ys.min())
-                x2 = int(xs.max() + 1); y2 = int(ys.max() + 1)
-                x1 = max(0, x1); y1 = max(0, y1)
-                x2 = min(img_w, x2); y2 = min(img_h, y2)
-                if x2 - x1 < 2 or y2 - y1 < 2:
-                    continue
-                mask_bboxes_per_frame[t].append((x1, y1, x2, y2))
+                mask_bboxes_per_frame[t].append(bb)
                 person_indices_per_frame[t].append(p_idx)
 
         n_sampled_with_data = sum(
             1 for t in sampled_frames if len(mask_bboxes_per_frame[t]) > 0
+        )
+        _logger.info(
+            "Pose3DUpgradeNLF: per-slot bboxes — %d from BMP mask, "
+            "%d from input POSES kpts (BMP failed but ViTPose carried "
+            "the slot), %d sampled frames have ≥1 slot bbox.",
+            bbox_source_counts["mask"], bbox_source_counts["kpts"],
+            n_sampled_with_data,
         )
 
         # Progress bar covers: NLF inference frames + 1 (post-processing)
