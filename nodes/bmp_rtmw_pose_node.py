@@ -59,7 +59,7 @@ import torch
 import comfy.utils
 
 from ._farl_face_inference import run_farl_face_per_person
-from ._mask_utils import _DEBUG_PALETTE_RGB, build_debug_overlay, pack_mask, unpack_mask
+from ._mask_utils import build_debug_overlay, pack_mask, unpack_mask
 
 _logger = logging.getLogger(__name__)
 
@@ -74,16 +74,38 @@ _RIGHT_WRIST_IDX = 10
 _RTMW_SCORE_NORM = 3.0
 
 
-# COCO-17-ish skeleton edges for the debug overlay. We only draw body
-# 0..16 + a couple of feet links — face / hand have too many points to
-# render cleanly at typical preview resolution.
-_DEBUG_SKELETON_EDGES = [
-    (5, 7), (7, 9), (6, 8), (8, 10),
-    (11, 13), (13, 15), (12, 14), (14, 16),
-    (5, 6), (5, 11), (6, 12), (11, 12),
-    (0, 1), (0, 2), (1, 3), (2, 4),
-    (0, 5), (0, 6),
-    (15, 19), (16, 22),  # ankles → heels (feet)
+# Body skeleton edges — COCO-17 indices 0..16. Source: BMP body.
+_DEBUG_BODY_EDGES = [
+    (5, 7), (7, 9), (6, 8), (8, 10),       # arms
+    (11, 13), (13, 15), (12, 14), (14, 16), # legs
+    (5, 6), (5, 11), (6, 12), (11, 12),     # torso
+    (0, 1), (0, 2), (1, 3), (2, 4),         # head
+    (0, 5), (0, 6),                         # neck → shoulders
+]
+
+# Foot edges — COCO-WB indices 17..22. Source: RTMW.
+# 17 left_big_toe, 18 left_small_toe, 19 left_heel,
+# 20 right_big_toe, 21 right_small_toe, 22 right_heel.
+_DEBUG_FOOT_EDGES = [
+    (15, 17), (15, 18), (15, 19),  # left ankle → toes/heel
+    (16, 20), (16, 21), (16, 22),  # right ankle → toes/heel
+]
+
+# Hand bone topology (MANO standard): wrist + 4 finger chains × 4 bones.
+# Indices are 0..20 for left hand (COCO-WB 91..111) and same offsets
+# for right hand (COCO-WB 112..132). Order:
+#   0 wrist
+#   1-4 thumb (CMC, MCP, IP, TIP)
+#   5-8 index (MCP, PIP, DIP, TIP)
+#   9-12 middle
+#   13-16 ring
+#   17-20 little
+_HAND_FINGER_CHAINS = [
+    [0, 1, 2, 3, 4],          # thumb
+    [0, 5, 6, 7, 8],          # index
+    [0, 9, 10, 11, 12],       # middle
+    [0, 13, 14, 15, 16],      # ring
+    [0, 17, 18, 19, 20],      # little
 ]
 
 
@@ -343,14 +365,36 @@ def _assign_wilor_hands_to_persons(
 # Debug overlay
 # --------------------------------------------------------------------------
 
-def _draw_skeleton(frame_u8: np.ndarray, kp133: np.ndarray,
-                    color_rgb: Tuple[int, int, int],
-                    conf_thresh: float = 0.3,
-                    radius: int = 3, thickness: int = 2):
-    """Mutate frame_u8 in place: draw body+feet skeleton from a 133-pt array."""
+# Region color scheme. Each model contributes a different region of the
+# 133-keypoint COCO-WB layout, so we use a FIXED color per region (NOT
+# per-track). This makes it visually obvious which model's output is
+# being looked at.
+#
+#   green   ← BMP body  (0..16)
+#   yellow  ← RTMW feet (17..22)
+#   cyan    ← FaRL face (23..90)
+#   magenta ← left hand (91..111)   — RTMW or WiLoR
+#   orange  ← right hand (112..132) — RTMW or WiLoR
+#
+# Mask & bbox in the underlying overlay still use one color per track
+# (from build_debug_overlay's palette) so person identity is also
+# preserved at a glance.
+_BODY_COLOR  = (50,  255, 50)    # green
+_FOOT_COLOR  = (255, 220, 0)     # yellow
+_FACE_COLOR  = (0,   220, 255)   # cyan
+_LHAND_COLOR = (255, 0,   200)   # magenta
+_RHAND_COLOR = (255, 140, 0)     # orange
+
+
+def _draw_keypoints(frame_u8: np.ndarray, kp133: np.ndarray,
+                     indices, color_rgb: Tuple[int, int, int],
+                     conf_thresh: float, radius: int):
+    """Helper: draw a subset of keypoints as filled circles."""
     import cv2
     H, W = frame_u8.shape[:2]
-    for k in range(min(23, kp133.shape[0])):  # body + feet only for clarity
+    for k in indices:
+        if k >= kp133.shape[0]:
+            continue
         x, y, c = float(kp133[k, 0]), float(kp133[k, 1]), float(kp133[k, 2])
         if c < conf_thresh:
             continue
@@ -358,14 +402,26 @@ def _draw_skeleton(frame_u8: np.ndarray, kp133: np.ndarray,
         if 0 <= ix < W and 0 <= iy < H:
             cv2.circle(frame_u8, (ix, iy), radius, color_rgb,
                         thickness=-1, lineType=cv2.LINE_AA)
-    for i, j in _DEBUG_SKELETON_EDGES:
-        if i >= kp133.shape[0] or j >= kp133.shape[0]:
+
+
+def _draw_edges(frame_u8: np.ndarray, kp133: np.ndarray,
+                 edges, base_offset: int,
+                 color_rgb: Tuple[int, int, int],
+                 conf_thresh: float, thickness: int):
+    """Helper: draw a list of (i, j) edges. ``base_offset`` is added
+    to the index pair (lets us reuse a 0-relative finger topology
+    for both left-hand 91..111 and right-hand 112..132)."""
+    import cv2
+    H, W = frame_u8.shape[:2]
+    for i, j in edges:
+        ai, aj = i + base_offset, j + base_offset
+        if ai >= kp133.shape[0] or aj >= kp133.shape[0]:
             continue
-        ci, cj = float(kp133[i, 2]), float(kp133[j, 2])
+        ci, cj = float(kp133[ai, 2]), float(kp133[aj, 2])
         if ci < conf_thresh or cj < conf_thresh:
             continue
-        p1 = (int(round(float(kp133[i, 0]))), int(round(float(kp133[i, 1]))))
-        p2 = (int(round(float(kp133[j, 0]))), int(round(float(kp133[j, 1]))))
+        p1 = (int(round(float(kp133[ai, 0]))), int(round(float(kp133[ai, 1]))))
+        p2 = (int(round(float(kp133[aj, 0]))), int(round(float(kp133[aj, 1]))))
         if not (0 <= p1[0] < W and 0 <= p1[1] < H and
                 0 <= p2[0] < W and 0 <= p2[1] < H):
             continue
@@ -373,22 +429,51 @@ def _draw_skeleton(frame_u8: np.ndarray, kp133: np.ndarray,
                   thickness=thickness, lineType=cv2.LINE_AA)
 
 
-def _draw_hands(frame_u8: np.ndarray, kp133: np.ndarray,
-                 color_rgb: Tuple[int, int, int],
-                 conf_thresh: float = 0.3, radius: int = 2):
-    """Draw the 42 hand keypoints (91..132) as small dots."""
-    import cv2
-    H, W = frame_u8.shape[:2]
-    for k in range(91, 133):
-        if k >= kp133.shape[0]:
-            break
-        x, y, c = float(kp133[k, 0]), float(kp133[k, 1]), float(kp133[k, 2])
-        if c < conf_thresh:
-            continue
-        ix, iy = int(round(x)), int(round(y))
-        if 0 <= ix < W and 0 <= iy < H:
-            cv2.circle(frame_u8, (ix, iy), radius, color_rgb,
-                        thickness=-1, lineType=cv2.LINE_AA)
+def _draw_body(frame_u8, kp133, conf_thresh):
+    """COCO-17 body 0..16 — sourced from BMP. Green."""
+    _draw_keypoints(frame_u8, kp133, range(17),
+                     _BODY_COLOR, conf_thresh, radius=3)
+    _draw_edges(frame_u8, kp133, _DEBUG_BODY_EDGES,
+                 base_offset=0, color_rgb=_BODY_COLOR,
+                 conf_thresh=conf_thresh, thickness=2)
+
+
+def _draw_feet(frame_u8, kp133, conf_thresh):
+    """COCO-WB feet 17..22 — sourced from RTMW. Yellow."""
+    _draw_keypoints(frame_u8, kp133, range(17, 23),
+                     _FOOT_COLOR, conf_thresh, radius=3)
+    _draw_edges(frame_u8, kp133, _DEBUG_FOOT_EDGES,
+                 base_offset=0, color_rgb=_FOOT_COLOR,
+                 conf_thresh=conf_thresh, thickness=2)
+
+
+def _draw_face(frame_u8, kp133, conf_thresh):
+    """COCO-WB face 23..90 — sourced from FaRL when connected else RTMW.
+    Cyan. Drawn as small dots; the 68-point iBUG layout is too dense
+    for skeleton edges to read cleanly at preview resolution."""
+    _draw_keypoints(frame_u8, kp133, range(23, 91),
+                     _FACE_COLOR, conf_thresh, radius=1)
+
+
+def _draw_hands(frame_u8, kp133, conf_thresh):
+    """COCO-WB hands 91..132 — sourced from RTMW or WiLoR.
+    Magenta (left) + orange (right). MANO finger-chain skeleton."""
+    # Left hand
+    _draw_keypoints(frame_u8, kp133, range(91, 112),
+                     _LHAND_COLOR, conf_thresh, radius=2)
+    for chain in _HAND_FINGER_CHAINS:
+        edges = list(zip(chain[:-1], chain[1:]))
+        _draw_edges(frame_u8, kp133, edges, base_offset=91,
+                     color_rgb=_LHAND_COLOR, conf_thresh=conf_thresh,
+                     thickness=1)
+    # Right hand
+    _draw_keypoints(frame_u8, kp133, range(112, 133),
+                     _RHAND_COLOR, conf_thresh, radius=2)
+    for chain in _HAND_FINGER_CHAINS:
+        edges = list(zip(chain[:-1], chain[1:]))
+        _draw_edges(frame_u8, kp133, edges, base_offset=112,
+                     color_rgb=_RHAND_COLOR, conf_thresh=conf_thresh,
+                     thickness=1)
 
 
 # --------------------------------------------------------------------------
@@ -756,22 +841,32 @@ class BMPRTMWPoseNode:
         overlay_t, legend = build_debug_overlay(
             images=images, per_frame_items=per_frame_items, H=H, W=W,
         )
-        _logger.info("BMPRTMWPose debug overlay legend: %s", legend)
+        _logger.info("BMPRTMWPose debug overlay legend (mask): %s", legend)
+        _logger.info(
+            "BMPRTMWPose debug overlay legend (joints): "
+            "body=green | feet=yellow | face=cyan | "
+            "left-hand=magenta | right-hand=orange"
+        )
 
         arr = (overlay_t.detach().cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
         arr = np.ascontiguousarray(arr)
 
+        # Per-region drawing — each model's contribution gets its own
+        # color (body=green, feet=yellow, face=cyan, lhand=magenta,
+        # rhand=orange). The mask + bbox layer underneath uses one color
+        # per track (from build_debug_overlay's palette), so reading the
+        # overlay you get track identity from the mask color and joint
+        # source from the keypoint color.
+        ct = float(score_threshold)
         for t in range(B):
             for p in range(n_persons):
                 kp = persons_133[p][t]
                 if kp is None:
                     continue
-                color = _DEBUG_PALETTE_RGB[p % len(_DEBUG_PALETTE_RGB)]
-                color_rgb = tuple(int(c) for c in color.tolist())
-                _draw_skeleton(arr[t], kp, color_rgb,
-                                conf_thresh=float(score_threshold))
-                _draw_hands(arr[t], kp, color_rgb,
-                             conf_thresh=float(score_threshold))
+                _draw_body(arr[t], kp, conf_thresh=ct)
+                _draw_feet(arr[t], kp, conf_thresh=ct)
+                _draw_face(arr[t], kp, conf_thresh=ct)
+                _draw_hands(arr[t], kp, conf_thresh=ct)
 
         out_overlay = torch.from_numpy(arr.astype(np.float32) / 255.0)
         return (poses, out_overlay)
