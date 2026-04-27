@@ -921,29 +921,6 @@ class BMPRTMWPoseNode:
                         ),
                     },
                 ),
-                "face_front_only": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": (
-                            "Skip FaRL face inference for (slot, frame) "
-                            "pairs whose head 5pt geometry suggests a "
-                            "back / extreme profile view. Top-down kpt "
-                            "regressors (BMP / RTMW / ViTPose) "
-                            "hallucinate plausible-but-wrong eye + "
-                            "nose positions when the person turns "
-                            "away from camera — feeding those to FaRL "
-                            "produces garbage 68-pt landmarks. This "
-                            "gate uses ear↔eye anatomical consistency, "
-                            "eye/ear distance ratios, nose-relative-to-"
-                            "eyes geometry, and ear vs eye confidence "
-                            "asymmetry to reject those cases. Disable "
-                            "if your content has unusual face geometry "
-                            "(cartoons, masks, etc.) and you'd rather "
-                            "let FaRL try regardless."
-                        ),
-                    },
-                ),
                 "debug_overlay": (
                     "BOOLEAN",
                     {
@@ -974,7 +951,7 @@ class BMPRTMWPoseNode:
             score_threshold, fps, pose_3d_fps,
             ghost_oks_thresh, ghost_max_burst_frames,
             recovery_max_gap_frames, recovery_oks_thresh,
-            face_front_only, debug_overlay,
+            debug_overlay,
             bmp_pose=None, farl_face=None, wilor=None, vitpose=None):
         from mmpose.apis import inference_topdown
 
@@ -1307,6 +1284,30 @@ class BMPRTMWPoseNode:
                 cleared_no_body,
             )
 
+        # ---- Capture pre-FaRL 2D face mean confidence --------------------
+        # Snapshot mean(kp133[23:91, 2]) per (slot, frame) BEFORE Phase 2.6
+        # overwrites face landmarks with FaRL's hard-coded conf=1.0.
+        # This is a strong "is the face actually visible" signal — RTMW's
+        # face heatmap softens sharply on back / occluded heads, unlike
+        # its body kpts which are hallucinated with high conf. Used at
+        # render time by _pose_utils.is_face_visible() as the second
+        # signal (after 3D body normal) before falling back to 2D
+        # geometry heuristics. ViTPose body fallback (Phase 2.7) does
+        # NOT touch face slots, so pre-FaRL face conf == RTMW face conf
+        # on slots where RTMW ran, else 0 (initial zeros from any from-
+        # scratch ViTPose-only allocation).
+        face_conf_2d_mat: List[List[Optional[float]]] = [
+            [None] * B for _ in range(n_persons)
+        ]
+        for p in range(n_persons):
+            for t in range(B):
+                kp133 = persons_133[p][t]
+                if kp133 is None or kp133.shape[0] < 91 or kp133.shape[1] < 3:
+                    continue
+                face_conf_2d_mat[p][t] = float(
+                    np.mean(kp133[23:91, 2])
+                )
+
         # ---- Phase 2.6: optional FaRL face override (23..90) -------------
         # When farl_face is connected, regenerate the face slice using
         # BMP's per-person head 5pt → synthesise FaRL 5pt landmarks →
@@ -1354,7 +1355,6 @@ class BMPRTMWPoseNode:
                 img_h=H, img_w=W,
                 head_conf_thresh=float(score_threshold),
                 frame_batch_size=32,
-                front_facing_filter=bool(face_front_only),
                 pbar=None,
             )
 
@@ -1815,6 +1815,12 @@ class BMPRTMWPoseNode:
             "cam_int": [None] * B,
             "scale":   [None] * B,
             "offset":  [None] * B,
+            # Pre-FaRL 2D face mean confidence per (slot, frame). Used
+            # by PoseRenderer / PoseEditor's is_face_visible() helper
+            # as the second-tier signal (after 3D body normal, before
+            # 2D head-kpt geometry). Underscore-prefixed since it's a
+            # render-only hint, not part of the canonical pose data.
+            "_face_conf_2d": face_conf_2d_mat,
         }
 
         # ---- Phase 4.5: build POSE_BUNDLE for downstream 3D --------------

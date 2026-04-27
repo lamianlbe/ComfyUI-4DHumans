@@ -22,7 +22,7 @@ import torch
 import comfy.utils
 
 from ..humans4d.hmr2.utils.render_sapiens import render_sapiens_dwpose
-from ._pose_utils import resample_keypoints
+from ._pose_utils import is_face_visible, resample_keypoints
 
 
 class PoseRendererNode:
@@ -67,6 +67,28 @@ class PoseRendererNode:
                         ),
                     },
                 ),
+                "face_smart_filter": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "When show_face=True, additionally skip "
+                            "drawing face landmarks for (slot, frame) "
+                            "pairs where the face appears NOT to be "
+                            "visible to camera (e.g. person turned "
+                            "around). Three-tier check: (1) 3D body "
+                            "normal from smpl_j3d shoulders × torso "
+                            "— used when Pose3DUpgrade was run; works "
+                            "even for upside-down poses, (2) RTMW/"
+                            "ViTPose pre-FaRL face mean confidence "
+                            "stashed by BMPRTMWPose — strong data-"
+                            "driven signal, (3) 2D head-kpt geometry "
+                            "fallback (no upright assumption). Disable "
+                            "for content where you'd rather always "
+                            "render whatever FaRL produced."
+                        ),
+                    },
+                ),
                 "show_hand_foot": (
                     "BOOLEAN",
                     {
@@ -91,7 +113,7 @@ class PoseRendererNode:
     CATEGORY = "4dhumans"
 
     def render(self, poses, debug, target_fps,
-               show_face, show_hand_foot, images=None):
+               show_face, face_smart_filter, show_hand_foot, images=None):
 
         n_persons = poses["n_persons"]
         B = poses["n_frames"]
@@ -129,6 +151,7 @@ class PoseRendererNode:
         # survived this (slot, frame); don't fake one."
         # -----------------------------------------------------------
         frame_kps = [[] for _ in range(B)]
+        face_filtered = 0  # counts (slot, frame) where smart filter zeroed face
 
         for t in range(B):
             for p_idx in visible_indices:
@@ -138,12 +161,31 @@ class PoseRendererNode:
                 kp = kp133.copy()
                 if not show_face:
                     kp[23:91] = 0.0          # face 68pt
+                elif face_smart_filter:
+                    # 3-tier visibility check: 3D body normal → RTMW
+                    # face conf → 2D head-kpt geometry fallback. Zero
+                    # face slots when face appears not visible (back
+                    # view / occluded).
+                    if not is_face_visible(poses, p_idx, t):
+                        kp[23:91] = 0.0
+                        face_filtered += 1
                 if not show_hand_foot:
                     kp[17:23]  = 0.0         # feet 6pt
                     kp[91:133] = 0.0         # hands 42pt
                 frame_kps[t].append(kp)
 
             pbar.update(1)
+
+        if show_face and face_smart_filter and face_filtered > 0:
+            # Diagnostic visibility — at-a-glance "how many faces did
+            # the smart filter hide". Useful for verifying it caught
+            # back-view frames without over-rejecting frontal ones.
+            import logging
+            logging.getLogger(__name__).info(
+                "PoseRenderer: face_smart_filter zeroed face on "
+                "%d (slot, frame) pairs (back-view / occluded).",
+                face_filtered,
+            )
 
         # -----------------------------------------------------------
         # Frame rate resampling (per-person linear interpolation)

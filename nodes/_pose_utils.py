@@ -483,3 +483,182 @@ def compute_resampled_indices(n_in, fps_in, target_fps=30.0):
         indices.append(j)
 
     return indices
+
+
+# ---------------------------------------------------------------------------
+# Face visibility (for render-time face-slot gating)
+# ---------------------------------------------------------------------------
+# Three independent signals, tried in priority order:
+#   1. 3D body normal (smpl_j3d shoulder × torso) — strongest. Works even
+#      when the subject is upside down or in odd poses; just measures
+#      "does the chest face the camera".
+#   2. RTMW / ViTPose face mean confidence — strong, data-driven. Top-
+#      down 2D estimators trained on diverse data drop face-landmark
+#      confidence sharply on back/occluded faces (unlike top-down BODY
+#      kpts which they hallucinate). FaRL has no per-landmark
+#      confidence (output is hard-coded to 1.0), so this signal must be
+#      captured upstream BEFORE FaRL overrides the face slots and
+#      stashed in poses["_face_conf_2d"].
+#   3. 2D head-kpt geometry (eye-ear sides, eye-vs-ear distance ratio,
+#      nose between eyes, ear-eye conf asymmetry). Last-resort fallback
+#      when the above are unavailable. Note: deliberately does NOT
+#      include "nose above eyes" — scenes with inverted/upside-down
+#      subjects would otherwise reject valid faces.
+
+# SMPL-24 indices used for the 3D body-normal check.
+_SMPL_PELVIS = 0
+_SMPL_NECK = 12
+_SMPL_L_SHOULDER = 16
+_SMPL_R_SHOULDER = 17
+
+
+def _is_face_visible_2d(head_kp, eye_conf_thresh=0.1):
+    """Return True when 5 COCO-17 head keypoints suggest a forward-
+    facing face. Returns False on geometry/confidence patterns typical
+    of back views or hallucinated kpts. Used as the last-resort
+    fallback in is_face_visible().
+
+    Parameters
+    ----------
+    head_kp : (5, 2) or (5, 3) ndarray
+        COCO-17 indices 0..4 (nose, subj L_eye, subj R_eye,
+        subj L_ear, subj R_ear). The 3rd column (confidence) is
+        used by signals 1 and 4 when available.
+    eye_conf_thresh : float
+        Minimum confidence to consider a keypoint "available" for
+        signals that need conf. Defaults to 0.1.
+
+    Notes
+    -----
+    Deliberately omits the historical "nose above eyes" check — it
+    false-rejects upright valid faces in scenes with inverted /
+    upside-down subjects. The remaining 4 signals are scale- and
+    orientation-invariant.
+    """
+    if head_kp.shape[0] < 5:
+        return True  # not enough info to reject
+    has_conf = head_kp.shape[1] >= 3
+    if has_conf:
+        n_conf = float(head_kp[0, 2])
+        le_c, re_c = float(head_kp[1, 2]), float(head_kp[2, 2])
+        la_c, ra_c = float(head_kp[3, 2]), float(head_kp[4, 2])
+        eyes_min_conf = min(le_c, re_c)
+        ears_min_conf = min(la_c, ra_c)
+        eyes_avg_conf = 0.5 * (le_c + re_c)
+        ears_avg_conf = 0.5 * (la_c + ra_c)
+    else:
+        n_conf = 1.0
+        eyes_min_conf = ears_min_conf = 1.0
+        eyes_avg_conf = ears_avg_conf = 1.0
+
+    nose = head_kp[0, :2]
+    l_eye, r_eye = head_kp[1, :2], head_kp[2, :2]
+    l_ear, r_ear = head_kp[3, :2], head_kp[4, :2]
+
+    eye_dx = float(l_eye[0] - r_eye[0])
+    ear_dx = float(l_ear[0] - r_ear[0])
+    eye_dist = float(np.hypot(*(l_eye - r_eye)))
+    ear_dist = float(np.hypot(*(l_ear - r_ear)))
+
+    # Signal 1 — anatomical-side consistency. For a face that's actually
+    # looking AT the camera, subj_L_eye and subj_L_ear lie on the same
+    # side of subj_R_*; back views often invert this.
+    if (
+        ears_min_conf > eye_conf_thresh
+        and ear_dist > 5.0
+        and abs(eye_dx) > 1.0
+        and (eye_dx * ear_dx < 0)
+    ):
+        return False
+
+    # Signal 2 — eye distance vs ear distance. Real frontal faces have
+    # inter-eye ≈ 0.30..0.50 × inter-ear; hallucinated back views
+    # commonly inflate the ratio.
+    if (
+        ears_min_conf > eye_conf_thresh
+        and ear_dist > 5.0
+        and eye_dist > 0.0
+        and eye_dist > 0.65 * ear_dist
+    ):
+        return False
+
+    # Signal 3 — nose lies between the eyes in image x (with pad).
+    eye_min_x = min(l_eye[0], r_eye[0])
+    eye_max_x = max(l_eye[0], r_eye[0])
+    if eye_dist > 5.0:
+        pad = eye_dist * 0.35
+        if nose[0] < eye_min_x - pad or nose[0] > eye_max_x + pad:
+            return False
+
+    # Signal 4 — confidence asymmetry: ears confident but eyes are not.
+    # Top-down regressors often locate ears on back views (silhouette
+    # is locatable from behind) but eye conf softens.
+    if (
+        ears_avg_conf > eyes_avg_conf + 0.20
+        and ears_min_conf > 0.30
+        and n_conf < 0.30
+    ):
+        return False
+
+    return True
+
+
+def is_face_visible(
+    poses,
+    p_idx,
+    t,
+    forward_z_threshold=0.1,
+    face_conf_threshold=0.30,
+):
+    """Return True if the face at (person p_idx, frame t) appears to
+    be visible to camera, False otherwise. Tries three signals in
+    priority order; first conclusive one wins.
+
+    1. 3D body normal — `smpl_j3d[t]` shoulder × torso → forward vector.
+       Visible when normalised forward.z < forward_z_threshold (camera
+       looks down +Z, so negative-z = chest faces camera). Threshold
+       0.1 admits slight past-profile yaws but rejects clear back.
+    2. RTMW / ViTPose face mean confidence stashed in
+       `poses["_face_conf_2d"][p_idx][t]`. Visible when score >=
+       face_conf_threshold. Captured upstream by BMPRTMWPose BEFORE
+       FaRL overrides the face slots.
+    3. 2D head-kpt geometry via _is_face_visible_2d().
+
+    Returns True (permissive default) when all three signals are
+    unavailable — caller's `show_face` toggle is the master kill
+    switch when the user wants to force-hide all faces.
+    """
+    person = poses["persons"][p_idx]
+
+    # -- Signal 1: 3D body normal -----------------------------------------
+    smpl_list = person.get("smpl_j3d")
+    if smpl_list is not None and 0 <= t < len(smpl_list):
+        j = smpl_list[t]
+        if j is not None and getattr(j, "shape", (0,))[0] >= _SMPL_R_SHOULDER + 1:
+            shoulder = np.asarray(j[_SMPL_L_SHOULDER]) - np.asarray(j[_SMPL_R_SHOULDER])
+            torso = np.asarray(j[_SMPL_NECK]) - np.asarray(j[_SMPL_PELVIS])
+            forward = np.cross(shoulder[:3], torso[:3])
+            fmag = float(np.linalg.norm(forward))
+            if fmag > 1e-3:
+                return float(forward[2]) / fmag < forward_z_threshold
+
+    # -- Signal 2: stashed pre-FaRL 2D face mean conf ---------------------
+    face_conf_mat = poses.get("_face_conf_2d")
+    if (
+        face_conf_mat is not None
+        and 0 <= p_idx < len(face_conf_mat)
+        and 0 <= t < len(face_conf_mat[p_idx])
+    ):
+        score = face_conf_mat[p_idx][t]
+        if score is not None:
+            return float(score) >= face_conf_threshold
+
+    # -- Signal 3: 2D head-kpt geometry -----------------------------------
+    kp_list = person.get("keypoints")
+    if kp_list is not None and 0 <= t < len(kp_list):
+        kp = kp_list[t]
+        if kp is not None and getattr(kp, "shape", (0,))[0] >= 5:
+            return _is_face_visible_2d(kp[:5])
+
+    # Nothing to go on — permissive default.
+    return True

@@ -75,102 +75,10 @@ _DETECTOR_MAX_SIDE = 640
 # producing a flipped/upside-down aligned face and wrong 68-pt output.
 # The fix is the explicit subject→image-space eye swap below.
 
-def _is_face_front_facing(
-    head_kp: np.ndarray,
-    eye_conf_thresh: float = 0.1,
-) -> Tuple[bool, str]:
-    """Decide whether the head's 5 COCO keypoints describe a face that
-    is actually pointing toward camera, based on multi-signal geometry
-    + confidence symmetry.
-
-    Returns (ok, reason). When ok=False, the caller should NOT run FaRL
-    on this (slot, frame) — top-down kpt regressors hallucinate
-    plausible-but-wrong eye/nose positions for back views, and FaRL
-    on a back-of-head crop produces garbage 68-point output (the user-
-    reported failure mode).
-
-    The 5 inputs are subject-anatomy COCO-17 indices 0..4:
-      0 = nose, 1 = subj L_eye, 2 = subj R_eye, 3 = subj L_ear, 4 = subj R_ear
-    """
-    if head_kp.shape[0] < 5 or head_kp.shape[1] < 3:
-        return True, ""  # not enough info for the gate — let caller's existing checks decide
-
-    nose = head_kp[0, :2]
-    l_eye, r_eye = head_kp[1, :2], head_kp[2, :2]
-    l_ear, r_ear = head_kp[3, :2], head_kp[4, :2]
-    n_conf = float(head_kp[0, 2])
-    le_c, re_c = float(head_kp[1, 2]), float(head_kp[2, 2])
-    la_c, ra_c = float(head_kp[3, 2]), float(head_kp[4, 2])
-    eyes_min_conf = min(le_c, re_c)
-    ears_min_conf = min(la_c, ra_c)
-    eyes_avg_conf = 0.5 * (le_c + re_c)
-    ears_avg_conf = 0.5 * (la_c + ra_c)
-
-    eye_dx = float(l_eye[0] - r_eye[0])
-    ear_dx = float(l_ear[0] - r_ear[0])
-    eye_dist = float(np.hypot(*(l_eye - r_eye)))
-    ear_dist = float(np.hypot(*(l_ear - r_ear)))
-
-    # Signal 1 — anatomical-side consistency. For a face that's actually
-    # looking AT the camera, subj_L is on image-right of subj_R (camera-
-    # mirror convention) for BOTH eyes and ears. So eye_dx and ear_dx
-    # should have the same sign. Disagreement = the kpt regressor is
-    # hallucinating eyes on a back view (or extreme profile) where the
-    # anatomical labelling no longer agrees with image geometry.
-    if (
-        ears_min_conf > eye_conf_thresh
-        and ear_dist > 5.0
-        and abs(eye_dx) > 1.0
-        and (eye_dx * ear_dx < 0)
-    ):
-        return False, "eye_ear_side_mismatch"
-
-    # Signal 2 — eye distance vs ear distance ratio. Real frontal face
-    # ratio is ~0.30..0.50; a yawing profile lowers it; a back-view
-    # hallucination often inflates it (eyes "spread out" since there's
-    # no real anatomy constraining them).
-    if (
-        ears_min_conf > eye_conf_thresh
-        and ear_dist > 5.0
-        and eye_dist > 0.0
-        and eye_dist > 0.65 * ear_dist
-    ):
-        return False, "eye_dist_too_wide_for_ears"
-
-    # Signal 3 — nose lies horizontally between the two eyes (with pad).
-    eye_min_x = min(l_eye[0], r_eye[0])
-    eye_max_x = max(l_eye[0], r_eye[0])
-    if eye_dist > 5.0:
-        pad = eye_dist * 0.35
-        if nose[0] < eye_min_x - pad or nose[0] > eye_max_x + pad:
-            return False, "nose_outside_eye_bracket"
-
-        # Signal 4 — nose below eye midpoint (face is upright). Image y
-        # axis grows downward, so we want nose.y >= eye_mid.y - small_tol.
-        eye_mid_y = 0.5 * (float(l_eye[1]) + float(r_eye[1]))
-        if float(nose[1]) < eye_mid_y - 0.10 * eye_dist:
-            return False, "nose_above_eyes"
-
-    # Signal 5 — confidence asymmetry: ears confident but eyes are not.
-    # On a back-of-head view, top-down regressors tend to keep ear conf
-    # reasonable (ear silhouette is locatable from behind) while eye
-    # conf softens because there's no actual eye to find. Margin is
-    # generous to avoid false positives on motion-blurred frontals.
-    if (
-        ears_avg_conf > eyes_avg_conf + 0.20
-        and ears_min_conf > 0.30
-        and n_conf < 0.30
-    ):
-        return False, "ear_eye_conf_asymmetry"
-
-    return True, ""
-
-
 def coco_head_to_retinaface_5_points(
     head_kp: np.ndarray,            # (5, 2) or (5, 3) — COCO indices 0..4
     conf_thresh: float = 0.1,
-    front_facing_filter: bool = True,
-) -> Tuple[Optional[np.ndarray], str]:
+) -> Optional[np.ndarray]:
     """Synthesize FaRL face_aligner's 5-point RetinaFace input from
     COCO-17 head keypoints (nose / L_eye / R_eye / L_ear / R_ear).
 
@@ -192,21 +100,19 @@ def coco_head_to_retinaface_5_points(
         mouth-below-nose = 74.4 / 120 = 0.62 × eye_distance
         mouth-half-width = 36.0 / 120 = 0.30 × eye_distance
 
-    Returns
-    -------
-    pts5 : (5, 2) ndarray or None
-        The synthesised RetinaFace 5pt landmarks, or None if the head
-        keypoints don't pass the confidence + front-facing gates.
-    reason : str
-        Empty string on success; one of ``insufficient_kps``,
-        ``low_confidence``, ``face_too_small``, or one of the front-
-        facing-gate reasons (``eye_ear_side_mismatch``,
-        ``eye_dist_too_wide_for_ears``, ``nose_outside_eye_bracket``,
-        ``nose_above_eyes``, ``ear_eye_conf_asymmetry``) when None.
-        Used by the caller for logging which gate fired most often.
+    Returns ``None`` when there aren't enough confident head kps to
+    produce a stable alignment (caller should leave that
+    (person, frame)'s face slot empty).
+
+    Note: back-view / hallucinated-face filtering happens DOWNSTREAM
+    at render time via ``_pose_utils.is_face_visible()`` — that uses
+    3D body normal + RTMW face conf + 2D geometry, which is strictly
+    more discriminative than what we could do with just the 5 head
+    keypoints here. This function only enforces basic sanity (kpts
+    present + confidence + non-degenerate eye distance).
     """
     if head_kp.shape[0] < 5:
-        return None, "insufficient_kps"
+        return None
     if head_kp.shape[1] >= 3:
         conf = head_kp[:, 2]
     else:
@@ -214,18 +120,7 @@ def coco_head_to_retinaface_5_points(
 
     # Need nose + both eyes to estimate face geometry reliably.
     if conf[0] < conf_thresh or conf[1] < conf_thresh or conf[2] < conf_thresh:
-        return None, "low_confidence"
-
-    # Multi-signal back-view / hallucinated-face filter. Top-down kpt
-    # regressors (BMP / RTMW / ViTPose) output plausible-but-wrong eye
-    # / nose positions when the person turns away from camera; FaRL on
-    # the resulting back-of-head crop produces garbage 68-pt landmarks.
-    if front_facing_filter:
-        ok, reason = _is_face_front_facing(
-            head_kp, eye_conf_thresh=conf_thresh,
-        )
-        if not ok:
-            return None, reason
+        return None
 
     nose       = head_kp[0, :2].astype(np.float32)
     subj_l_eye = head_kp[1, :2].astype(np.float32)  # COCO: subject's left eye
@@ -233,7 +128,7 @@ def coco_head_to_retinaface_5_points(
 
     eye_dist = float(np.linalg.norm(subj_r_eye - subj_l_eye))
     if eye_dist < 5.0:
-        return None, "face_too_small"  # Face too small / eyes degenerate
+        return None  # Face too small / eyes degenerate
 
     eye_mid = (subj_l_eye + subj_r_eye) * 0.5
     down = nose - eye_mid
@@ -263,7 +158,7 @@ def coco_head_to_retinaface_5_points(
     return np.stack(
         [img_l_eye, img_r_eye, nose, img_l_mouth, img_r_mouth],
         axis=0,
-    ).astype(np.float32), ""
+    ).astype(np.float32)
 
 
 def run_farl_face_per_person(
@@ -276,7 +171,6 @@ def run_farl_face_per_person(
     img_w: int,
     head_conf_thresh: float = 0.1,
     frame_batch_size: int = 32,
-    front_facing_filter: bool = True,
     pbar=None,
 ) -> Tuple[List[List[Optional[np.ndarray]]], float]:
     """Run FaRL face_aligner per-tracked-person using head keypoints
@@ -312,37 +206,17 @@ def run_farl_face_per_person(
     # Group requests by frame so we can run FaRL in chunked frames.
     # Each entry: (frame_local, track_idx, retinaface_5pt)
     per_frame: Dict[int, List[Tuple[int, np.ndarray]]] = {}
-    reject_counts: Dict[str, int] = {}
-    accepted = 0
     for p_idx in range(n_tracks):
         for t in range(B):
             head = head_kp_per_track[p_idx][t]
             if head is None:
                 continue
-            pts5, reason = coco_head_to_retinaface_5_points(
-                head,
-                conf_thresh=head_conf_thresh,
-                front_facing_filter=front_facing_filter,
+            pts5 = coco_head_to_retinaface_5_points(
+                head, conf_thresh=head_conf_thresh,
             )
             if pts5 is None:
-                reject_counts[reason] = reject_counts.get(reason, 0) + 1
                 continue
             per_frame.setdefault(t, []).append((p_idx, pts5))
-            accepted += 1
-
-    total_rejected = sum(reject_counts.values())
-    if total_rejected > 0:
-        # Sort reasons by count DESC for at-a-glance read
-        breakdown = ", ".join(
-            f"{r}={c}"
-            for r, c in sorted(
-                reject_counts.items(), key=lambda kv: -kv[1]
-            )
-        )
-        _logger.info(
-            "FaRL pre-gate: %d (slot, frame) accepted, %d rejected (%s).",
-            accepted, total_rejected, breakdown,
-        )
 
     if not per_frame:
         return face_kp_68_timeline, 0.0
