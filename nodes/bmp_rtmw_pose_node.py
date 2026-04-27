@@ -921,6 +921,29 @@ class BMPRTMWPoseNode:
                         ),
                     },
                 ),
+                "face_front_only": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Skip FaRL face inference for (slot, frame) "
+                            "pairs whose head 5pt geometry suggests a "
+                            "back / extreme profile view. Top-down kpt "
+                            "regressors (BMP / RTMW / ViTPose) "
+                            "hallucinate plausible-but-wrong eye + "
+                            "nose positions when the person turns "
+                            "away from camera — feeding those to FaRL "
+                            "produces garbage 68-pt landmarks. This "
+                            "gate uses ear↔eye anatomical consistency, "
+                            "eye/ear distance ratios, nose-relative-to-"
+                            "eyes geometry, and ear vs eye confidence "
+                            "asymmetry to reject those cases. Disable "
+                            "if your content has unusual face geometry "
+                            "(cartoons, masks, etc.) and you'd rather "
+                            "let FaRL try regardless."
+                        ),
+                    },
+                ),
                 "debug_overlay": (
                     "BOOLEAN",
                     {
@@ -951,7 +974,7 @@ class BMPRTMWPoseNode:
             score_threshold, fps, pose_3d_fps,
             ghost_oks_thresh, ghost_max_burst_frames,
             recovery_max_gap_frames, recovery_oks_thresh,
-            debug_overlay,
+            face_front_only, debug_overlay,
             bmp_pose=None, farl_face=None, wilor=None, vitpose=None):
         from mmpose.apis import inference_topdown
 
@@ -1331,6 +1354,7 @@ class BMPRTMWPoseNode:
                 img_h=H, img_w=W,
                 head_conf_thresh=float(score_threshold),
                 frame_batch_size=32,
+                front_facing_filter=bool(face_front_only),
                 pbar=None,
             )
 
