@@ -911,6 +911,12 @@ class BMPRTMWPoseNode:
         # left alone — they're more likely two genuinely close people.
         ghosts_suppressed_frames = 0
         ghosts_suppressed_bursts = 0
+        ghosts_swaps_applied = 0
+        # Burst metadata collected during the suppression pass and
+        # consumed by the swap-detection pass below: each entry is
+        # ``(slot_a, slot_b, r_start, r_end)`` with slot_a < slot_b
+        # (canonical ordering matches the pair-enumeration loop).
+        suppressed_bursts: List[Tuple[int, int, int, int]] = []
         if ghost_max_burst_frames > 0 and n_persons >= 2:
             # Per-frame body bboxes (re-derived from kp133 since we may
             # have overridden body via BMP — bbox should track the
@@ -1003,6 +1009,7 @@ class BMPRTMWPoseNode:
                                 persons_133[ghost_slot][t] = None
                                 ghosts_suppressed_frames += 1
                         ghosts_suppressed_bursts += 1
+                        suppressed_bursts.append((a, b, r_start, r_end))
                         _logger.info(
                             "Ghost suppression: pair (slot %d, slot %d) "
                             "frames %d..%d (%d frames) — kept slot %d, "
@@ -1010,6 +1017,131 @@ class BMPRTMWPoseNode:
                             a, b, r_start, r_end, burst_len,
                             keep_slot, ghost_slot, qa, qb,
                         )
+
+            # ---- Phase 3.6: post-burst slot-swap correction ---------------
+            # Suppressing a ghost only blanks the duplicate keypoints
+            # WITHIN the burst. It does nothing about BMP's IoU tracker
+            # potentially swapping the real person's slot when the
+            # mask-fragments collapse back to one mask after the burst.
+            #
+            # Detect that case here: for each burst (a, b) at frames
+            # [r_start, r_end], compare each slot's pose immediately
+            # before vs immediately after the burst. If "post-burst
+            # slot a" matches "pre-burst slot b" better than itself,
+            # the tracker swapped — fix by swapping persons_133[a]
+            # with persons_133[b] from r_end+1 to end of video.
+            #
+            # Process bursts in chronological r_end order so cascading
+            # swaps see the corrected state from earlier bursts.
+            #
+            # Three cases are handled:
+            #   (1) Both slots have pre AND post poses → compare
+            #       no-swap vs swap OKS sums, swap if margin > 0.2
+            #   (2) Slot a active before, slot b active after, the
+            #       opposite slots empty around the burst → classic
+            #       SAM-split pattern. Swap if cross-OKS > 0.5.
+            #   (3) Mirror of (2): slot b active before, slot a after.
+            for (sa, sb, sr_start, sr_end) in sorted(
+                suppressed_bursts, key=lambda x: (x[3], x[2]),
+            ):
+                # Find latest non-None pose in slot s before burst start.
+                def _pose_before(slot: int, t_burst_start: int):
+                    for tt in range(t_burst_start - 1, -1, -1):
+                        kp = persons_133[slot][tt]
+                        if kp is not None:
+                            return kp, tt
+                    return None, -1
+
+                # Find earliest non-None pose in slot s after burst end.
+                def _pose_after(slot: int, t_burst_end: int):
+                    for tt in range(t_burst_end + 1, B):
+                        kp = persons_133[slot][tt]
+                        if kp is not None:
+                            return kp, tt
+                    return None, -1
+
+                pre_a,  pre_a_t  = _pose_before(sa, sr_start)
+                pre_b,  pre_b_t  = _pose_before(sb, sr_start)
+                post_a, post_a_t = _pose_after(sa,  sr_end)
+                post_b, post_b_t = _pose_after(sb,  sr_end)
+
+                do_swap = False
+                swap_reason = ""
+
+                if (pre_a is not None and pre_b is not None
+                        and post_a is not None and post_b is not None):
+                    # Case 1: full data — pick the configuration with
+                    # higher cumulative OKS by a clear margin.
+                    bb_pre_a  = _body_bbox_from_kp133(pre_a,  score_threshold)
+                    bb_pre_b  = _body_bbox_from_kp133(pre_b,  score_threshold)
+                    bb_post_a = _body_bbox_from_kp133(post_a, score_threshold)
+                    bb_post_b = _body_bbox_from_kp133(post_b, score_threshold)
+
+                    oks_no = (
+                        _body_oks(pre_a, post_a, bb_pre_a, bb_post_a, score_threshold)
+                        + _body_oks(pre_b, post_b, bb_pre_b, bb_post_b, score_threshold)
+                    )
+                    oks_yes = (
+                        _body_oks(pre_a, post_b, bb_pre_a, bb_post_b, score_threshold)
+                        + _body_oks(pre_b, post_a, bb_pre_b, bb_post_a, score_threshold)
+                    )
+                    # Margin of 0.2 to avoid hair-trigger swaps when
+                    # the two configurations are nearly tied (which
+                    # happens when both slots track genuinely-similar
+                    # poses).
+                    if oks_yes > oks_no + 0.2:
+                        do_swap = True
+                        swap_reason = (
+                            f"OKS swapped={oks_yes:.3f} vs no-swap={oks_no:.3f}"
+                        )
+
+                elif (pre_a is not None and post_b is not None
+                      and pre_b is None and post_a is None):
+                    # Case 2: classic mask-split swap — slot a was the
+                    # active slot before burst, the new track-id (slot
+                    # b) carries the person after burst.
+                    bb_pre_a  = _body_bbox_from_kp133(pre_a,  score_threshold)
+                    bb_post_b = _body_bbox_from_kp133(post_b, score_threshold)
+                    oks_x = _body_oks(
+                        pre_a, post_b, bb_pre_a, bb_post_b, score_threshold,
+                    )
+                    if oks_x > 0.5:
+                        do_swap = True
+                        swap_reason = (
+                            f"slot{sa}→{sb} transfer, OKS(pre_a, post_b)"
+                            f"={oks_x:.3f}"
+                        )
+
+                elif (pre_b is not None and post_a is not None
+                      and pre_a is None and post_b is None):
+                    # Case 3: mirror of case 2.
+                    bb_pre_b  = _body_bbox_from_kp133(pre_b,  score_threshold)
+                    bb_post_a = _body_bbox_from_kp133(post_a, score_threshold)
+                    oks_x = _body_oks(
+                        pre_b, post_a, bb_pre_b, bb_post_a, score_threshold,
+                    )
+                    if oks_x > 0.5:
+                        do_swap = True
+                        swap_reason = (
+                            f"slot{sb}→{sa} transfer, OKS(pre_b, post_a)"
+                            f"={oks_x:.3f}"
+                        )
+
+                if do_swap:
+                    # In-place swap of the two slot timelines from
+                    # ``sr_end + 1`` to the end of the video. Subsequent
+                    # bursts processed later will see the corrected
+                    # state — that's why we sort by r_end.
+                    for tt in range(sr_end + 1, B):
+                        persons_133[sa][tt], persons_133[sb][tt] = (
+                            persons_133[sb][tt], persons_133[sa][tt]
+                        )
+                    ghosts_swaps_applied += 1
+                    _logger.info(
+                        "Slot swap: from frame %d, slot %d ↔ slot %d "
+                        "(post-burst remap; %s)",
+                        sr_end + 1, sa, sb, swap_reason,
+                    )
 
         # ---- Phase 4: pack POSES dict -------------------------------------
         poses_persons = []
@@ -1048,13 +1180,14 @@ class BMPRTMWPoseNode:
             "BMPRTMWPose: %d frames, %d tracks | RTMW %.2fs | "
             "BMP body overrides: %d | FaRL face %.2fs (%d overrides) | "
             "WiLoR %.2fs (%d hand overrides) | "
-            "ghost suppression: %d bursts (%d frames nulled) | "
-            "total %.2fs",
+            "ghost suppression: %d bursts (%d frames nulled, "
+            "%d slot swaps applied) | total %.2fs",
             B, n_persons, rtmw_time,
             body_override_count,
             farl_time, farl_override_count,
             wilor_time, wilor_overrides_count,
             ghosts_suppressed_bursts, ghosts_suppressed_frames,
+            ghosts_swaps_applied,
             elapsed,
         )
 
