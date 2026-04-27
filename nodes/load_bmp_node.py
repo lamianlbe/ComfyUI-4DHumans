@@ -73,8 +73,9 @@ _logger = logging.getLogger(__name__)
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BMP_CONFIGS_ROOT = os.path.join(REPO_ROOT, "bmp_configs")
 
-# Variant → relative path inside bmp_configs/. Mirrors pmpose.api's
-# DEFAULT_CONFIGS table but with our vendored prefix.
+# Variant → relative path under {mmpose,bmp_configs}/configs/. Mirrors
+# pmpose.api's DEFAULT_CONFIGS table. PMPose lives under
+# ProbMaskPose/, MaskPose lives under MaskPose/.
 _PMPOSE_CONFIG_RELPATH = {
     # PMPose (full w/ presence + visibility heads, v1.0.0)
     "PMPose-s":       "ProbMaskPose/PMPose-s-1.0.0.py",
@@ -87,6 +88,75 @@ _PMPOSE_CONFIG_RELPATH = {
     "MaskPose-l":     "MaskPose/MaskPose-l-1.1.0.py",
     "MaskPose-h":     "MaskPose/MaskPose-h-1.1.0.py",
 }
+
+
+def _resolve_pmpose_config(rel_path: str) -> str:
+    """Find a PMPose / MaskPose mmpose config file. Prefer the installed
+    mmpose package's bundled configs (so a wheel-only install works on
+    any host), fall back to vendored paths if the installed mmpose
+    lacks them.
+    """
+    try:
+        import mmpose
+        installed_root = os.path.dirname(os.path.abspath(mmpose.__file__))
+        candidate = os.path.join(installed_root, "configs", rel_path)
+        if os.path.isfile(candidate):
+            return candidate
+    except ImportError:
+        pass
+    return os.path.join(BMP_CONFIGS_ROOT, rel_path)
+
+
+def _resolve_bmp_yaml(rel_path: str) -> str:
+    """Find a bboxmaskpose config YAML. Prefer the installed
+    bboxmaskpose package's bundled configs, fall back to vendored.
+
+    rel_path examples:
+      "configs/bmp_v2.yaml"
+      "sam2/configs/sam-pose2seg/sam-pose2seg_hiera_b+.yaml"
+    """
+    try:
+        import bboxmaskpose
+        installed_root = os.path.dirname(os.path.abspath(bboxmaskpose.__file__))
+        candidate = os.path.join(installed_root, rel_path)
+        if os.path.isfile(candidate):
+            return candidate
+    except ImportError:
+        pass
+    # Vendored layout was bmp_configs/{bmp,sam2}/* — adapt rel_path to
+    # match: "configs/bmp_v2.yaml" → "bmp/bmp_v2.yaml", etc.
+    if rel_path.startswith("configs/"):
+        return os.path.join(
+            BMP_CONFIGS_ROOT, "bmp", rel_path[len("configs/"):],
+        )
+    if rel_path.startswith("sam2/configs/"):
+        return os.path.join(
+            BMP_CONFIGS_ROOT, "sam2", rel_path[len("sam2/configs/"):],
+        )
+    return os.path.join(BMP_CONFIGS_ROOT, rel_path)
+
+
+def _resolve_mmdet_config(rel_path: str) -> str:
+    """Find an mmdet config file. Prefer installed mmdet, fall back to
+    bmp_configs/mmdet/."""
+    try:
+        import mmdet
+        installed_root = os.path.dirname(os.path.abspath(mmdet.__file__))
+        candidate = os.path.join(installed_root, ".mim", "configs", rel_path)
+        if os.path.isfile(candidate):
+            return candidate
+        # Some mmdet wheels also ship configs alongside the package
+        # (not in .mim/), try that too.
+        candidate2 = os.path.join(installed_root, "configs", rel_path)
+        if os.path.isfile(candidate2):
+            return candidate2
+    except ImportError:
+        pass
+    # The vendored detector tree lives under bmp_configs/mmdet/...
+    # without a "mmdet/" prefix (we cherry-picked just rtmdet/ + base).
+    if rel_path.startswith("mmdet/"):
+        return os.path.join(BMP_CONFIGS_ROOT, rel_path)
+    return os.path.join(BMP_CONFIGS_ROOT, "mmdet", rel_path)
 
 
 # BMP config aliases shipped in bboxmaskpose/configs/. Each trades off
@@ -335,15 +405,15 @@ class LoadBMPNode:
                 f"Unknown pose variant '{pose_variant}'. "
                 f"Known: {list(_PMPOSE_CONFIG_RELPATH)}"
             )
-        pose_config_path = os.path.join(BMP_CONFIGS_ROOT, variant_relpath)
+        pose_config_path = _resolve_pmpose_config(variant_relpath)
         if not os.path.isfile(pose_config_path):
             raise FileNotFoundError(
-                f"Vendored PMPose config missing: {pose_config_path}\n"
-                f"This file should ship with the ComfyUI-4DHumans repo "
-                f"under bmp_configs/. Reinstall/pull the repo, or copy "
-                f"from BBoxMaskPose/mmpose/configs/ manually."
+                f"PMPose config not found:\n  {pose_config_path}\n\n"
+                f"Tried installed mmpose package + vendored fallback. "
+                f"Make sure mmpose (or BMP's mmpose fork) is installed "
+                f"with config data files included."
             )
-        _logger.info("  PMPose config   : vendored  %s", pose_config_path)
+        _logger.info("  PMPose config   : %s", pose_config_path)
 
         _original_pmpose_url = _PMPOSE_URLS.get(pose_variant)
         _PMPOSE_URLS[pose_variant] = pose_ckpt
@@ -364,52 +434,49 @@ class LoadBMPNode:
         # Step 2: Patch BMP's YAML config with our resolved detector +
         # SAM2 paths, then build BBoxMaskPose off the patched file.
         #
-        # We use the VENDORED copy under bmp_configs/bmp/ — NOT the
-        # pip-installed one at site-packages/bboxmaskpose/configs/ —
-        # because some pip wheels of bboxmaskpose don't ship the yaml
-        # data files (same bug that hit PMPose above). Vendoring makes
-        # this robust regardless of whether the pip install is clean.
+        # Resolution order for each config: installed package first,
+        # vendored bmp_configs/ as fallback. The fallback is kept around
+        # for cases where the installed wheel was built without data
+        # files — re-installing with our patched MANIFEST.in makes the
+        # fallback unnecessary, but it doesn't hurt.
         # ----------------------------------------------------------------
-        src_yaml = os.path.join(BMP_CONFIGS_ROOT, "bmp", f"{config}.yaml")
+        src_yaml = _resolve_bmp_yaml(f"configs/{config}.yaml")
         if not os.path.isfile(src_yaml):
             raise FileNotFoundError(
-                f"Vendored BMP config missing: {src_yaml}\n"
-                f"Should ship with the repo under bmp_configs/bmp/. "
-                f"Reinstall/pull the repo, or copy from "
-                f"BBoxMaskPose/bboxmaskpose/configs/ manually."
+                f"BMP config not found:\n  {src_yaml}\n\n"
+                f"Tried installed bboxmaskpose package + vendored "
+                f"fallback. Make sure bboxmaskpose is installed with "
+                f"config data files (re-build with the MANIFEST.in "
+                f"patch if needed)."
             )
 
-        # Resolve SAM2 config (vendored) to an absolute path so
-        # BBoxMaskPose's internal os.path.join-under-site-packages
-        # lookup gets bypassed.
         sam2_config_rel = _BMP_TO_SAM2_CONFIG.get(config)
         if sam2_config_rel is None:
             raise ValueError(
                 f"No SAM2 config mapping for BMP config '{config}'. "
                 f"Known: {list(_BMP_TO_SAM2_CONFIG)}"
             )
-        sam2_config_abs = os.path.join(
-            BMP_CONFIGS_ROOT, "sam2", sam2_config_rel,
-        )
+        sam2_config_abs = _resolve_bmp_yaml(f"sam2/configs/{sam2_config_rel}")
         if not os.path.isfile(sam2_config_abs):
             raise FileNotFoundError(
-                f"Vendored SAM2 config missing: {sam2_config_abs}\n"
-                f"Should ship with the repo under bmp_configs/sam2/."
+                f"SAM2 config not found:\n  {sam2_config_abs}\n\n"
+                f"Tried installed bboxmaskpose package + vendored fallback."
             )
-        _logger.info("  SAM2 config     : vendored  %s", sam2_config_abs)
+        _logger.info("  SAM2 config     : %s", sam2_config_abs)
 
-        # Resolve RTMDet detector config (also vendored). Its `_base_`
-        # chain (rtmdet_l_8xb32-300e_coco.py, rtmdet_tta.py, plus 3
-        # _base_/ entries) is shipped alongside — mmengine resolves
-        # `_base_` relative to the config file's dir, so as long as
-        # we preserve the layout the chain walks our vendor tree.
-        det_config_abs = os.path.join(BMP_CONFIGS_ROOT, _BMP_DET_CONFIG)
+        # Resolve RTMDet detector config. Its ``_base_`` chain
+        # (rtmdet_l_8xb32-300e_coco.py, rtmdet_tta.py, plus 3 _base_/
+        # entries) is shipped alongside — mmengine resolves _base_
+        # relative to the config file's dir, so as long as the layout
+        # is preserved the chain walks naturally.
+        det_config_abs = _resolve_mmdet_config(_BMP_DET_CONFIG)
         if not os.path.isfile(det_config_abs):
             raise FileNotFoundError(
-                f"Vendored RTMDet config missing: {det_config_abs}\n"
-                f"Should ship with the repo under bmp_configs/mmdet/."
+                f"RTMDet config not found:\n  {det_config_abs}\n\n"
+                f"Tried installed mmdet (.mim/configs and configs paths) "
+                f"+ vendored bmp_configs/mmdet/ fallback."
             )
-        _logger.info("  RTMDet config   : vendored  %s", det_config_abs)
+        _logger.info("  RTMDet config   : %s", det_config_abs)
 
         patched_yaml = _write_patched_config(
             src_yaml_path=src_yaml,

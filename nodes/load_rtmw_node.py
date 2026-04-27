@@ -57,24 +57,60 @@ from folder_paths import models_dir
 _logger = logging.getLogger(__name__)
 
 
-# Hardcoded layout: weights under models/rtmw/, configs vendored in repo.
+# Weights live under ComfyUI/models/rtmw/. Config files are resolved
+# from the *installed* mmpose package (its data files include all the
+# wholebody_2d_keypoint configs we need). Falls back to our vendored
+# bmp_configs/mmpose_rtmw/ if the installed mmpose doesn't ship the
+# config — only happens with old (pre-1.3) mmpose, since BMP's own
+# fork of mmpose is based on 1.3.1 and ships RTMW configs in-tree.
 RTMW_MODELS_DIR = os.path.join(models_dir, "rtmw")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RTMW_CONFIGS_ROOT = os.path.join(
+RTMW_VENDORED_CONFIGS_ROOT = os.path.join(
     REPO_ROOT, "bmp_configs", "mmpose_rtmw",
 )
 
-# Variant → (config relative path, expected weight filename, HF URL)
+
+def _resolve_rtmw_config(rel_path: str) -> str:
+    """Find a RTMW config file. Prefer the installed mmpose package's
+    bundled configs (so a wheel-only install works on any host without
+    needing this repo's vendored copy), fall back to vendored paths if
+    the installed mmpose lacks them.
+
+    ``rel_path`` is the path relative to ``mmpose/configs/``, e.g.
+    ``"wholebody_2d_keypoint/rtmpose/cocktail14/rtmw-x_*.py"``.
+    """
+    # Try installed package first — works when BMP's wheel was built
+    # with our MANIFEST.in (recursive-include of mmpose/configs/**).
+    try:
+        import mmpose
+        installed_root = os.path.dirname(os.path.abspath(mmpose.__file__))
+        candidate = os.path.join(
+            installed_root, "configs", rel_path,
+        )
+        if os.path.isfile(candidate):
+            return candidate
+    except ImportError:
+        pass
+
+    # Fallback: vendored copy (kept around for the case where the
+    # mmpose install lacks data files, e.g. broken pip wheels).
+    fallback = os.path.join(
+        RTMW_VENDORED_CONFIGS_ROOT, "configs", rel_path,
+    )
+    return fallback
+
+# Variant → (config relative path under mmpose/configs/, expected
+# weight filename).
 _VARIANTS = {
     "rtmw-x_384x288": (
-        "configs/wholebody_2d_keypoint/rtmpose/cocktail14/"
+        "wholebody_2d_keypoint/rtmpose/cocktail14/"
         "rtmw-x_8xb320-270e_cocktail14-384x288.py",
         "rtmw-x_simcc-cocktail14_pt-ucoco_270e-384x288-f840f204_20231122.pth",
         # ↑ Whole-body AP 70.2 (cocktail14 v1.0). Recommended default.
     ),
     "rtmw-x_256x192": (
-        "configs/wholebody_2d_keypoint/rtmpose/cocktail14/"
+        "wholebody_2d_keypoint/rtmpose/cocktail14/"
         "rtmw-x_8xb704-270e_cocktail14-256x192.py",
         "rtmw-x_simcc-cocktail14_pt-ucoco_270e-256x192-13a2546d_20231208.pth",
         # ↑ Whole-body AP 67.2, ~2× faster. For real-time use.
@@ -125,14 +161,18 @@ class LoadRTMWNode:
 
     def load(self, device, variant):
         cfg_rel, weight_filename, *_ = _VARIANTS[variant]
-        cfg_path = os.path.join(RTMW_CONFIGS_ROOT, cfg_rel)
+        cfg_path = _resolve_rtmw_config(cfg_rel)
         weight_path = os.path.join(RTMW_MODELS_DIR, weight_filename)
 
         if not os.path.isfile(cfg_path):
             raise FileNotFoundError(
-                f"Vendored RTMW config missing: {cfg_path}\n"
-                f"Should ship with the repo under bmp_configs/mmpose_rtmw/. "
-                f"Reinstall/pull the repo."
+                f"RTMW config not found:\n  {cfg_path}\n\n"
+                f"Tried installed mmpose package + vendored fallback. "
+                f"Make sure mmpose is installed (pip install bboxmaskpose "
+                f"if you went the BMP-fork route, or upstream mmpose). "
+                f"If the installed mmpose's wheel doesn't ship configs, "
+                f"the vendored copy under bmp_configs/mmpose_rtmw/ should "
+                f"have been picked up — re-pull the repo."
             )
         if not os.path.isfile(weight_path):
             raise FileNotFoundError(
@@ -172,15 +212,27 @@ class LoadRTMWNode:
             variant, device_str, cfg_path, weight_path,
         )
 
-        # mmpose resolves `metainfo=dict(from_file='configs/_base_/...')` in
-        # the test pipeline relative to CWD. Our vendored config tree
-        # mirrors mmpose's relative paths under bmp_configs/mmpose_rtmw/,
-        # so we briefly cd there during init_model so those lookups
-        # land in our vendored copies. After init the model carries its
-        # config in-memory and CWD doesn't matter.
+        # mmpose resolves ``metainfo=dict(from_file='configs/_base_/...')``
+        # in the test pipeline relative to CWD. Walk up from the chosen
+        # config until we hit the parent of the ``configs/`` directory —
+        # that's the cwd mmpose's relative lookups need. Works whether
+        # cfg_path resolved from the installed mmpose package or our
+        # vendored fallback.
+        cfg_dir = os.path.dirname(os.path.abspath(cfg_path))
+        chdir_target = cfg_dir
+        while chdir_target and os.path.basename(chdir_target) != "configs":
+            parent = os.path.dirname(chdir_target)
+            if parent == chdir_target:
+                chdir_target = None  # walked past root, give up
+                break
+            chdir_target = parent
+        if chdir_target:
+            chdir_target = os.path.dirname(chdir_target)  # parent of configs/
+
         original_cwd = os.getcwd()
         try:
-            os.chdir(RTMW_CONFIGS_ROOT)
+            if chdir_target:
+                os.chdir(chdir_target)
             model = init_model(cfg_path, weight_path, device=device_str)
         finally:
             os.chdir(original_cwd)
