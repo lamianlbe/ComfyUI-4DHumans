@@ -351,3 +351,261 @@ def run_nlf_inference(
         pbar.update(1)
 
     return total_time
+
+
+# =============================================================================
+# Bundle-contract entry point — used by Pose3DUpgradeNLFNode
+# =============================================================================
+
+def run_nlf_video(
+    images_np_u8: np.ndarray,           # (B, H, W, 3) uint8 RGB
+    mask_bboxes_per_frame: list,        # [ [(x1,y1,x2,y2), ...] for each frame ]
+    person_indices_per_frame: list,     # [ [p_idx, ...] for each frame ]  same alignment as mask_bboxes
+    sampled_frames: list,               # frame indices to actually run NLF on (others get None and get interpolated upstream)
+    nlf_dict: dict,                     # POSE3D dict from LoadNLFNode
+    n_persons: int,
+    img_h: int,
+    img_w: int,
+    batch_size: int = 4,
+    pbar=None,
+):
+    """Run NLF on the given video and scatter results into per-person POSES timelines.
+
+    This is the bundle-contract counterpart to run_fastsam3db_video, used
+    by Pose3DUpgradeNLFNode. NLF is self-detecting (full-frame; doesn't
+    consume our mask bboxes as input), so we use the mask bboxes only
+    for IoU-matching detections back to BMP-tracked slots.
+
+    Returns
+    -------
+    result : dict with keys
+        persons : list of length n_persons, each
+                  {"body_joints2d": [None|(25,2)] * B,
+                   "body_joints":   [None|(25,3)] * B,
+                   "smpl_j3d":      [None|(24,3)] * B,
+                   }
+        cam_int  : [None|(3,3)] * B
+        nlf_time_s : float
+    """
+    model       = nlf_dict["model"]
+    torch_dtype = nlf_dict.get("torch_dtype", torch.float32)
+
+    B = images_np_u8.shape[0]
+
+    # Per-person timelines.  Same field layout as run_fastsam3db_video so
+    # downstream merging / NPZ saving treats both backends identically.
+    persons = []
+    for _ in range(n_persons):
+        persons.append({
+            "body_joints2d": [None] * B,
+            "body_joints":   [None] * B,
+            "smpl_j3d":      [None] * B,
+        })
+    cam_int_per_frame = [None] * B
+
+    # Resolve device from the loaded model.  LoadNLFNode moves the model
+    # to cuda when available; fall back to cpu otherwise.
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    # Filter sampled_frames down to ones that actually have at least one
+    # mask bbox — NLF will still detect on full frames with no mask, but
+    # the result has nowhere to land and the time is wasted.
+    valid_frames = [
+        t for t in sampled_frames
+        if 0 <= t < B and len(mask_bboxes_per_frame[t]) > 0
+    ]
+
+    if len(valid_frames) == 0:
+        _logger.warning(
+            "run_nlf_video: 0 frames with mask bboxes — NLF skipped."
+        )
+        if pbar is not None:
+            for _ in range(B):
+                pbar.update(1)
+        return {
+            "persons":    persons,
+            "cam_int":    cam_int_per_frame,
+            "nlf_time_s": 0.0,
+        }
+
+    # Build BCHW float [0, 1] tensor once; index per-batch slice when
+    # entering the loop.
+    images_f32_bchw = (
+        torch.from_numpy(images_np_u8).float().div_(255.0)
+              .permute(0, 3, 1, 2).contiguous()
+    )
+
+    K_default = _nlf_default_intrinsic(img_h, img_w)
+    nlf_time_s = 0.0
+    logged_keys = False
+    matched_total = 0
+
+    # Force JIT profiling executor ON — see kijai's wrapper / module
+    # docstring for the rationale (avoids the
+    # 'vector::_M_range_check' crash on detect_smpl_batched).
+    jit_prev = torch._C._jit_set_profiling_executor(True)
+    try:
+        for chunk_start in range(0, len(valid_frames), batch_size):
+            chunk_frames = valid_frames[chunk_start:chunk_start + batch_size]
+            frame_batch = images_f32_bchw[chunk_frames].to(device)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+            with torch.inference_mode():
+                # Autocast lets bf16/fp16 NLF runs share the input tensor
+                # without an explicit per-call cast; fp32 stays the no-op
+                # path (autocast(enabled=False) when dtype==float32).
+                if torch_dtype == torch.float32 or not torch.cuda.is_available():
+                    pred = model.detect_smpl_batched(frame_batch)
+                else:
+                    with torch.autocast(
+                        device_type="cuda", dtype=torch_dtype,
+                    ):
+                        pred = model.detect_smpl_batched(frame_batch)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            nlf_time_s += time.perf_counter() - t0
+
+            if not logged_keys:
+                info_parts = []
+                for k, v in pred.items():
+                    if isinstance(v, (list, tuple)) and len(v) > 0 and \
+                            isinstance(v[0], torch.Tensor):
+                        info_parts.append(
+                            f"{k}=list[len={len(v)}, item0={tuple(v[0].shape)}]"
+                        )
+                    elif isinstance(v, torch.Tensor):
+                        info_parts.append(f"{k}=Tensor{tuple(v.shape)}")
+                    else:
+                        info_parts.append(f"{k}={type(v).__name__}")
+                _logger.info("NLF pred keys: %s", "; ".join(info_parts))
+                logged_keys = True
+
+            boxes_list = pred.get("boxes", None)
+            j3d_list = pred.get("joints3d_nonparam", None)
+            if j3d_list is None:
+                raise RuntimeError(
+                    "NLF output has no 'joints3d_nonparam' key. "
+                    f"Got keys: {list(pred.keys())}"
+                )
+
+            for chunk_i, t in enumerate(chunk_frames):
+                # Per-frame ragged outputs.
+                boxes_t = (
+                    boxes_list[chunk_i].detach().float().cpu().numpy()
+                    if boxes_list is not None
+                    and boxes_list[chunk_i] is not None
+                    else None
+                )
+                j3d_t = j3d_list[chunk_i].detach().float().cpu().numpy()
+                # NLF reports in millimetres; downstream POSES code
+                # (NLF renderer, transform helpers) works in metres.
+                # See module docstring for context.
+                j3d_t = j3d_t / 1000.0
+
+                # Camera intrinsic: 55° FOV constant per frame; scale=1,
+                # offset=0.  This matches what
+                # _transform_j3d_to_nlf_camera in
+                # sapiens_prompthmr_to_nlf_node assumes.
+                cam_int_per_frame[t] = K_default.copy()
+
+                if j3d_t.shape[0] == 0:
+                    # No detections this frame — leave timeline entries
+                    # as None; Phase 3 linear interp will fill.
+                    continue
+
+                # Build det_bboxes (xyxy) for IoU matching — prefer NLF's
+                # own boxes, else project SMPL-24 3D via the default
+                # intrinsic to synthesise.
+                if boxes_t is not None and boxes_t.shape[0] == j3d_t.shape[0]:
+                    det_bboxes = [
+                        (float(bb[0]), float(bb[1]),
+                         float(bb[2]), float(bb[3]))
+                        for bb in boxes_t
+                    ]
+                else:
+                    det_bboxes = []
+                    for p3d in j3d_t:
+                        p2d = _project_3d_to_2d(p3d, K_default)
+                        det_bboxes.append((
+                            float(p2d[:, 0].min()),
+                            float(p2d[:, 1].min()),
+                            float(p2d[:, 0].max()),
+                            float(p2d[:, 1].max()),
+                        ))
+
+                # Greedy IoU match: each NLF detection picked at most once,
+                # each slot picked at most once.  Per-slot best-match with
+                # a low IoU floor (0.1) — same threshold as the
+                # phmr_frame_inputs path; lower would pull in obvious
+                # mismatches.
+                pidxs   = person_indices_per_frame[t]
+                mbboxes = mask_bboxes_per_frame[t]
+                used = set()
+                for k_slot, p_idx in enumerate(pidxs):
+                    mbbox = mbboxes[k_slot]
+                    best_i = -1
+                    best_iou = 0.1
+                    for i in range(len(det_bboxes)):
+                        if i in used:
+                            continue
+                        iou = _bbox_iou_xywh_like(mbbox, det_bboxes[i])
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_i = i
+                    if best_i < 0:
+                        continue
+
+                    used.add(best_i)
+                    j3d = j3d_t[best_i]  # (K, 3) — expect K=24
+                    if j3d.shape[0] != 24:
+                        if not hasattr(run_nlf_video, "_warned_k"):
+                            _logger.warning(
+                                "NLF returned K=%d joints (expected 24). "
+                                "Skeleton mapping may be incorrect.",
+                                j3d.shape[0],
+                            )
+                            run_nlf_video._warned_k = True
+                        # Best-effort fallback: pad/truncate to 24.
+                        smpl24 = np.zeros((24, 3), dtype=np.float32)
+                        limit = min(24, j3d.shape[0])
+                        smpl24[:limit] = j3d[:limit]
+                    else:
+                        smpl24 = j3d.astype(np.float32)
+
+                    j2d_smpl24 = _project_3d_to_2d(smpl24, K_default)
+
+                    persons[p_idx]["body_joints2d"][t] = \
+                        _smpl24_to_openpose25(j2d_smpl24).astype(np.float32)
+                    persons[p_idx]["body_joints"][t] = \
+                        _smpl24_to_openpose25(smpl24).astype(np.float32)
+                    persons[p_idx]["smpl_j3d"][t] = smpl24
+                    matched_total += 1
+
+                if pbar is not None:
+                    pbar.update(1)
+    finally:
+        torch._C._jit_set_profiling_executor(jit_prev)
+
+    # Pbar catch-up for frames that we deliberately skipped (either
+    # outside sampled_frames, or had zero mask bboxes).
+    if pbar is not None:
+        skipped = B - len(valid_frames)
+        for _ in range(skipped):
+            pbar.update(1)
+
+    _logger.info(
+        "run_nlf_video: %d/%d sampled frames → %d (slot, det) matches",
+        len(valid_frames), len(sampled_frames), matched_total,
+    )
+    return {
+        "persons":    persons,
+        "cam_int":    cam_int_per_frame,
+        "nlf_time_s": nlf_time_s,
+    }
