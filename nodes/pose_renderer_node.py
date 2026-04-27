@@ -1,10 +1,20 @@
 """
-Sapiens PromptHMR Pose Renderer node.
+Pose Renderer — render the COCO-WB 133-keypoint 2D timeline as a
+DWPose-style skeleton image.
 
-Fuses body keypoints from 3D data with face/hand keypoints from 2D data
-within a unified POSES dict and renders DWPose-style skeleton images.
-Supports debug overlay, frame rate resampling, and toggling face /
-hand+foot visibility.  Only renders persons with visible=True.
+History note: this node used to fuse 3D body (projected to 2D) with 2D
+face/hands. That mattered when the 3D backbone (PromptHMR / NLF) was
+the only quality body source. With BMPRTMWPose now producing
+high-quality 133-keypoint 2D per frame, projecting 3D back to 2D only
+adds error (3D model error + estimated camera intrinsics + projection
+rounding), so the renderer now uses ``person["keypoints"][t]``
+directly. Frames where ``keypoints[t]`` is None are intentionally not
+drawn — that signal is set upstream when no body source survived
+(BMPRTMWPose Phase 2.8) and faking it from a less-trusted source would
+hide real gaps.
+
+Supports debug overlay, frame-rate resampling, and toggling face /
+hand+foot visibility. Only renders persons with visible=True.
 """
 
 import numpy as np
@@ -12,15 +22,11 @@ import torch
 import comfy.utils
 
 from ..humans4d.hmr2.utils.render_sapiens import render_sapiens_dwpose
-from ._pose_utils import (
-    openpose25_to_coco_wholebody,
-    fuse_3d_body_with_sapiens,
-    resample_keypoints,
-)
+from ._pose_utils import resample_keypoints
 
 
 class PoseRendererNode:
-    """Render fused 2D+3D pose skeletons as DWPose-style images."""
+    """Render COCO-WB 133-keypoint 2D timelines as DWPose-style images."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -55,8 +61,9 @@ class PoseRendererNode:
                     {
                         "default": True,
                         "tooltip": (
-                            "Show face keypoints from Sapiens. "
-                            "When False only PromptHMR body keypoints are shown."
+                            "Show face keypoints (COCO-WB slots 23..90). "
+                            "When False those slots are zeroed before "
+                            "rendering."
                         ),
                     },
                 ),
@@ -65,8 +72,10 @@ class PoseRendererNode:
                     {
                         "default": True,
                         "tooltip": (
-                            "Show hand & foot keypoints from Sapiens. "
-                            "When False only PromptHMR body keypoints are shown."
+                            "Show hand (91..132) and foot (17..22) "
+                            "keypoints. When False both ranges are "
+                            "zeroed and only body+head (0..16) is "
+                            "rendered."
                         ),
                     },
                 ),
@@ -108,24 +117,31 @@ class PoseRendererNode:
 
         # -----------------------------------------------------------
         # Pass 1: build per-frame, per-person COCO-WB keypoints
+        #
+        # Read directly from person["keypoints"][t] — that's the
+        # 133-keypoint 2D output composed by BMPRTMWPose (BMP body +
+        # RTMW feet + FaRL face + WiLoR hands + ViTPose fallback) or
+        # an equivalent 2D pose node. No projection from 3D, no
+        # cross-source fusion: a single 2D source is more accurate
+        # than projecting 3D back through estimated intrinsics.
+        # Frames where keypoints[t] is None are silently skipped —
+        # that's the upstream node telling us "no body source
+        # survived this (slot, frame); don't fake one."
         # -----------------------------------------------------------
         frame_kps = [[] for _ in range(B)]
 
         for t in range(B):
             for p_idx in visible_indices:
-                person = poses["persons"][p_idx]
-                j2d = person["body_joints2d"][t]
-                sapiens_kp = person["keypoints"][t]
-
-                if j2d is not None:
-                    kp = fuse_3d_body_with_sapiens(
-                        j2d, sapiens_kp,
-                        show_face=show_face,
-                        show_hand_foot=show_hand_foot,
-                    )
-                    frame_kps[t].append(kp)
-                elif sapiens_kp is not None and show_face and show_hand_foot:
-                    frame_kps[t].append(sapiens_kp.copy())
+                kp133 = poses["persons"][p_idx]["keypoints"][t]
+                if kp133 is None:
+                    continue
+                kp = kp133.copy()
+                if not show_face:
+                    kp[23:91] = 0.0          # face 68pt
+                if not show_hand_foot:
+                    kp[17:23]  = 0.0         # feet 6pt
+                    kp[91:133] = 0.0         # hands 42pt
+                frame_kps[t].append(kp)
 
             pbar.update(1)
 
