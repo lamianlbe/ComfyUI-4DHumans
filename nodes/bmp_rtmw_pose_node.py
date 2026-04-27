@@ -202,6 +202,12 @@ def _run_wilor_one_frame(
 
     Empty list if no hands detected.
     """
+    # Defensive: LoadWiLoRNode normally adds wilor_lib/ to sys.path, but
+    # if the node was loaded from ComfyUI's cache without re-running
+    # __init__, the path injection might be missing. Idempotent.
+    from ..wilor_lib import ensure_lib_importable as _ensure
+    _ensure()
+
     from wilor.datasets.vitdet_dataset import ViTDetDataset
     from wilor.utils import recursive_to
     from wilor.utils.renderer import cam_crop_to_full

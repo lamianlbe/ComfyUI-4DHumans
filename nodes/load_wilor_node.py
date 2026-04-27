@@ -36,6 +36,12 @@ to a CWD-relative path. ``smplx.MANOLayer`` then reads
 ``os.chdir`` to ``ComfyUI/models/wilor/`` during the load — after
 which the model carries everything in memory and CWD doesn't matter.
 
+The WiLoR python package itself is vendored under
+``ComfyUI-4DHumans/wilor_lib/`` so users don't have to clone the
+upstream repo (which has no setup.py and isn't pip-installable).
+The vendor only includes the inference-side code (~250 KB);
+weights / demo images / training code are NOT included.
+
 License: WiLoR code Apache-2.0, weights CC-BY-NC. MANO from MPI is
 research-only (registration required). This integration assumes
 non-commercial use.
@@ -48,6 +54,8 @@ import shutil
 import torch
 
 from folder_paths import models_dir
+
+from ..wilor_lib import ensure_lib_importable as _ensure_wilor_importable
 
 _logger = logging.getLogger(__name__)
 
@@ -203,6 +211,9 @@ class LoadWiLoRNode:
     CATEGORY = "4dhumans"
 
     def load(self, device, fast, detector_conf):
+        # Make our vendored ``wilor/`` package importable. Has to happen
+        # BEFORE ``from wilor.models import load_wilor`` further down.
+        _ensure_wilor_importable()
         runtime_dir = _ensure_runtime_layout()
 
         device_str = (
@@ -221,12 +232,14 @@ class LoadWiLoRNode:
             from ultralytics import YOLO
         except ImportError as e:
             raise ImportError(
-                "WiLoR is not installed in this Python env. Install with:\n"
-                "  cd <somewhere>\n"
-                "  git clone https://github.com/rolpotamias/WiLoR.git\n"
-                "  cd WiLoR && pip install -e .\n\n"
-                "Plus 'pip install ultralytics' for the YOLO hand detector "
-                "(usually pulled in by WiLoR's setup)."
+                "Failed to import wilor / ultralytics. The wilor package "
+                "is vendored under ComfyUI-4DHumans/wilor_lib/ and should "
+                "have been added to sys.path automatically. If this error "
+                "persists, the runtime deps are likely missing — install "
+                "them with:\n"
+                "  pip install pytorch-lightning smplx timm yacs "
+                "omegaconf hydra-core scikit-image rich ultralytics\n\n"
+                "Underlying error: " + str(e)
             ) from e
 
         _logger.info(
