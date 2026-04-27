@@ -255,7 +255,8 @@ def _run_vitpose_onnx_batch(
 ) -> Optional[np.ndarray]:
     """ONNX backend. Top-down affine crop → ImageNet normalise →
     onnxruntime → heatmap argmax decode → inverse affine. Returns
-    ``(N, 17, 3)``."""
+    ``(N, K, 3)`` where K is the model's full keypoint count
+    (17 for body-only ViTPose, 133 for wholebody)."""
     if not bboxes_xyxy:
         return None
 
@@ -263,7 +264,6 @@ def _run_vitpose_onnx_batch(
     input_name = vitpose_dict["input_name"]
     input_h    = vitpose_dict["input_h"]
     input_w    = vitpose_dict["input_w"]
-    num_kpts   = vitpose_dict["num_kpts"]
 
     # Per-bbox top-down affine
     crops = []
@@ -306,12 +306,14 @@ def _run_vitpose_onnx_batch(
     x_in = x_hm * sx
     y_in = y_hm * sy
 
-    # Take only body keypoints 0..16 — fallback only contributes there.
-    use_K = min(17, K)
-    out = np.zeros((N, 17, 3), dtype=np.float32)
+    # Return ALL K keypoints (caller picks slices: 0..16 body, 17..22
+    # feet, 91..132 hands, etc.). For 17-keypoint body-only ViTPose
+    # K==17 so caller can only fill body. For wholebody K==133 caller
+    # can fill body+feet+hands.
+    out = np.zeros((N, K, 3), dtype=np.float32)
     for n in range(N):
         M_inv = inv_mats[n]
-        for k in range(use_K):
+        for k in range(K):
             xc, yc = x_in[n, k], y_in[n, k]
             x_orig = M_inv[0, 0] * xc + M_inv[0, 1] * yc + M_inv[0, 2]
             y_orig = M_inv[1, 0] * xc + M_inv[1, 1] * yc + M_inv[1, 2]
@@ -381,11 +383,20 @@ def _run_vitpose_hf_batch(
         )
         return None
 
-    out = np.zeros((len(per_person), 17, 3), dtype=np.float32)
+    # Determine the keypoint count from the first result so the output
+    # shape matches whatever variant we loaded (typically 17 for
+    # ViTPose-simple body-only, but ViTPose+ multi-task can theoretically
+    # emit different counts depending on dataset_index).
+    if not per_person:
+        return None
+    first_kp = np.asarray(per_person[0]["keypoints"], dtype=np.float32)
+    K = int(first_kp.shape[0])
+
+    out = np.zeros((len(per_person), K, 3), dtype=np.float32)
     for i, person in enumerate(per_person):
         kp = np.asarray(person["keypoints"], dtype=np.float32)
         sc = np.asarray(person["scores"],    dtype=np.float32)
-        n_kp = min(17, kp.shape[0])
+        n_kp = min(K, kp.shape[0])
         out[i, :n_kp, 0] = kp[:n_kp, 0]
         out[i, :n_kp, 1] = kp[:n_kp, 1]
         out[i, :n_kp, 2] = sc[:n_kp]
@@ -1047,37 +1058,48 @@ class BMPRTMWPoseNode:
                             kp133[0:17] = kp17.astype(np.float32)
                             body_override_count += 1
 
-        # ---- Phase 2.7: optional ViTPose body fallback (0..16) ------------
-        # In extreme scenes (heavy motion blur, very dark, atypical
-        # poses) BMP's mask-conditioned PMPose can fail entirely while
-        # mmpose RTMW also struggles. ViTPose has no mask conditioning
-        # and uses a plain ViT-H backbone, which empirically still
-        # produces usable body skeletons in those edge cases.
+        # ---- Phase 2.7: optional ViTPose fallback ------------------------
+        # When BMP's mask-conditioned PMPose fails entirely on extreme
+        # scenes (heavy motion blur, very dark, atypical poses) AND
+        # mmpose RTMW also struggles, ViTPose's plain ViT-H backbone
+        # empirically still produces usable skeletons.
         #
-        # Only fires when the body section's MAX confidence across
-        # 0..16 is below score_threshold (i.e. neither RTMW nor BMP
-        # produced anything trustworthy). Fallback inputs:
-        #   * full RGB frame
-        #   * person bbox derived from the BMP mask (already computed
-        #     for Phase 2 above as ``bbox_per_frame[t][p]``)
-        # Fallback batches all (frame, slot) requests grouped by
-        # frame so a single ViTPose forward handles every fallback
-        # bbox in the same image.
+        # Trigger condition: body 0..16 max-confidence below
+        # score_threshold (i.e. neither RTMW nor BMP body produced
+        # anything trustworthy for this slot/frame).
+        #
+        # Slice ownership when fallback fires:
+        #   0..16   body  ← ViTPose                  (always)
+        #   17..22  feet  ← ViTPose                  (always, if K>=23)
+        #   23..90  face  ← UNCHANGED                (FaRL Phase 2.6 or
+        #                                              RTMW base wins)
+        #   91..132 hands ← ViTPose                  (only if WiLoR not
+        #                                              connected; otherwise
+        #                                              WiLoR Phase 3
+        #                                              overrides anyway)
+        #
+        # If the loaded ViTPose variant is body-only (K=17 ONNX or
+        # ViTPose-simple HF), only body 0..16 gets filled — feet/hands
+        # ranges stay with their existing source.
         vitpose_fallback_count = 0
+        vitpose_feet_filled    = 0
+        vitpose_hands_filled   = 0
         if vitpose is not None:
             from collections import defaultdict
             backend = vitpose.get("backend", "hf")
+            wilor_will_override = wilor is not None
             _logger.info(
-                "ViTPose fallback enabled (backend=%s). Will fire only "
-                "for (slot, frame) pairs where body max-confidence "
-                "< score_threshold (%.2f).",
+                "ViTPose fallback enabled (backend=%s). Triggers when "
+                "body max-conf < %.2f. Slice ownership: body+feet from "
+                "ViTPose, face stays with FaRL/RTMW, hands from %s.",
                 backend, float(score_threshold),
+                "WiLoR (Phase 3 override)" if wilor_will_override
+                else "ViTPose",
             )
             vt_t = time.perf_counter()
 
-            # Group fallback requests by frame. Each group gets ONE
-            # ViTPose forward (top-down accepts a list of bboxes per
-            # image).
+            # Group fallback requests by frame. Each group → ONE
+            # ViTPose forward over all that frame's fallback bboxes.
             requests_by_frame: Dict[int, List[Tuple[int, np.ndarray]]] = (
                 defaultdict(list)
             )
@@ -1098,27 +1120,49 @@ class BMPRTMWPoseNode:
                 slots = [pair[0] for pair in slot_bbox_pairs]
                 bboxes_for_vt = [pair[1] for pair in slot_bbox_pairs]
 
-                # ViTPose backends both expect RGB image input.
-                vt_kp17 = _run_vitpose_batch(
+                # _run_vitpose_batch returns (N, K, 3) where K matches
+                # the loaded model's keypoint count (17 body-only or
+                # 133 wholebody).
+                vt_out = _run_vitpose_batch(
                     vitpose, rgb_u8[t], bboxes_for_vt,
                 )
-                if vt_kp17 is None:
+                if vt_out is None:
                     continue
+
+                K_returned = vt_out.shape[1]
+                has_feet  = K_returned >= 23
+                has_hands = K_returned >= 133
 
                 for i, p_idx in enumerate(slots):
                     kp133 = persons_133[p_idx][t]
                     if kp133 is None:
                         continue
-                    new_body = vt_kp17[i].astype(np.float32)
-                    new_max = float(new_body[:, 2].max())
-                    # Sanity gate: ViTPose's own confidence must clear
-                    # the threshold too — if even ViTPose can't see a
-                    # body in this crop, leave the existing kp133 alone
-                    # (don't overwrite usable RTMW output with garbage).
-                    if new_max < float(score_threshold):
+
+                    new_kp = vt_out[i].astype(np.float32)
+                    body_new = new_kp[:17]
+                    body_new_max = float(body_new[:, 2].max())
+                    # Sanity gate: ViTPose itself must clear threshold.
+                    # If even ViTPose can't see a body, don't overwrite
+                    # whatever was there (might be marginal RTMW data).
+                    if body_new_max < float(score_threshold):
                         continue
-                    kp133[0:17] = new_body
+
+                    # 1. Body 0..16 — always
+                    kp133[0:17] = body_new
                     vitpose_fallback_count += 1
+
+                    # 2. Feet 17..22 — only if model output has them
+                    if has_feet:
+                        kp133[17:23] = new_kp[17:23]
+                        vitpose_feet_filled += 1
+
+                    # 3. Hands 91..132 — only if model output has them
+                    #    AND WiLoR is NOT connected (else WiLoR's
+                    #    Phase 3 override will take precedence; writing
+                    #    here is wasted work).
+                    if has_hands and not wilor_will_override:
+                        kp133[91:133] = new_kp[91:133]
+                        vitpose_hands_filled += 1
 
             vitpose_time = time.perf_counter() - vt_t
         else:
