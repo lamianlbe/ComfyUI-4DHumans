@@ -37,9 +37,13 @@ import cv2
 import folder_paths
 import comfy.utils
 
+import logging
+
 from ..humans4d.hmr2.utils.render_sapiens import render_sapiens_dwpose
-from ._pose_utils import fuse_3d_body_with_sapiens, temporal_filter_keypoints
+from ._pose_utils import is_face_visible, temporal_filter_keypoints
 from .save_pose_node import poses_to_npz_dict
+
+_logger = logging.getLogger(__name__)
 
 # Global cache: node_id -> {poses, images_np, output_dir, subfolder,
 #                            velocity_threshold, smooth_sigma}
@@ -100,7 +104,16 @@ def _render_video(node_id):
     mp4_filename = f"PoseEditor_{node_id}_{ts}.mp4"
     mp4_path = os.path.join(output_dir, mp4_filename)
 
+    # Render strategy mirrors PoseRenderer: read 2D keypoints (COCO-WB
+    # 133) directly from person["keypoints"][t] — no projection from 3D
+    # body_joints2d, which would only inject the 3D model's error +
+    # estimated camera intrinsics + projection rounding into the
+    # display. is_face_visible() applies the same 3-tier check
+    # (3D body normal → pre-FaRL RTMW face conf → 2D head geometry)
+    # that PoseRenderer uses, so the editor preview shows the same
+    # face-gating behaviour as the final render output.
     rendered_frames = []
+    face_filtered = 0
     for t in range(B):
         canvas = images_np[t].copy()
         # Use actual image dimensions (may differ from pose detection resolution)
@@ -111,44 +124,34 @@ def _render_video(node_id):
             if not person.get("visible", True):
                 continue
 
-            j2d = person["body_joints2d"][t]
-            sapiens_kp = person["keypoints"][t]
+            kp133 = person["keypoints"][t]
+            if kp133 is None:
+                continue
 
             # Scale keypoints if image was resized since detection
             scale_x = actual_w / img_w if img_w > 0 else 1.0
             scale_y = actual_h / img_h if img_h > 0 else 1.0
             needs_scale = abs(scale_x - 1.0) > 0.01 or abs(scale_y - 1.0) > 0.01
 
-            j2d_r = j2d
-            sap_r = sapiens_kp
+            kp = kp133.copy()
             if needs_scale:
-                if j2d is not None:
-                    j2d_r = j2d.copy()
-                    j2d_r[:, 0] *= scale_x
-                    j2d_r[:, 1] *= scale_y
-                if sapiens_kp is not None:
-                    sap_r = sapiens_kp.copy()
-                    sap_r[:, 0] *= scale_x
-                    sap_r[:, 1] *= scale_y
+                kp[:, 0] *= scale_x
+                kp[:, 1] *= scale_y
 
-            if j2d_r is not None:
-                kp = fuse_3d_body_with_sapiens(j2d_r, sap_r)
-                canvas = render_sapiens_dwpose(canvas, kp, actual_h, actual_w)
-            elif sap_r is not None:
-                canvas = render_sapiens_dwpose(canvas, sap_r, actual_h, actual_w)
+            # Smart face filter — zero face slots when the 3-tier check
+            # says the face isn't visible to camera (back view, etc.).
+            # IMPORTANT: pass the ORIGINAL poses dict (not scaled coords)
+            # so the helper sees the 3D smpl_j3d in its original frame.
+            if not is_face_visible(poses, p_idx, t):
+                kp[23:91] = 0.0
+                face_filtered += 1
 
-            # Draw person ID label near nose (use scaled coords)
-            label_pos = None
-            if j2d_r is not None:
-                nx, ny = float(j2d_r[0, 0]), float(j2d_r[0, 1])
-                if nx > 1 or ny > 1:
-                    label_pos = (int(nx), int(ny) - 20)
-            elif sap_r is not None:
-                nx, ny = float(sap_r[0, 0]), float(sap_r[0, 1])
-                if nx > 1 or ny > 1:
-                    label_pos = (int(nx), int(ny) - 20)
+            canvas = render_sapiens_dwpose(canvas, kp, actual_h, actual_w)
 
-            if label_pos is not None:
+            # Draw person ID label near nose (COCO-WB index 0)
+            nx, ny = float(kp[0, 0]), float(kp[0, 1])
+            if nx > 1 or ny > 1:
+                label_pos = (int(nx), int(ny) - 20)
                 label = f"P{p_idx}"
                 canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
                 cv2.putText(
@@ -159,6 +162,13 @@ def _render_video(node_id):
                 canvas = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB)
 
         rendered_frames.append(np.clip(canvas, 0, 255).astype(np.uint8))
+
+    if face_filtered > 0:
+        _logger.info(
+            "PoseEditor render: face_smart_filter zeroed face on "
+            "%d (slot, frame) pairs (back-view / occluded).",
+            face_filtered,
+        )
 
     import imageio.v3 as iio
     with iio.imopen(mp4_path, "w", plugin="pyav") as out_file:
