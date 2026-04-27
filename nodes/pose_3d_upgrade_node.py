@@ -269,36 +269,92 @@ class Pose3DUpgradeNode:
             # "every frame" so we degrade safely rather than crash.
             sampled_frames = set(range(B))
 
-        # Two structures:
-        #   mask_bboxes_per_frame / person_indices_per_frame:
-        #       flat lists for SAMPLED frames only (fed to Fast SAM 3D Body)
-        #   bbox_by_slot[t][p]:
-        #       per-slot indexed dict for ALL frames (used to build the
-        #       auto-extracted yolo_pose dict when yolo11_pose is None)
+        # Per-slot bbox + per-slot effective mask sources:
+        #   1. BMP mask  (preferred — tight, full-body silhouette)
+        #   2. Body kpts 0..16 from input POSES with 20% pad (fallback —
+        #      fires when BMP failed but ViTPose carried the slot via
+        #      its full-image bbox path upstream; we still have valid
+        #      kpts to bound, just no mask)
+        #
+        # Fast SAM 3D Body NEEDS a bbox for top-down crop AND uses the
+        # mask to zero out background inside that crop. If we feed an
+        # empty mask alongside a kpt-derived bbox, the model's masking
+        # layer would clear the input image and detection would fail —
+        # so we synthesise a filled-bbox mask for kpt-fallback slots.
+        # That mask is coarser than BMP's, but the bbox is still tight
+        # so the crop is reasonable, and the model just sees "all
+        # foreground" inside the crop, which is the right prior when
+        # the bbox is well-cropped.
         mask_bboxes_per_frame: List[list] = [[] for _ in range(B)]
         person_indices_per_frame: List[list] = [[] for _ in range(B)]
         bbox_by_slot: List[List[Optional[np.ndarray]]] = [
             [None] * n_persons for _ in range(B)
         ]
+        # Effective masks (copy of masks_np that we may overwrite for
+        # kpt-fallback slots). bool dtype to match the original.
+        effective_masks_np = masks_np.copy()
+
+        in_persons_for_bbox = list(poses.get("persons", []))
+        bbox_source_counts = {"mask": 0, "kpts": 0}
 
         for t in range(B):
             for p_idx in range(n_persons):
+                bb = None
+                source = None
+
                 mask_frame = masks_np[t, p_idx]
                 ys, xs = np.where(mask_frame)
-                if len(xs) == 0:
+                if len(xs) > 0:
+                    x1 = int(xs.min()); y1 = int(ys.min())
+                    x2 = int(xs.max() + 1); y2 = int(ys.max() + 1)
+                    x1 = max(0, x1); y1 = max(0, y1)
+                    x2 = min(img_w, x2); y2 = min(img_h, y2)
+                    if x2 - x1 >= 2 and y2 - y1 >= 2:
+                        bb = (x1, y1, x2, y2)
+                        source = "mask"
+
+                if bb is None and p_idx < len(in_persons_for_bbox):
+                    kp_list = in_persons_for_bbox[p_idx].get("keypoints", [])
+                    if t < len(kp_list) and kp_list[t] is not None:
+                        kp = np.asarray(kp_list[t], dtype=np.float32)
+                        if kp.shape[0] >= 17 and kp.shape[1] >= 3:
+                            kp17 = kp[:17]
+                            vis = kp17[:, 2] > 0.1
+                            if int(vis.sum()) >= 3:
+                                xs17 = kp17[vis, 0]
+                                ys17 = kp17[vis, 1]
+                                xmin = float(xs17.min()); xmax = float(xs17.max())
+                                ymin = float(ys17.min()); ymax = float(ys17.max())
+                                pad_x = max(1.0, (xmax - xmin) * 0.20)
+                                pad_y = max(1.0, (ymax - ymin) * 0.20)
+                                x1 = max(0, int(round(xmin - pad_x)))
+                                y1 = max(0, int(round(ymin - pad_y)))
+                                x2 = min(img_w, int(round(xmax + pad_x)))
+                                y2 = min(img_h, int(round(ymax + pad_y)))
+                                if x2 - x1 >= 2 and y2 - y1 >= 2:
+                                    bb = (x1, y1, x2, y2)
+                                    source = "kpts"
+                                    # Synthesise a filled-bbox mask so
+                                    # the model's mask-conditioning
+                                    # path doesn't zero the crop.
+                                    effective_masks_np[t, p_idx, y1:y2, x1:x2] = True
+
+                if bb is None:
                     continue
-                x1 = int(xs.min()); y1 = int(ys.min())
-                x2 = int(xs.max() + 1); y2 = int(ys.max() + 1)
-                x1 = max(0, x1); y1 = max(0, y1)
-                x2 = min(img_w, x2); y2 = min(img_h, y2)
-                if x2 - x1 < 2 or y2 - y1 < 2:
-                    continue
-                bbox_by_slot[t][p_idx] = np.array(
-                    [x1, y1, x2, y2], dtype=np.float32,
-                )
+
+                bbox_source_counts[source] += 1
+                bbox_by_slot[t][p_idx] = np.array(bb, dtype=np.float32)
                 if t in sampled_frames:
-                    mask_bboxes_per_frame[t].append((x1, y1, x2, y2))
+                    mask_bboxes_per_frame[t].append(bb)
                     person_indices_per_frame[t].append(p_idx)
+
+        _logger.info(
+            "Pose3DUpgrade: per-slot bboxes — %d from BMP mask, %d from "
+            "input POSES kpts (synth mask filled bbox); %d sampled "
+            "frames have ≥1 slot bbox.",
+            bbox_source_counts["mask"], bbox_source_counts["kpts"],
+            sum(1 for t in sampled_frames if mask_bboxes_per_frame[t]),
+        )
 
         n_sampled = len(sampled_frames)
         pbar = comfy.utils.ProgressBar(B + 1)
@@ -334,7 +390,7 @@ class Pose3DUpgradeNode:
         result = run_fastsam3db_video(
             images_np_u8=images_np_u8,
             mask_bboxes_per_frame=mask_bboxes_per_frame,
-            masks_np=masks_np,
+            masks_np=effective_masks_np,
             person_indices_per_frame=person_indices_per_frame,
             fastsam3db_dict=fast_sam_3d_body,
             yolo11pose_dict=yolo11_pose,
