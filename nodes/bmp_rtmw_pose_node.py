@@ -391,6 +391,62 @@ def _assign_wilor_hands_to_persons(
 # Mask & bbox in the underlying overlay still use one color per track
 # (from build_debug_overlay's palette) so person identity is also
 # preserved at a glance.
+# OKS sigma per body joint, copied from COCO's standard table (used by
+# pycocotools.cocoeval). Same sigmas mmpose uses internally for
+# evaluation. Distance × 2σ²·s² in the OKS formula — small sigmas
+# (eyes, hips) penalise distance more than large ones (feet).
+_COCO17_OKS_SIGMAS = np.array([
+    0.026, 0.025, 0.025, 0.035, 0.035,   # nose, eyes, ears
+    0.079, 0.079, 0.072, 0.072, 0.062, 0.062,   # shoulders, elbows, wrists
+    0.107, 0.107, 0.087, 0.087, 0.089, 0.089,   # hips, knees, ankles
+], dtype=np.float32)
+
+
+def _body_oks(
+    kp_a: np.ndarray, kp_b: np.ndarray,
+    bbox_a: Optional[np.ndarray], bbox_b: Optional[np.ndarray],
+    score_threshold: float,
+) -> float:
+    """Object Keypoint Similarity between two (17, 3) body skeletons.
+
+    Returns 0.0 if there are fewer than 5 jointly-visible keypoints
+    (insufficient evidence to call them the same person). Otherwise
+    follows the COCO OKS formula:
+        OKS = mean_i exp(-d_i² / (2 σ_i² s²))
+    where ``s²`` = bbox area (we use mean of the two bboxes).
+    """
+    visible = (kp_a[:17, 2] >= score_threshold) & (kp_b[:17, 2] >= score_threshold)
+    if int(visible.sum()) < 5:
+        return 0.0
+
+    diff = kp_a[:17, :2] - kp_b[:17, :2]
+    d2 = np.sum(diff * diff, axis=1)
+
+    # bbox area used to normalise distances. Average of the two bboxes
+    # — both should describe the SAME person if they're a ghost pair,
+    # so any discrepancy means the bboxes themselves are off-spec.
+    def _area(bb):
+        if bb is None:
+            return 0.0
+        w = max(0.0, bb[2] - bb[0])
+        h = max(0.0, bb[3] - bb[1])
+        return float(w * h)
+
+    area_a, area_b = _area(bbox_a), _area(bbox_b)
+    if area_a > 0 and area_b > 0:
+        s2 = 0.5 * (area_a + area_b)
+    elif area_a > 0:
+        s2 = area_a
+    elif area_b > 0:
+        s2 = area_b
+    else:
+        s2 = max(d2.max(), 1.0)  # degenerate: just normalise by max d²
+
+    e = d2 / (2.0 * _COCO17_OKS_SIGMAS ** 2 * s2 + 1e-9)
+    contrib = np.exp(-e)
+    return float(contrib[visible].mean())
+
+
 _BODY_COLOR  = (50,  255, 50)    # green
 _FOOT_COLOR  = (255, 220, 0)     # yellow
 _FACE_COLOR  = (0,   220, 255)   # cyan
@@ -535,6 +591,40 @@ class BMPRTMWPoseNode:
                         ),
                     },
                 ),
+                "ghost_oks_thresh": (
+                    "FLOAT",
+                    {
+                        "default": 0.7,
+                        "min": 0.3,
+                        "max": 0.99,
+                        "step": 0.05,
+                        "tooltip": (
+                            "Two slots are considered 'ghost duplicates' "
+                            "(same real person split into two BMP mask "
+                            "fragments) on a frame when their COCO-17 "
+                            "body OKS exceeds this threshold. 0.7 is a "
+                            "safe default — distinct people typically "
+                            "score < 0.3 even when standing close."
+                        ),
+                    },
+                ),
+                "ghost_max_burst_frames": (
+                    "INT",
+                    {
+                        "default": 5,
+                        "min": 0,
+                        "max": 60,
+                        "step": 1,
+                        "tooltip": (
+                            "Maximum length (in frames) of a "
+                            "transient ghost-overlap burst that gets "
+                            "suppressed. Set to 0 to disable suppression "
+                            "entirely. Bursts longer than this are left "
+                            "alone — they're likely two different "
+                            "people, not a SAM mask split."
+                        ),
+                    },
+                ),
                 "debug_overlay": (
                     "BOOLEAN",
                     {
@@ -561,7 +651,9 @@ class BMPRTMWPoseNode:
     CATEGORY = "4dhumans"
 
     def run(self, images, bmp_masks, rtmw,
-            score_threshold, fps, debug_overlay,
+            score_threshold, fps,
+            ghost_oks_thresh, ghost_max_burst_frames,
+            debug_overlay,
             bmp_pose=None, farl_face=None, wilor=None):
         from mmpose.apis import inference_topdown
 
@@ -797,6 +889,128 @@ class BMPRTMWPoseNode:
 
         pbar.update(1)
 
+        # ---- Phase 3.5: ghost-track suppression ---------------------------
+        # In tightly-overlapping multi-person scenes, BMP's mask tracker
+        # sometimes splits a single real person into two slots for a
+        # short window — think upper body in slot A, lower body in
+        # slot B, both fragments getting their own mask-bbox. RTMW
+        # then runs on both bboxes and produces nearly-identical
+        # skeletons because the underlying ViT crop sees the same body
+        # parts. The result is two visually-overlapping skeletons in a
+        # 2-5 frame burst, then collapse back to one slot. Worse, the
+        # IoU tracker often re-assigns the dominant slot ID after the
+        # burst, manifesting as a track-ID swap.
+        #
+        # Detection: for each ordered pair (a, b) and each frame
+        # where BOTH have body keypoints, compute COCO-17 OKS. Frames
+        # with OKS > ghost_oks_thresh are "overlap frames". Group
+        # consecutive overlap frames into bursts. If a burst is short
+        # (≤ ghost_max_burst_frames) we declare the lower-quality slot
+        # in that burst (sum of body keypoint scores) the ghost and
+        # null its keypoints in the affected frames. Long bursts are
+        # left alone — they're more likely two genuinely close people.
+        ghosts_suppressed_frames = 0
+        ghosts_suppressed_bursts = 0
+        if ghost_max_burst_frames > 0 and n_persons >= 2:
+            # Per-frame body bboxes (re-derived from kp133 since we may
+            # have overridden body via BMP — bbox should track the
+            # final keypoints, not the original mask bbox).
+            def _body_bbox_from_kp133(kp133, conf_thresh):
+                if kp133 is None:
+                    return None
+                vis = kp133[:17, 2] >= conf_thresh
+                if int(vis.sum()) < 3:
+                    return None
+                pts = kp133[:17][vis][:, :2]
+                return np.array([
+                    pts[:, 0].min(), pts[:, 1].min(),
+                    pts[:, 0].max(), pts[:, 1].max(),
+                ], dtype=np.float32)
+
+            def _kp_quality(kp133, conf_thresh):
+                if kp133 is None:
+                    return -1.0
+                vis = kp133[:17, 2] >= conf_thresh
+                if not vis.any():
+                    return 0.0
+                return float(kp133[:17][vis, 2].sum())
+
+            # Pass 1: build overlap matrix flag[(a, b)][t] = True if pair
+            # is ghost-overlapping that frame.
+            overlap_per_frame: List[Dict[Tuple[int, int], bool]] = [
+                {} for _ in range(B)
+            ]
+            for t in range(B):
+                for a in range(n_persons):
+                    kpa = persons_133[a][t]
+                    if kpa is None:
+                        continue
+                    for b in range(a + 1, n_persons):
+                        kpb = persons_133[b][t]
+                        if kpb is None:
+                            continue
+                        bbox_a = _body_bbox_from_kp133(kpa, score_threshold)
+                        bbox_b = _body_bbox_from_kp133(kpb, score_threshold)
+                        oks = _body_oks(
+                            kpa, kpb, bbox_a, bbox_b,
+                            score_threshold,
+                        )
+                        if oks > float(ghost_oks_thresh):
+                            overlap_per_frame[t][(a, b)] = True
+
+            # Pass 2: for each (a, b) pair, find contiguous overlap
+            # bursts and suppress short ones.
+            checked_pairs = set()
+            for a in range(n_persons):
+                for b in range(a + 1, n_persons):
+                    if (a, b) in checked_pairs:
+                        continue
+                    checked_pairs.add((a, b))
+                    # Find runs of contiguous frames where (a, b) overlap.
+                    runs: List[Tuple[int, int]] = []
+                    run_start = None
+                    for t in range(B):
+                        is_overlap = (a, b) in overlap_per_frame[t]
+                        if is_overlap and run_start is None:
+                            run_start = t
+                        elif not is_overlap and run_start is not None:
+                            runs.append((run_start, t - 1))
+                            run_start = None
+                    if run_start is not None:
+                        runs.append((run_start, B - 1))
+
+                    for r_start, r_end in runs:
+                        burst_len = r_end - r_start + 1
+                        if burst_len > int(ghost_max_burst_frames):
+                            continue  # likely a real adjacent person, leave it
+
+                        # Per-burst quality comparison: sum body
+                        # confidences across the burst. Slot with lower
+                        # total is the ghost.
+                        qa = sum(
+                            _kp_quality(persons_133[a][t], score_threshold)
+                            for t in range(r_start, r_end + 1)
+                        )
+                        qb = sum(
+                            _kp_quality(persons_133[b][t], score_threshold)
+                            for t in range(r_start, r_end + 1)
+                        )
+                        ghost_slot = a if qa < qb else b
+                        keep_slot  = b if ghost_slot == a else a
+
+                        for t in range(r_start, r_end + 1):
+                            if persons_133[ghost_slot][t] is not None:
+                                persons_133[ghost_slot][t] = None
+                                ghosts_suppressed_frames += 1
+                        ghosts_suppressed_bursts += 1
+                        _logger.info(
+                            "Ghost suppression: pair (slot %d, slot %d) "
+                            "frames %d..%d (%d frames) — kept slot %d, "
+                            "nulled slot %d (quality %.2f vs %.2f).",
+                            a, b, r_start, r_end, burst_len,
+                            keep_slot, ghost_slot, qa, qb,
+                        )
+
         # ---- Phase 4: pack POSES dict -------------------------------------
         poses_persons = []
         for p_idx in range(n_persons):
@@ -833,11 +1047,14 @@ class BMPRTMWPoseNode:
         _logger.info(
             "BMPRTMWPose: %d frames, %d tracks | RTMW %.2fs | "
             "BMP body overrides: %d | FaRL face %.2fs (%d overrides) | "
-            "WiLoR %.2fs (%d hand overrides) | total %.2fs",
+            "WiLoR %.2fs (%d hand overrides) | "
+            "ghost suppression: %d bursts (%d frames nulled) | "
+            "total %.2fs",
             B, n_persons, rtmw_time,
             body_override_count,
             farl_time, farl_override_count,
             wilor_time, wilor_overrides_count,
+            ghosts_suppressed_bursts, ghosts_suppressed_frames,
             elapsed,
         )
 
