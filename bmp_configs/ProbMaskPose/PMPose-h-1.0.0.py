@@ -98,7 +98,7 @@ model = dict(
         shift_heatmap=False,
         output_heatmaps=False,
     ),
-    freeze_backbone=True,
+    # freeze_backbone=True,  # stripped: BMP mmpose-fork only kwarg
 )
 
 # pipelines
