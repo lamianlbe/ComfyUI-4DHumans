@@ -270,6 +270,14 @@ def _run_wilor_one_frame(
             .detach().cpu().numpy()
         )
 
+        # ``scaled_focal_length`` is a 0-dim tensor (img_size.max() over
+        # the batch — i.e. ONE focal scalar shared by every hand crop in
+        # this image). It's NOT indexable per-hand. WiLoR's demo.py uses
+        # it as a scalar (``focal_length=scaled_focal_length``); we do
+        # the same here, after a single .item() conversion outside the
+        # per-hand loop so the cost stays out of the inner loop.
+        focal_scalar = float(scaled_focal_length.item())
+
         bsz = batch["img"].shape[0]
         for n in range(bsz):
             joints_3d = out["pred_keypoints_3d"][n].detach().cpu().numpy()  # (21, 3)
@@ -280,9 +288,7 @@ def _run_wilor_one_frame(
             cam_t = pred_cam_t_full[n]
             joints_2d = _project_full_img(
                 joints_3d, cam_t,
-                float(scaled_focal_length[n].item()
-                      if hasattr(scaled_focal_length, "__getitem__")
-                      else scaled_focal_length),
+                focal_scalar,
                 img_size[n].cpu().numpy(),
             )
 
