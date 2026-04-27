@@ -16,18 +16,22 @@ Pipeline:
 
     images ─┬─► [BMPInstanceSeg] ──┬─► masks ──┐
             │                       │           │
-            │                       └─► bmp_pose │  ┌──► [BMP+RTMW Pose] ──► poses (2D, 133pt) ──┐
-            └───────────────────────────────────┴──┤                                              │
-                                                    │                                              │
-                                                    │              ┌─────────────────────────────┘
-                                                    ▼              ▼
-                                              [Pose 3D Upgrade] ◄── poses
-                                              ◄── bmp_masks
-                                              ◄── images
+            │                       └─► bmp_pose │  ┌──► [BMP+RTMW Pose] ──► pose_bundle ──┐
+            └───────────────────────────────────┴──┤                                       │
+                                                    │                                       │
+                                                    ▼                                       ▼
+                                              [Pose 3D Upgrade] ◄────────────── pose_bundle
                                               ◄── fast_sam_3d_body
                                                     │
                                                     ▼
                                           POSES (2D + 3D, NPZ-compatible)
+
+The ``pose_bundle`` is the *single* contract — it carries the 2D
+``poses`` dict, the ``bmp_masks`` they were produced from, the
+``images``, and the pre-computed ``sampled_frames`` schedule the
+upstream node chose based on its ``fps`` / ``pose_3d_fps`` settings.
+This eliminates the previous "two nodes, two fps inputs that can
+disagree" foot-gun.
 
 Slot ownership in the merged POSES:
 
@@ -154,26 +158,8 @@ class Pose3DUpgradeNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "poses":             ("POSES",),
-                "bmp_masks":         ("MASK",),
-                "images":            ("IMAGE",),
+                "pose_bundle":       ("POSE_BUNDLE",),
                 "fast_sam_3d_body":  ("FASTSAM3DBODY",),
-                "pose_fps": (
-                    "FLOAT",
-                    {
-                        "default": 15.0,
-                        "min": 1.0,
-                        "max": 120.0,
-                        "step": 0.5,
-                        "tooltip": (
-                            "Target FPS for Fast SAM 3D Body inference. "
-                            "Intermediate frames are linearly interpolated. "
-                            "Lower = faster, but jittery 3D motion. "
-                            "15 is a reasonable balance for 24-30 fps "
-                            "source video."
-                        ),
-                    },
-                ),
             },
             "optional": {
                 "yolo11_pose": (
@@ -200,30 +186,35 @@ class Pose3DUpgradeNode:
     FUNCTION = "upgrade"
     CATEGORY = "4dhumans"
 
-    def upgrade(self, poses, bmp_masks, images, fast_sam_3d_body,
-                pose_fps=15.0, yolo11_pose=None):
+    def upgrade(self, pose_bundle, fast_sam_3d_body, yolo11_pose=None):
         # ---------------------------------------------------------------
-        # Phase 0: validate alignment between POSES and masks
+        # Phase 0: unpack the bundle (single contract from BMPRTMWPose)
         # ---------------------------------------------------------------
-        n_persons_poses = int(poses.get("n_persons", 0))
-        n_frames_poses  = int(poses.get("n_frames", 0))
-        img_h_poses     = int(poses.get("img_h", 0))
-        img_w_poses     = int(poses.get("img_w", 0))
-        fps             = float(poses.get("fps", 30.0))
+        poses          = pose_bundle["poses"]
+        bmp_masks      = pose_bundle["bmp_masks"]
+        images         = pose_bundle["images"]
+        fps            = float(pose_bundle["fps"])
+        pose_3d_fps    = float(pose_bundle.get("pose_3d_fps", fps))
+        phmr_stride    = int(pose_bundle.get("phmr_stride", 1))
+        sampled_frames_list = pose_bundle.get("sampled_frames", None)
+        n_persons_bundle = int(pose_bundle.get("n_persons", 0))
+        B_bundle       = int(pose_bundle.get("n_frames", 0))
+        img_h_bundle   = int(pose_bundle.get("img_h", 0))
+        img_w_bundle   = int(pose_bundle.get("img_w", 0))
 
         B, img_h, img_w, _C = images.shape
-        if (img_h != img_h_poses) or (img_w != img_w_poses):
+        if (img_h != img_h_bundle) or (img_w != img_w_bundle):
             _logger.warning(
                 "Pose3DUpgrade: images shape (%d, %d) doesn't match "
-                "POSES img_h/img_w (%d, %d). Using images shape as "
+                "bundle img_h/img_w (%d, %d). Using images shape as "
                 "ground truth.",
-                img_h, img_w, img_h_poses, img_w_poses,
+                img_h, img_w, img_h_bundle, img_w_bundle,
             )
-        if B != n_frames_poses and n_frames_poses > 0:
+        if B != B_bundle and B_bundle > 0:
             _logger.warning(
                 "Pose3DUpgrade: image frame count (%d) doesn't match "
-                "POSES n_frames (%d).",
-                B, n_frames_poses,
+                "bundle n_frames (%d).",
+                B, B_bundle,
             )
 
         # Reshape masks to (B, n_persons, H, W)
@@ -242,12 +233,11 @@ class Pose3DUpgradeNode:
                 f"of frame count ({B})."
             )
         n_persons_masks = M // B
-        if n_persons_masks != n_persons_poses:
+        if n_persons_masks != n_persons_bundle:
             _logger.warning(
-                "Pose3DUpgrade: mask slots (%d) ≠ POSES persons (%d). "
-                "Using mask slot count for 3D inference; POSES persons "
-                "list will be padded/truncated as needed.",
-                n_persons_masks, n_persons_poses,
+                "Pose3DUpgrade: mask slots (%d) ≠ bundle n_persons (%d). "
+                "Using mask slot count for 3D inference.",
+                n_persons_masks, n_persons_bundle,
             )
         n_persons = n_persons_masks
         masks = bmp_masks.reshape(B, n_persons, bmp_masks.shape[-2],
@@ -259,20 +249,25 @@ class Pose3DUpgradeNode:
 
         _logger.info(
             "Pose3DUpgrade: %d frames, %d persons (mask slots), %dx%d, "
-            "pose_fps=%.1f (src %.1f)",
-            B, n_persons, img_w, img_h, pose_fps, fps,
+            "pose_3d_fps=%.1f (src %.1f, stride=%d, sampled=%d)",
+            B, n_persons, img_w, img_h, pose_3d_fps, fps,
+            phmr_stride,
+            len(sampled_frames_list) if sampled_frames_list is not None else B,
         )
 
         # ---------------------------------------------------------------
-        # Phase 1: per-frame mask → bbox + pose_fps sampling
+        # Phase 1: per-frame mask → bbox; sampling schedule from bundle
         # ---------------------------------------------------------------
-        if pose_fps > 0 and pose_fps < fps:
-            phmr_stride = max(1, int(round(float(fps) / float(pose_fps))))
+        # The upstream BMPRTMWPose pre-computed phmr_stride + sampled_frames
+        # from its (fps, pose_3d_fps) settings. We just consume them — no
+        # local fps/stride logic anywhere in this node.
+        if sampled_frames_list is not None:
+            sampled_frames = set(int(t) for t in sampled_frames_list)
         else:
-            phmr_stride = 1
-        sampled_frames = set(range(0, B, phmr_stride))
-        if B > 0:
-            sampled_frames.add(B - 1)
+            # Defensive fallback: bundle came from a future/older
+            # producer that didn't ship sampled_frames. Treat as
+            # "every frame" so we degrade safely rather than crash.
+            sampled_frames = set(range(B))
 
         # Two structures:
         #   mask_bboxes_per_frame / person_indices_per_frame:

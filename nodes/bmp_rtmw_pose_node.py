@@ -814,9 +814,34 @@ class BMPRTMWPoseNode:
                         "max": 240.0,
                         "step": 1.0,
                         "tooltip": (
-                            "Output FPS metadata written into the POSES "
-                            "dict (used by Save NPZ / Pose Editor). "
-                            "Doesn't affect inference, only metadata."
+                            "Source video FPS metadata. Written into "
+                            "the POSES dict (used by Save NPZ / Pose "
+                            "Editor) and used together with "
+                            "pose_3d_fps to decide which frames the "
+                            "downstream Pose3DUpgrade node will run "
+                            "Fast SAM 3D Body on. Doesn't affect 2D "
+                            "inference (always per-frame)."
+                        ),
+                    },
+                ),
+                "pose_3d_fps": (
+                    "FLOAT",
+                    {
+                        "default": 15.0,
+                        "min": 1.0,
+                        "max": 120.0,
+                        "step": 0.5,
+                        "tooltip": (
+                            "Target FPS for downstream 3D inference "
+                            "(only matters when pose_bundle output is "
+                            "wired to Pose3DUpgrade). Frames are "
+                            "sampled every round(fps / pose_3d_fps); "
+                            "intermediate frames get linearly "
+                            "interpolated by the 3D node. Lower = "
+                            "faster 3D inference, jitterier 3D "
+                            "motion. No effect on 2D output. Set "
+                            "≥ fps to disable sampling (every frame "
+                            "runs 3D)."
                         ),
                     },
                 ),
@@ -917,13 +942,13 @@ class BMPRTMWPoseNode:
             },
         }
 
-    RETURN_TYPES = ("POSES", "IMAGE")
-    RETURN_NAMES = ("poses", "debug_overlay")
+    RETURN_TYPES = ("POSES", "IMAGE", "POSE_BUNDLE")
+    RETURN_NAMES = ("poses", "debug_overlay", "pose_bundle")
     FUNCTION = "run"
     CATEGORY = "4dhumans"
 
     def run(self, images, bmp_masks, rtmw,
-            score_threshold, fps,
+            score_threshold, fps, pose_3d_fps,
             ghost_oks_thresh, ghost_max_burst_frames,
             recovery_max_gap_frames, recovery_oks_thresh,
             debug_overlay,
@@ -943,7 +968,10 @@ class BMPRTMWPoseNode:
                 "BMPRTMWPose: no input frames or no masks; returning "
                 "empty POSES."
             )
-            return self._empty_output(images, fps, B, H, W, debug_overlay)
+            return self._empty_output(
+                images, bmp_masks, fps, pose_3d_fps,
+                B, H, W, debug_overlay,
+            )
         if total % B != 0:
             raise ValueError(
                 f"bmp_masks shape {tuple(bmp_masks.shape)} not divisible "
@@ -1765,6 +1793,37 @@ class BMPRTMWPoseNode:
             "offset":  [None] * B,
         }
 
+        # ---- Phase 4.5: build POSE_BUNDLE for downstream 3D --------------
+        # Pre-compute the 3D-sampling stride here so the downstream
+        # Pose3DUpgrade node doesn't need to know about fps at all. The
+        # bundle is the *single* contract between 2D (here) and 3D —
+        # changing one fps in the UI can never get out of sync with the
+        # other because there *is* no other.
+        if pose_3d_fps > 0 and pose_3d_fps < fps:
+            phmr_stride = max(1, int(round(float(fps) / float(pose_3d_fps))))
+        else:
+            phmr_stride = 1
+        if B > 0:
+            sampled_frames = sorted(
+                set(range(0, B, phmr_stride)) | {B - 1}
+            )
+        else:
+            sampled_frames = []
+
+        pose_bundle = {
+            "poses":          poses,
+            "bmp_masks":      bmp_masks,
+            "images":         images,
+            "fps":            float(fps),
+            "pose_3d_fps":    float(pose_3d_fps),
+            "phmr_stride":    int(phmr_stride),
+            "sampled_frames": sampled_frames,
+            "n_persons":      n_persons,
+            "n_frames":       B,
+            "img_h":          int(H),
+            "img_w":          int(W),
+        }
+
         elapsed = time.perf_counter() - t0
         _logger.info(
             "BMPRTMWPose: %d frames, %d tracks | RTMW %.2fs | "
@@ -1787,7 +1846,7 @@ class BMPRTMWPoseNode:
 
         # ---- Phase 5: debug overlay ---------------------------------------
         if not debug_overlay:
-            return (poses, images)
+            return (poses, images, pose_bundle)
 
         per_frame_items = [
             [(p, pack_mask(masks_bool[t, p])) for p in range(n_persons)
@@ -1825,10 +1884,11 @@ class BMPRTMWPoseNode:
                 _draw_hands(arr[t], kp, conf_thresh=ct)
 
         out_overlay = torch.from_numpy(arr.astype(np.float32) / 255.0)
-        return (poses, out_overlay)
+        return (poses, out_overlay, pose_bundle)
 
     @staticmethod
-    def _empty_output(images, fps, B, H, W, debug_overlay):
+    def _empty_output(images, bmp_masks, fps, pose_3d_fps,
+                      B, H, W, debug_overlay):
         empty_poses = {
             "n_persons": 0,
             "n_frames":  B,
@@ -1840,4 +1900,17 @@ class BMPRTMWPoseNode:
             "scale":     [None] * B,
             "offset":    [None] * B,
         }
-        return (empty_poses, images)
+        empty_bundle = {
+            "poses":          empty_poses,
+            "bmp_masks":      bmp_masks,
+            "images":         images,
+            "fps":            float(fps),
+            "pose_3d_fps":    float(pose_3d_fps),
+            "phmr_stride":    1,
+            "sampled_frames": list(range(B)),
+            "n_persons":      0,
+            "n_frames":       B,
+            "img_h":          int(H),
+            "img_w":          int(W),
+        }
+        return (empty_poses, images, empty_bundle)
