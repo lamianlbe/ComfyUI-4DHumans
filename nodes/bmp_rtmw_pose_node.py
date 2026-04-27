@@ -1017,12 +1017,38 @@ class BMPRTMWPoseNode:
             pbar.update(1)
         rtmw_time = time.perf_counter() - rtmw_t
 
-        # ---- Phase 2.5: optional BMP body override (0..16) ----------------
-        # When the user wires in BMPInstanceSegmentation's `bmp_pose` we
-        # replace RTMW's body section with BMP's track-aligned 17-pt
-        # output. BMP's mask-conditioned PMPose is OCHuman-SOTA whereas
-        # RTMW-x is a generic WholeBody estimator — for occluded /
-        # tightly-overlapping POV scenes BMP's body wins.
+        # Per-(slot, frame) body source tracking. None means body 0..16
+        # is still RTMW's output (which we DON'T want in the final
+        # POSES dict — pipeline policy: body never comes from RTMW).
+        # After Phase 2.5/2.7 finish, Phase 2.8 nulls every (p, t)
+        # whose body_source is still None — entire kp133 set to None
+        # so nothing leaks.
+        body_source: List[List[Optional[str]]] = [
+            [None] * B for _ in range(n_persons)
+        ]
+
+        # Sanity gate: at least ONE body source must be wired up.
+        # Otherwise the entire output is empty (per the policy above).
+        if bmp_pose is None and vitpose is None:
+            _logger.warning(
+                "BMPRTMWPose: neither bmp_pose nor vitpose connected. "
+                "By design this pipeline never uses RTMW's body output, "
+                "so the result will have NO body keypoints (and feet "
+                "/ hands tied to body — entire (slot, frame) entries "
+                "will be NULL). Connect at least one of bmp_pose or "
+                "vitpose."
+            )
+
+        # ---- Phase 2.5: BMP body source (0..16) --------------------------
+        # When BMPInstanceSegmentation provides track-aligned 17-pt
+        # output for a (slot, frame), claim body for it. This is the
+        # PRIMARY body source when bmp_pose is connected.
+        #
+        # Trigger: BMP detection exists for this (p, t) — i.e.
+        # ``track_aligned[p][t]`` is not None. We don't gate on
+        # confidence: BMP's tracker only emits a non-None entry when
+        # it actually has a detection, so existence == "BMP saw a
+        # person here".
         body_override_count = 0
         if bmp_pose is not None:
             track_aligned = bmp_pose.get("_track_aligned_kpts", None)
@@ -1034,9 +1060,6 @@ class BMPRTMWPoseNode:
                     "with the latest node code or skip the bmp_pose input."
                 )
             else:
-                # BMP and our slot count must match — both come from the
-                # same IoU-tracked persons via the same MASK output, so
-                # they index the same N_total tracks.
                 bmp_n = len(track_aligned)
                 if bmp_n != n_persons:
                     _logger.warning(
@@ -1056,31 +1079,31 @@ class BMPRTMWPoseNode:
                             # BMP keypoints are (17, 3) with PMPose scores
                             # already in [0, 1]. Direct slot replacement.
                             kp133[0:17] = kp17.astype(np.float32)
+                            body_source[p_idx][t] = "bmp"
                             body_override_count += 1
 
-        # ---- Phase 2.7: optional ViTPose fallback ------------------------
-        # When BMP's mask-conditioned PMPose fails entirely on extreme
-        # scenes (heavy motion blur, very dark, atypical poses) AND
-        # mmpose RTMW also struggles, ViTPose's plain ViT-H backbone
-        # empirically still produces usable skeletons.
-        #
-        # Trigger condition: body 0..16 max-confidence below
-        # score_threshold (i.e. neither RTMW nor BMP body produced
-        # anything trustworthy for this slot/frame).
+        # ---- Phase 2.7: ViTPose fallback (body + feet + maybe hands) -----
+        # Trigger: any (slot, frame) whose body_source is still None
+        # (i.e. BMP wasn't connected, OR BMP didn't detect this person
+        # this frame). ViTPose tries; if it can produce a confident
+        # body it claims body_source = "vit" and ALSO fills feet+hands.
         #
         # Slice ownership when fallback fires:
-        #   0..16   body  ← ViTPose                  (always)
-        #   17..22  feet  ← ViTPose                  (always, if K>=23)
-        #   23..90  face  ← UNCHANGED                (FaRL Phase 2.6 or
-        #                                              RTMW base wins)
-        #   91..132 hands ← ViTPose                  (only if WiLoR not
-        #                                              connected; otherwise
-        #                                              WiLoR Phase 3
-        #                                              overrides anyway)
+        #   0..16   body  ← ViTPose
+        #   17..22  feet  ← ViTPose                 (if K >= 23)
+        #   23..90  face  ← UNCHANGED — FaRL Phase 2.6 or RTMW base
+        #   91..132 hands ← ViTPose                 (only if WiLoR not
+        #                                              connected; else
+        #                                              Phase 3 will own it)
         #
-        # If the loaded ViTPose variant is body-only (K=17 ONNX or
-        # ViTPose-simple HF), only body 0..16 gets filled — feet/hands
-        # ranges stay with their existing source.
+        # ViTPose body-only models (K=17) fill only body — feet/hands
+        # stay at None for this (p, t) and Phase 2.8 cleans them up.
+        # Wholebody models (K=133) give us enough to fully populate
+        # the slot when WiLoR isn't around.
+        #
+        # Sanity gate: ViTPose must have body max-conf >= score_threshold;
+        # otherwise leave body_source as None (Phase 2.8 will null
+        # the entire (p, t)).
         vitpose_fallback_count = 0
         vitpose_feet_filled    = 0
         vitpose_hands_filled   = 0
@@ -1089,28 +1112,28 @@ class BMPRTMWPoseNode:
             backend = vitpose.get("backend", "hf")
             wilor_will_override = wilor is not None
             _logger.info(
-                "ViTPose fallback enabled (backend=%s). Triggers when "
-                "body max-conf < %.2f. Slice ownership: body+feet from "
-                "ViTPose, face stays with FaRL/RTMW, hands from %s.",
-                backend, float(score_threshold),
+                "ViTPose fallback enabled (backend=%s). Fires for "
+                "(slot, frame) pairs without a BMP detection. Slice "
+                "ownership: body+feet from ViTPose, face stays with "
+                "FaRL/RTMW, hands from %s.",
+                backend,
                 "WiLoR (Phase 3 override)" if wilor_will_override
                 else "ViTPose",
             )
             vt_t = time.perf_counter()
 
-            # Group fallback requests by frame. Each group → ONE
-            # ViTPose forward over all that frame's fallback bboxes.
+            # Group fallback requests by frame so each ViTPose forward
+            # runs all that frame's missing-body bboxes in one shot.
             requests_by_frame: Dict[int, List[Tuple[int, np.ndarray]]] = (
                 defaultdict(list)
             )
             for t in range(B):
                 for p in range(n_persons):
+                    if body_source[p][t] is not None:
+                        continue   # Already claimed by BMP
                     kp133 = persons_133[p][t]
                     if kp133 is None:
                         continue
-                    body_max = float(kp133[:17, 2].max())
-                    if body_max >= float(score_threshold):
-                        continue  # body OK from RTMW / BMP, no fallback
                     bb = bbox_per_frame[t][p]
                     if bb is None:
                         continue
@@ -1120,9 +1143,9 @@ class BMPRTMWPoseNode:
                 slots = [pair[0] for pair in slot_bbox_pairs]
                 bboxes_for_vt = [pair[1] for pair in slot_bbox_pairs]
 
-                # _run_vitpose_batch returns (N, K, 3) where K matches
-                # the loaded model's keypoint count (17 body-only or
-                # 133 wholebody).
+                # _run_vitpose_batch returns (N, K, 3); K is the
+                # loaded model's keypoint count (17 body-only or 133
+                # wholebody).
                 vt_out = _run_vitpose_batch(
                     vitpose, rgb_u8[t], bboxes_for_vt,
                 )
@@ -1141,25 +1164,25 @@ class BMPRTMWPoseNode:
                     new_kp = vt_out[i].astype(np.float32)
                     body_new = new_kp[:17]
                     body_new_max = float(body_new[:, 2].max())
-                    # Sanity gate: ViTPose itself must clear threshold.
-                    # If even ViTPose can't see a body, don't overwrite
-                    # whatever was there (might be marginal RTMW data).
+                    # Sanity gate: ViTPose's own body confidence must
+                    # clear threshold. If it can't see a body either,
+                    # body_source stays None → Phase 2.8 nulls the
+                    # entire (p, t).
                     if body_new_max < float(score_threshold):
                         continue
 
-                    # 1. Body 0..16 — always
+                    # Body 0..16
                     kp133[0:17] = body_new
+                    body_source[p_idx][t] = "vit"
                     vitpose_fallback_count += 1
 
-                    # 2. Feet 17..22 — only if model output has them
+                    # Feet 17..22
                     if has_feet:
                         kp133[17:23] = new_kp[17:23]
                         vitpose_feet_filled += 1
 
-                    # 3. Hands 91..132 — only if model output has them
-                    #    AND WiLoR is NOT connected (else WiLoR's
-                    #    Phase 3 override will take precedence; writing
-                    #    here is wasted work).
+                    # Hands 91..132 — only when WiLoR won't override
+                    # (saves a copy; otherwise Phase 3 takes over).
                     if has_hands and not wilor_will_override:
                         kp133[91:133] = new_kp[91:133]
                         vitpose_hands_filled += 1
@@ -1167,6 +1190,25 @@ class BMPRTMWPoseNode:
             vitpose_time = time.perf_counter() - vt_t
         else:
             vitpose_time = 0.0
+
+        # ---- Phase 2.8: clear unsourced bodies (RTMW body never leaks) ---
+        # Per pipeline policy, body keypoints must come from BMP or
+        # ViTPose. Any (slot, frame) still using RTMW's body output
+        # gets the entire kp133 nulled — feet/hands tied to body
+        # presence, so the whole entry is meaningless without a real
+        # body source.
+        cleared_no_body = 0
+        for p in range(n_persons):
+            for t in range(B):
+                if body_source[p][t] is None and persons_133[p][t] is not None:
+                    persons_133[p][t] = None
+                    cleared_no_body += 1
+        if cleared_no_body > 0:
+            _logger.info(
+                "Cleared %d (slot, frame) pairs with no body source "
+                "(RTMW body never leaks per pipeline policy).",
+                cleared_no_body,
+            )
 
         # ---- Phase 2.6: optional FaRL face override (23..90) -------------
         # When farl_face is connected, regenerate the face slice using
@@ -1680,14 +1722,15 @@ class BMPRTMWPoseNode:
         elapsed = time.perf_counter() - t0
         _logger.info(
             "BMPRTMWPose: %d frames, %d tracks | RTMW %.2fs | "
-            "BMP body overrides: %d | ViTPose fallback %.2fs (%d "
-            "applied) | FaRL face %.2fs (%d overrides) | "
-            "WiLoR %.2fs (%d hand overrides) | "
-            "ghost suppression: %d bursts (%d frames nulled, "
-            "%d slot swaps) | track recovery: %d merges | total %.2fs",
+            "BMP body: %d | ViTPose %.2fs (body=%d feet=%d hands=%d) "
+            "| cleared %d no-body slots | FaRL face %.2fs (%d) | "
+            "WiLoR %.2fs (%d) | ghost: %d bursts (%d nulled, %d "
+            "swaps) | recovery: %d merges | total %.2fs",
             B, n_persons, rtmw_time,
             body_override_count,
             vitpose_time, vitpose_fallback_count,
+            vitpose_feet_filled, vitpose_hands_filled,
+            cleared_no_body,
             farl_time, farl_override_count,
             wilor_time, wilor_overrides_count,
             ghosts_suppressed_bursts, ghosts_suppressed_frames,
