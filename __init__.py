@@ -39,6 +39,7 @@ from .nodes.load_wilor_node import LoadWiLoRNode
 from .nodes.load_vitpose_node import LoadViTPoseNode
 from .nodes.load_vitpose_onnx_node import LoadViTPoseONNXNode
 from .nodes.bmp_rtmw_pose_node import BMPRTMWPoseNode
+from .nodes.pose_3d_upgrade_node import Pose3DUpgradeNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -74,6 +75,7 @@ NODE_CLASS_MAPPINGS = {
     'LoadViTPose': LoadViTPoseNode,
     'LoadViTPoseONNX': LoadViTPoseONNXNode,
     'BMPRTMWPose': BMPRTMWPoseNode,
+    'Pose3DUpgrade': Pose3DUpgradeNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -109,4 +111,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'LoadViTPose': 'Load ViTPose (HF transformers, body fallback)',
     'LoadViTPoseONNX': 'Load ViTPose ONNX (onnxruntime, body fallback)',
     'BMPRTMWPose': 'BMP + RTMW-x + WiLoR Pose (133-keypoint)',
+    'Pose3DUpgrade': 'Pose 3D Upgrade (Fast SAM 3D Body merge)',
 }
