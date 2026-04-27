@@ -36,6 +36,8 @@ from .nodes.load_sapiens2_node import LoadSapiens2Node
 from .nodes.sapiens2_pose_node import Sapiens2InstancePoseNode
 from .nodes.load_rtmw_node import LoadRTMWNode
 from .nodes.load_wilor_node import LoadWiLoRNode
+from .nodes.load_vitpose_node import LoadViTPoseNode
+from .nodes.load_vitpose_onnx_node import LoadViTPoseONNXNode
 from .nodes.bmp_rtmw_pose_node import BMPRTMWPoseNode
 
 
@@ -69,6 +71,8 @@ NODE_CLASS_MAPPINGS = {
     'Sapiens2InstancePose': Sapiens2InstancePoseNode,
     'LoadRTMW': LoadRTMWNode,
     'LoadWiLoR': LoadWiLoRNode,
+    'LoadViTPose': LoadViTPoseNode,
+    'LoadViTPoseONNX': LoadViTPoseONNXNode,
     'BMPRTMWPose': BMPRTMWPoseNode,
 }
 
@@ -102,5 +106,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'Sapiens2InstancePose': 'Sapiens2 Instance Pose (SAM3 + iterate)',
     'LoadRTMW': 'Load RTMW-x (WholeBody 133-keypoint)',
     'LoadWiLoR': 'Load WiLoR (high-quality hand pose)',
+    'LoadViTPose': 'Load ViTPose (HF transformers, body fallback)',
+    'LoadViTPoseONNX': 'Load ViTPose ONNX (onnxruntime, body fallback)',
     'BMPRTMWPose': 'BMP + RTMW-x + WiLoR Pose (133-keypoint)',
 }

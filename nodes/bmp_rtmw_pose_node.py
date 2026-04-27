@@ -186,6 +186,224 @@ def _project_full_img(points_3d: np.ndarray, cam_t: np.ndarray,
     return pts2d[..., :2].astype(np.float32)
 
 
+# --------------------------------------------------------------------------
+# ViTPose fallback (two backends: HF transformers + ONNX)
+# --------------------------------------------------------------------------
+#
+# Both backends produce the same ``(N, 17, 3)`` output (body 0..16) so
+# BMPRTMWPose's fallback path is backend-agnostic. ``vitpose["backend"]``
+# selects which path to run. The HF backend uses transformers'
+# VitPoseImageProcessor + post_process_pose_estimation. The ONNX
+# backend rolls its own top-down affine + heatmap decode.
+
+# ImageNet normalisation, used by both backends. Values match mmpose
+# ViTPose default and HF transformers VitPoseImageProcessor default.
+_VITPOSE_MEAN_RGB = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_VITPOSE_STD_RGB  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _topdown_affine(image_rgb: np.ndarray, bbox_xyxy: np.ndarray,
+                     input_h: int, input_w: int,
+                     padding: float = 1.25):
+    """Crop+resize to (input_h, input_w) keeping bbox aspect-aligned.
+
+    Returns:
+        crop:  (input_h, input_w, 3) uint8 RGB
+        M_inv: (2, 3) affine matrix mapping crop coords → image coords
+    """
+    import cv2 as _cv2
+
+    x1, y1, x2, y2 = bbox_xyxy
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+
+    # Match input aspect ratio by inflating the shorter side.
+    aspect = float(input_w) / float(input_h)
+    if bw > bh * aspect:
+        bh = bw / aspect
+    else:
+        bw = bh * aspect
+    bw *= padding
+    bh *= padding
+
+    # Build affine via 3-point correspondence (mmpose convention).
+    src = np.array([
+        [cx,            cy],
+        [cx,            cy + bh * 0.5],
+        [cx + bw * 0.5, cy],
+    ], dtype=np.float32)
+    dst = np.array([
+        [input_w * 0.5, input_h * 0.5],
+        [input_w * 0.5, input_h],
+        [input_w,       input_h * 0.5],
+    ], dtype=np.float32)
+    M     = _cv2.getAffineTransform(src, dst)
+    M_inv = _cv2.getAffineTransform(dst, src)
+
+    crop = _cv2.warpAffine(
+        image_rgb, M, (input_w, input_h), flags=_cv2.INTER_LINEAR,
+    )
+    return crop, M_inv
+
+
+def _run_vitpose_onnx_batch(
+    vitpose_dict: dict,
+    img_rgb: np.ndarray,
+    bboxes_xyxy: List[np.ndarray],
+) -> Optional[np.ndarray]:
+    """ONNX backend. Top-down affine crop → ImageNet normalise →
+    onnxruntime → heatmap argmax decode → inverse affine. Returns
+    ``(N, 17, 3)``."""
+    if not bboxes_xyxy:
+        return None
+
+    session    = vitpose_dict["session"]
+    input_name = vitpose_dict["input_name"]
+    input_h    = vitpose_dict["input_h"]
+    input_w    = vitpose_dict["input_w"]
+    num_kpts   = vitpose_dict["num_kpts"]
+
+    # Per-bbox top-down affine
+    crops = []
+    inv_mats = []
+    for bb in bboxes_xyxy:
+        crop, M_inv = _topdown_affine(img_rgb, bb, input_h, input_w)
+        crops.append(crop)
+        inv_mats.append(M_inv)
+    crops_arr = np.stack(crops, axis=0).astype(np.float32) / 255.0  # (N, H, W, 3) [0,1] RGB
+    crops_arr = (crops_arr - _VITPOSE_MEAN_RGB) / _VITPOSE_STD_RGB
+    crops_arr = crops_arr.transpose(0, 3, 1, 2).astype(np.float32)   # (N, 3, H, W)
+
+    try:
+        outputs = session.run(None, {input_name: crops_arr})
+    except Exception as e:
+        _logger.error(
+            "ViTPose ONNX inference failed (%d boxes): %s",
+            len(bboxes_xyxy), e,
+        )
+        return None
+
+    heatmaps = outputs[0]  # (N, K, hm_h, hm_w)
+    if heatmaps.ndim != 4:
+        _logger.warning(
+            "ViTPose ONNX unexpected output shape %s — expected "
+            "(N, K, h, w). Skipping batch.", heatmaps.shape,
+        )
+        return None
+
+    N, K, hm_h, hm_w = heatmaps.shape
+    flat = heatmaps.reshape(N, K, -1)
+    idx = flat.argmax(axis=-1)
+    y_hm = (idx // hm_w).astype(np.float32)
+    x_hm = (idx %  hm_w).astype(np.float32)
+    scores = flat.max(axis=-1)
+
+    # Heatmap → input crop space
+    sx = float(input_w) / float(hm_w)
+    sy = float(input_h) / float(hm_h)
+    x_in = x_hm * sx
+    y_in = y_hm * sy
+
+    # Take only body keypoints 0..16 — fallback only contributes there.
+    use_K = min(17, K)
+    out = np.zeros((N, 17, 3), dtype=np.float32)
+    for n in range(N):
+        M_inv = inv_mats[n]
+        for k in range(use_K):
+            xc, yc = x_in[n, k], y_in[n, k]
+            x_orig = M_inv[0, 0] * xc + M_inv[0, 1] * yc + M_inv[0, 2]
+            y_orig = M_inv[1, 0] * xc + M_inv[1, 1] * yc + M_inv[1, 2]
+            out[n, k, 0] = x_orig
+            out[n, k, 1] = y_orig
+            out[n, k, 2] = scores[n, k]
+    return out
+
+
+def _run_vitpose_hf_batch(
+    vitpose_dict: dict,
+    img_rgb: np.ndarray,
+    bboxes_xyxy: List[np.ndarray],
+) -> Optional[np.ndarray]:
+    """HF transformers backend. Uses VitPoseImageProcessor's built-in
+    pre/post processing."""
+    if not bboxes_xyxy:
+        return None
+
+    from PIL import Image as _PIL
+
+    model      = vitpose_dict["model"]
+    processor  = vitpose_dict["processor"]
+    device     = vitpose_dict["device"]
+    is_plus    = vitpose_dict["is_plus"]
+    torch_dtype = vitpose_dict.get("torch_dtype", torch.float32)
+
+    # xyxy → xywh per ViTPose's processor convention.
+    boxes_xywh = []
+    for bb in bboxes_xyxy:
+        x1, y1, x2, y2 = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+        boxes_xywh.append([x1, y1, max(1.0, x2 - x1), max(1.0, y2 - y1)])
+
+    pil_img = _PIL.fromarray(img_rgb)
+
+    try:
+        inputs = processor(
+            pil_img, boxes=[boxes_xywh], return_tensors="pt",
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        if torch_dtype != torch.float32 and "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(dtype=torch_dtype)
+
+        with torch.inference_mode():
+            forward_kwargs = dict(inputs)
+            if is_plus:
+                forward_kwargs["dataset_index"] = torch.tensor(
+                    [0] * len(boxes_xywh), device=device,
+                )
+            outputs = model(**forward_kwargs)
+
+        results = processor.post_process_pose_estimation(
+            outputs, boxes=[boxes_xywh],
+        )
+        per_person = results[0]
+    except Exception as e:
+        _logger.error(
+            "ViTPose HF batch failed (%d boxes): %s", len(boxes_xywh), e,
+        )
+        return None
+
+    if len(per_person) != len(boxes_xywh):
+        _logger.warning(
+            "ViTPose HF returned %d results for %d boxes — alignment "
+            "broken, skipping batch.",
+            len(per_person), len(boxes_xywh),
+        )
+        return None
+
+    out = np.zeros((len(per_person), 17, 3), dtype=np.float32)
+    for i, person in enumerate(per_person):
+        kp = np.asarray(person["keypoints"], dtype=np.float32)
+        sc = np.asarray(person["scores"],    dtype=np.float32)
+        n_kp = min(17, kp.shape[0])
+        out[i, :n_kp, 0] = kp[:n_kp, 0]
+        out[i, :n_kp, 1] = kp[:n_kp, 1]
+        out[i, :n_kp, 2] = sc[:n_kp]
+    return out
+
+
+def _run_vitpose_batch(
+    vitpose_dict: dict,
+    img_rgb: np.ndarray,
+    bboxes_xyxy: List[np.ndarray],
+) -> Optional[np.ndarray]:
+    """Backend-dispatching wrapper. Returns ``(N, 17, 3)`` or None."""
+    backend = vitpose_dict.get("backend", "hf")
+    if backend == "onnx":
+        return _run_vitpose_onnx_batch(vitpose_dict, img_rgb, bboxes_xyxy)
+    return _run_vitpose_hf_batch(vitpose_dict, img_rgb, bboxes_xyxy)
+
+
 def _run_wilor_one_frame(
     wilor_dict: dict,
     img_bgr: np.ndarray,
@@ -684,6 +902,7 @@ class BMPRTMWPoseNode:
                 "bmp_pose":  ("YOLO11POSE",),
                 "farl_face": ("FARLFACE",),
                 "wilor":     ("WILOR",),
+                "vitpose":   ("VITPOSE",),
             },
         }
 
@@ -697,7 +916,7 @@ class BMPRTMWPoseNode:
             ghost_oks_thresh, ghost_max_burst_frames,
             recovery_max_gap_frames, recovery_oks_thresh,
             debug_overlay,
-            bmp_pose=None, farl_face=None, wilor=None):
+            bmp_pose=None, farl_face=None, wilor=None, vitpose=None):
         from mmpose.apis import inference_topdown
 
         rtmw_model = rtmw["model"]
@@ -827,6 +1046,83 @@ class BMPRTMWPoseNode:
                             # already in [0, 1]. Direct slot replacement.
                             kp133[0:17] = kp17.astype(np.float32)
                             body_override_count += 1
+
+        # ---- Phase 2.7: optional ViTPose body fallback (0..16) ------------
+        # In extreme scenes (heavy motion blur, very dark, atypical
+        # poses) BMP's mask-conditioned PMPose can fail entirely while
+        # mmpose RTMW also struggles. ViTPose has no mask conditioning
+        # and uses a plain ViT-H backbone, which empirically still
+        # produces usable body skeletons in those edge cases.
+        #
+        # Only fires when the body section's MAX confidence across
+        # 0..16 is below score_threshold (i.e. neither RTMW nor BMP
+        # produced anything trustworthy). Fallback inputs:
+        #   * full RGB frame
+        #   * person bbox derived from the BMP mask (already computed
+        #     for Phase 2 above as ``bbox_per_frame[t][p]``)
+        # Fallback batches all (frame, slot) requests grouped by
+        # frame so a single ViTPose forward handles every fallback
+        # bbox in the same image.
+        vitpose_fallback_count = 0
+        if vitpose is not None:
+            from collections import defaultdict
+            backend = vitpose.get("backend", "hf")
+            _logger.info(
+                "ViTPose fallback enabled (backend=%s). Will fire only "
+                "for (slot, frame) pairs where body max-confidence "
+                "< score_threshold (%.2f).",
+                backend, float(score_threshold),
+            )
+            vt_t = time.perf_counter()
+
+            # Group fallback requests by frame. Each group gets ONE
+            # ViTPose forward (top-down accepts a list of bboxes per
+            # image).
+            requests_by_frame: Dict[int, List[Tuple[int, np.ndarray]]] = (
+                defaultdict(list)
+            )
+            for t in range(B):
+                for p in range(n_persons):
+                    kp133 = persons_133[p][t]
+                    if kp133 is None:
+                        continue
+                    body_max = float(kp133[:17, 2].max())
+                    if body_max >= float(score_threshold):
+                        continue  # body OK from RTMW / BMP, no fallback
+                    bb = bbox_per_frame[t][p]
+                    if bb is None:
+                        continue
+                    requests_by_frame[t].append((p, bb))
+
+            for t, slot_bbox_pairs in requests_by_frame.items():
+                slots = [pair[0] for pair in slot_bbox_pairs]
+                bboxes_for_vt = [pair[1] for pair in slot_bbox_pairs]
+
+                # ViTPose backends both expect RGB image input.
+                vt_kp17 = _run_vitpose_batch(
+                    vitpose, rgb_u8[t], bboxes_for_vt,
+                )
+                if vt_kp17 is None:
+                    continue
+
+                for i, p_idx in enumerate(slots):
+                    kp133 = persons_133[p_idx][t]
+                    if kp133 is None:
+                        continue
+                    new_body = vt_kp17[i].astype(np.float32)
+                    new_max = float(new_body[:, 2].max())
+                    # Sanity gate: ViTPose's own confidence must clear
+                    # the threshold too — if even ViTPose can't see a
+                    # body in this crop, leave the existing kp133 alone
+                    # (don't overwrite usable RTMW output with garbage).
+                    if new_max < float(score_threshold):
+                        continue
+                    kp133[0:17] = new_body
+                    vitpose_fallback_count += 1
+
+            vitpose_time = time.perf_counter() - vt_t
+        else:
+            vitpose_time = 0.0
 
         # ---- Phase 2.6: optional FaRL face override (23..90) -------------
         # When farl_face is connected, regenerate the face slice using
@@ -1340,12 +1636,14 @@ class BMPRTMWPoseNode:
         elapsed = time.perf_counter() - t0
         _logger.info(
             "BMPRTMWPose: %d frames, %d tracks | RTMW %.2fs | "
-            "BMP body overrides: %d | FaRL face %.2fs (%d overrides) | "
+            "BMP body overrides: %d | ViTPose fallback %.2fs (%d "
+            "applied) | FaRL face %.2fs (%d overrides) | "
             "WiLoR %.2fs (%d hand overrides) | "
             "ghost suppression: %d bursts (%d frames nulled, "
             "%d slot swaps) | track recovery: %d merges | total %.2fs",
             B, n_persons, rtmw_time,
             body_override_count,
+            vitpose_time, vitpose_fallback_count,
             farl_time, farl_override_count,
             wilor_time, wilor_overrides_count,
             ghosts_suppressed_bursts, ghosts_suppressed_frames,
