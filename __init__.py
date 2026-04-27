@@ -41,6 +41,7 @@ from .nodes.load_vitpose_onnx_node import LoadViTPoseONNXNode
 from .nodes.bmp_rtmw_pose_node import BMPRTMWPoseNode
 from .nodes.pose_3d_upgrade_node import Pose3DUpgradeNode
 from .nodes.pose_3d_upgrade_nlf_node import Pose3DUpgradeNLFNode
+from .nodes.frame_rate_capper_node import FrameRateCapperNode
 
 
 NODE_CLASS_MAPPINGS = {
@@ -78,6 +79,7 @@ NODE_CLASS_MAPPINGS = {
     'BMPRTMWPose': BMPRTMWPoseNode,
     'Pose3DUpgrade': Pose3DUpgradeNode,
     'Pose3DUpgradeNLF': Pose3DUpgradeNLFNode,
+    'FrameRateCapper': FrameRateCapperNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -115,4 +117,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'BMPRTMWPose': 'BMP + RTMW-x + WiLoR Pose (133-keypoint)',
     'Pose3DUpgrade': 'Pose 3D Upgrade (Fast SAM 3D Body merge)',
     'Pose3DUpgradeNLF': 'Pose 3D Upgrade (NLF merge)',
+    'FrameRateCapper': 'Frame Rate Capper',
 }
