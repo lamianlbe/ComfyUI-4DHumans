@@ -1,46 +1,51 @@
 """
 BMPRTMWPose — composite 2D pose pipeline.
 
+Layout decisions (each part of COCO-WB 133 sources from its strongest model):
+
+    0..16    body  ← BMP   (mask-conditioned PMPose, OCHuman-SOTA)
+    17..22   feet  ← RTMW-x (cocktail-14 trained, decent feet)
+    23..90   face  ← FaRL  (per-person via BMP head 5pt → synthesised
+                            RetinaFace 5pt → FaRL face_aligner)
+    91..132  hands ← RTMW-x default; WiLoR override when connected
+
+Each upgrade path is optional (degrades gracefully to RTMW for that
+section) so the same node serves "all best models" and "RTMW-only
+baseline" workflows without graph rewiring.
+
 Inputs:
     images       : (B, H, W, 3) float in [0, 1], RGB
-    bmp_masks    : (B*N_total, H, W) float — frame-grouped per-tracked-person
+    bmp_masks    : (B*N_total, H, W) — frame-grouped per-tracked-person
                    masks from BMPInstanceSegmentation
     rtmw         : RTMW dict from LoadRTMWNode (133-keypoint base estimator)
-    wilor (opt)  : WILOR dict from LoadWiLoRNode — when connected, overrides
-                   the hand portion (91..132) of every person's COCO-WB
-                   output with WiLoR's MANO-projected 21-point hands
+
+Optional:
+    bmp_pose     : YOLO11POSE-shaped dict from BMPInstanceSegmentation
+                   — when connected, body 0..16 comes from BMP's track-
+                   aligned 17-pt instead of RTMW's body slice.
+    farl_face    : FARLFACE dict from LoadFaRLFace — when connected,
+                   face 23..90 is regenerated per-person by feeding
+                   BMP head keypoints into FaRL's face_aligner. NOT
+                   based on RetinaFace+mask matching (which fails in
+                   tightly overlapping multi-person scenes).
+    wilor        : WILOR dict from LoadWiLoR — when connected, hands
+                   91..132 get replaced with WiLoR's MANO-projected
+                   21-point hands. Match each WiLoR-detected hand to
+                   the closest BMP-tracked wrist; greedy 1-to-1.
 
 Output:
     poses           : POSES dict (NPZ-compatible 133-keypoint COCO-WB layout)
     debug_overlay   : (B, H, W, 3) float — color-coded mask + skeleton
                       visualization for sanity-checking
 
-Pipeline per frame:
-    1. From bmp_masks, derive per-person mask + bbox (the BMP node already
-       did the cross-frame tracking for us; we just consume its layout).
-    2. Run RTMW-x ``inference_topdown`` with all per-person bboxes ➔ each
-       person gets a (133, 2) keypoint + (133,) score array.
-    3. Pack into the 133-layout COCO-WB slot directly (RTMW's output
-       order matches COCO-WB, no remapping needed).
-    4. (optional) Run WiLoR's hand detector on the whole image, project
-       its 3D joints to 2D, and match each hand to a BMP-tracked person
-       by wrist-proximity. Replace 91..111 (left) / 112..132 (right) of
-       that person's keypoints with WiLoR's 21 points.
-
-Score handling: RTMW's SimCC head returns TWO score channels (when
-the codec has ``decode_visibility=True``, which our vendored RTMW-x
-configs do). The first is ``keypoint_scores`` — the raw min(max
-simcc_x, max simcc_y) which is unnormalised (typically 0.2 - 3+).
-The second is ``keypoints_visible`` — the same peaks but with
-``simcc * decode_beta * sigma`` followed by softmax, giving a clean
-[0, 1] probability. mmpose's base_head exposes both via
-``pred_instances.keypoint_scores`` and ``pred_instances.keypoints_
-visible`` respectively.
-
-We prefer ``keypoints_visible`` when present (clean [0, 1] semantics,
-matches what PoseRenderer / Pose Editor / Save NPZ expect), and fall
-back to ``clip(keypoint_scores, 0, 3) / 3`` only if a future RTMW
-variant ships with ``decode_visibility=False``.
+Score handling: RTMW's SimCC head returns TWO score channels when the
+codec has ``decode_visibility=True`` (our vendored RTMW-x configs do).
+The first is ``keypoint_scores`` — raw ``min(max simcc_x, max simcc_y)``
+unnormalised (typically 0.2 - 3+). The second is ``keypoints_visible``
+— same peaks with ``simcc * decode_beta * sigma`` then softmax, giving
+a clean [0, 1] probability. We prefer ``keypoints_visible`` when
+available, falling back to ``clip(keypoint_scores, 0, 3) / 3`` only if
+a future variant ships with ``decode_visibility=False``.
 """
 
 import logging
@@ -53,6 +58,7 @@ import torch
 
 import comfy.utils
 
+from ._farl_face_inference import run_farl_face_per_person
 from ._mask_utils import _DEBUG_PALETTE_RGB, build_debug_overlay, pack_mask, unpack_mask
 
 _logger = logging.getLogger(__name__)
@@ -446,7 +452,9 @@ class BMPRTMWPoseNode:
                 ),
             },
             "optional": {
-                "wilor": ("WILOR",),
+                "bmp_pose":  ("YOLO11POSE",),
+                "farl_face": ("FARLFACE",),
+                "wilor":     ("WILOR",),
             },
         }
 
@@ -457,7 +465,7 @@ class BMPRTMWPoseNode:
 
     def run(self, images, bmp_masks, rtmw,
             score_threshold, fps, debug_overlay,
-            wilor=None):
+            bmp_pose=None, farl_face=None, wilor=None):
         from mmpose.apis import inference_topdown
 
         rtmw_model = rtmw["model"]
@@ -547,6 +555,110 @@ class BMPRTMWPoseNode:
             pbar.update(1)
         rtmw_time = time.perf_counter() - rtmw_t
 
+        # ---- Phase 2.5: optional BMP body override (0..16) ----------------
+        # When the user wires in BMPInstanceSegmentation's `bmp_pose` we
+        # replace RTMW's body section with BMP's track-aligned 17-pt
+        # output. BMP's mask-conditioned PMPose is OCHuman-SOTA whereas
+        # RTMW-x is a generic WholeBody estimator — for occluded /
+        # tightly-overlapping POV scenes BMP's body wins.
+        body_override_count = 0
+        if bmp_pose is not None:
+            track_aligned = bmp_pose.get("_track_aligned_kpts", None)
+            if track_aligned is None:
+                _logger.warning(
+                    "BMPRTMWPose: bmp_pose was connected but the dict "
+                    "doesn't carry '_track_aligned_kpts' — that field "
+                    "was added 2026-04-27. Re-run BMPInstanceSegmentation "
+                    "with the latest node code or skip the bmp_pose input."
+                )
+            else:
+                # BMP and our slot count must match — both come from the
+                # same IoU-tracked persons via the same MASK output, so
+                # they index the same N_total tracks.
+                bmp_n = len(track_aligned)
+                if bmp_n != n_persons:
+                    _logger.warning(
+                        "BMPRTMWPose: bmp_pose slots (%d) don't match "
+                        "mask slots (%d) — connecting bmp_pose from a "
+                        "DIFFERENT BMPInstanceSegmentation than "
+                        "bmp_masks? Body override skipped.",
+                        bmp_n, n_persons,
+                    )
+                else:
+                    for p_idx in range(n_persons):
+                        for t in range(B):
+                            kp17 = track_aligned[p_idx][t]
+                            kp133 = persons_133[p_idx][t]
+                            if kp17 is None or kp133 is None:
+                                continue
+                            # BMP keypoints are (17, 3) with PMPose scores
+                            # already in [0, 1]. Direct slot replacement.
+                            kp133[0:17] = kp17.astype(np.float32)
+                            body_override_count += 1
+
+        # ---- Phase 2.6: optional FaRL face override (23..90) -------------
+        # When farl_face is connected, regenerate the face slice using
+        # BMP's per-person head 5pt → synthesise FaRL 5pt landmarks →
+        # face_aligner. This bypasses the RetinaFace + mask matching
+        # path entirely (which fails in tight overlap) and instead
+        # leverages the per-person face↔body association we already
+        # have from BMP.
+        farl_time = 0.0
+        farl_override_count = 0
+        if farl_face is not None:
+            farl_t = time.perf_counter()
+
+            # Source for head 5pt: prefer BMP body (clean per-person
+            # association by construction), fall back to RTMW body slice
+            # if bmp_pose isn't connected.
+            head_kp_per_track: List[List[Optional[np.ndarray]]] = [
+                [None] * B for _ in range(n_persons)
+            ]
+            if bmp_pose is not None and bmp_pose.get("_track_aligned_kpts") is not None:
+                bmp_kpts = bmp_pose["_track_aligned_kpts"]
+                if len(bmp_kpts) == n_persons:
+                    for p_idx in range(n_persons):
+                        for t in range(B):
+                            kp17 = bmp_kpts[p_idx][t]
+                            if kp17 is not None:
+                                # Head = COCO indices 0..4
+                                head_kp_per_track[p_idx][t] = (
+                                    kp17[:5].astype(np.float32).copy()
+                                )
+            else:
+                # Fall back to RTMW body slice (also COCO 0..4 layout).
+                for p_idx in range(n_persons):
+                    for t in range(B):
+                        kp133 = persons_133[p_idx][t]
+                        if kp133 is None:
+                            continue
+                        head_kp_per_track[p_idx][t] = (
+                            kp133[0:5].astype(np.float32).copy()
+                        )
+
+            face_kp_68_timeline, _ = run_farl_face_per_person(
+                images_np_u8=rgb_u8,
+                head_kp_per_track=head_kp_per_track,
+                farl_face_dict=farl_face,
+                img_h=H, img_w=W,
+                head_conf_thresh=float(score_threshold),
+                frame_batch_size=32,
+                pbar=None,
+            )
+
+            for p_idx in range(n_persons):
+                for t in range(B):
+                    face68 = face_kp_68_timeline[p_idx][t]
+                    kp133 = persons_133[p_idx][t]
+                    if face68 is None or kp133 is None:
+                        continue
+                    # face68 is already (68, 3) with conf=1.0. Drop into
+                    # COCO-WB face slot 23..90 (68 iBUG / 300W landmarks).
+                    kp133[23:91] = face68.astype(np.float32)
+                    farl_override_count += 1
+
+            farl_time = time.perf_counter() - farl_t
+
         # ---- Phase 3: optional WiLoR hand override ------------------------
         wilor_time = 0.0
         wilor_overrides_count = 0
@@ -623,9 +735,13 @@ class BMPRTMWPoseNode:
         elapsed = time.perf_counter() - t0
         _logger.info(
             "BMPRTMWPose: %d frames, %d tracks | RTMW %.2fs | "
+            "BMP body overrides: %d | FaRL face %.2fs (%d overrides) | "
             "WiLoR %.2fs (%d hand overrides) | total %.2fs",
-            B, n_persons, rtmw_time, wilor_time,
-            wilor_overrides_count, elapsed,
+            B, n_persons, rtmw_time,
+            body_override_count,
+            farl_time, farl_override_count,
+            wilor_time, wilor_overrides_count,
+            elapsed,
         )
 
         # ---- Phase 5: debug overlay ---------------------------------------

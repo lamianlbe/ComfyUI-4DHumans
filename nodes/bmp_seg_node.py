@@ -809,24 +809,46 @@ class BMPInstanceSegmentationNode:
 
         id_to_slot = {tid: i for i, tid in enumerate(all_track_ids)}
 
+        # Track-aligned per-person keypoint timeline. Indexed by
+        # ``[slot][frame]`` → (17, 3) array or None when that person
+        # wasn't detected/tracked in that frame. Built here (not later)
+        # so downstream nodes don't have to re-run mask-IoU matching to
+        # recover which BMP detection belongs to which tracked-person
+        # slot — the work was already done by the IoU tracker above.
+        bmp_kpts_per_track: List[List[Optional[np.ndarray]]] = [
+            [None] * B for _ in range(n_total)
+        ]
         masks_out = torch.zeros(B * n_total, H, W, dtype=torch.float32)
         for t in range(B):
-            for tid, packed, _score, _kpts in per_frame_tracks[t]:
+            for tid, packed, _score, kpts in per_frame_tracks[t]:
                 slot = id_to_slot[tid]
                 mask_bool = unpack_mask(packed, H, W)
                 masks_out[t * n_total + slot] = torch.from_numpy(
                     mask_bool.astype(np.float32)
                 )
+                if kpts is not None:
+                    bmp_kpts_per_track[slot][t] = np.asarray(
+                        kpts, dtype=np.float32,
+                    )
 
-        # YOLO11POSE-compatible output: a replay model over the raw
-        # per-frame BMP results (unfiltered). FastSAM3DBody plugs this
-        # into yolo_model = yolo11pose_dict["model"] and iterates.
+        # YOLO11POSE-compatible output:
+        #   * ``model`` / ``_bmp_cache``: replay-based interface used by
+        #     FastSAM3DBodyFaRLPose's yolo11_pose slot (per-frame, raw
+        #     BMP detections in detection order — NOT track-aligned).
+        #   * ``_track_aligned_kpts``: NEW (2026-04-27). Per-tracked-
+        #     person 17-keypoint timeline, layout (n_total, B, 17, 3).
+        #     BMPRTMWPose uses this to override the body portion of
+        #     RTMW's 133-pt output with BMP's higher-quality body
+        #     keypoints (BMP's mask-conditioned PMPose is SOTA on
+        #     OCHuman; RTMW-x is generic top-down). Listed here so
+        #     downstream consumers don't have to redo IoU matching.
         replay_model = _BMPReplayModel(replay_cache)
         bmp_pose_out = {
-            "model":             replay_model,
-            "checkpoint_path":   "<BMP replay - see LoadBMPNode>",
-            "_bmp_cache":        replay_cache,
-            "_n_tracks":         n_total,
+            "model":               replay_model,
+            "checkpoint_path":     "<BMP replay - see LoadBMPNode>",
+            "_bmp_cache":          replay_cache,
+            "_n_tracks":           n_total,
+            "_track_aligned_kpts": bmp_kpts_per_track,
         }
 
         # Debug overlay: masks + bboxes + skeletons
