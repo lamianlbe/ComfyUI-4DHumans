@@ -44,6 +44,25 @@ def poses_to_npz_dict(poses):
         data["filter_smooth_sigma"] = np.float32(
             poses["_filter_smooth_sigma"])
 
+    # Pre-FaRL 2D face mean confidence per (slot, frame). Used by the
+    # render-time is_face_visible() helper as signal #2 (after 3D body
+    # normal, before 2D head-kpt geometry). Stored as a dense
+    # (n_persons, n_frames) float32 array; NaN encodes None for slots
+    # that had no face data at capture time. Without this round-trip
+    # the signal is silently lost on Save → Load and downstream
+    # PoseEditor / PoseRenderer fall back to weaker 2D heuristics that
+    # don't catch e.g. heads outside the frame.
+    face_conf_mat = poses.get("_face_conf_2d")
+    if face_conf_mat is not None:
+        arr = np.full((n_persons, n_frames), np.nan, dtype=np.float32)
+        for p_i in range(min(n_persons, len(face_conf_mat))):
+            row = face_conf_mat[p_i]
+            for f_j in range(min(n_frames, len(row))):
+                v = row[f_j]
+                if v is not None:
+                    arr[p_i, f_j] = float(v)
+        data["face_conf_2d"] = arr
+
     for i in range(n_persons):
         person = poses["persons"][i]
         data[f"person_{i}_visible"] = np.bool_(person.get("visible", True))

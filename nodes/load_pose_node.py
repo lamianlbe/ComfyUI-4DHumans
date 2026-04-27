@@ -105,6 +105,21 @@ def npz_to_poses(npz):
     if "filter_smooth_sigma" in npz:
         poses["_filter_smooth_sigma"] = float(npz["filter_smooth_sigma"])
 
+    # Restore pre-FaRL 2D face mean confidence (signal #2 used by
+    # is_face_visible). Stored as a dense (n_persons, n_frames) float32
+    # array with NaN for missing entries; rebuild the nested
+    # List[List[Optional[float]]] structure the helper expects.
+    if "face_conf_2d" in npz:
+        arr = np.asarray(npz["face_conf_2d"])
+        if arr.ndim == 2 and arr.shape == (n_persons, n_frames):
+            poses["_face_conf_2d"] = [
+                [
+                    None if not np.isfinite(arr[p, f]) else float(arr[p, f])
+                    for f in range(n_frames)
+                ]
+                for p in range(n_persons)
+            ]
+
     return poses
 
 

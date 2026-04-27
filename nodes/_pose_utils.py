@@ -614,6 +614,25 @@ def is_face_visible(
     be visible to camera, False otherwise. Tries three signals in
     priority order; first conclusive one wins.
 
+    Pre-check (always first, no signal-tier override):
+
+    0. Head landmarks must be substantially within image bounds. Top-
+       down kpt regressors (BMP / RTMW / ViTPose) extrapolate confidently
+       off-screen — when a person's head leaves the frame their
+       predicted nose / eyes / ears land at negative or > img_w / > img_h
+       coordinates while still passing all anatomical & geometric
+       checks. The 4 fallback signals can't catch this because the
+       extrapolated geometry is internally consistent (eyes still
+       between ears, distances proportional, etc.). So we just require
+       at least 3 of 5 head kpts (and ≥50% of FaRL face 68 if present)
+       to fall inside (0..img_w, 0..img_h) before any other check runs.
+       This applies REGARDLESS of which signal tier is conclusive
+       further down — a face whose anchors are off-screen is not a
+       "visible face" no matter what 3D body normal says about chest
+       direction.
+
+    Then three signals in priority order; first conclusive one wins.
+
     1. 3D body normal — `smpl_j3d[t]` shoulder × torso → forward vector.
        Visible when normalised forward.z < forward_z_threshold (camera
        looks down +Z, so negative-z = chest faces camera). Threshold
@@ -629,6 +648,41 @@ def is_face_visible(
     switch when the user wants to force-hide all faces.
     """
     person = poses["persons"][p_idx]
+
+    # -- Signal 0 (pre-check): face landmarks substantially in-frame ------
+    img_w = int(poses.get("img_w", 0))
+    img_h = int(poses.get("img_h", 0))
+    kp_list_pre = person.get("keypoints")
+    if (
+        img_w > 0 and img_h > 0
+        and kp_list_pre is not None
+        and 0 <= t < len(kp_list_pre)
+    ):
+        kp = kp_list_pre[t]
+        if kp is not None:
+            shape0 = getattr(kp, "shape", (0,))[0]
+            # Head 5pt (COCO-WB 0..4): nose, eyes, ears. These come from
+            # BMP / RTMW / ViTPose's body head regression.
+            if shape0 >= 5:
+                head = np.asarray(kp[:5, :2])
+                in_head = (
+                    (head[:, 0] >= 0) & (head[:, 0] < img_w)
+                    & (head[:, 1] >= 0) & (head[:, 1] < img_h)
+                ).sum()
+                if int(in_head) < 3:
+                    return False
+            # Face 68pt (COCO-WB 23..90): if present (FaRL output),
+            # require ≥50% in frame too. Catches the case where head
+            # 5pt sits at the image border but the surrounding face
+            # extrapolated mostly outside.
+            if shape0 >= 91:
+                face = np.asarray(kp[23:91, :2])
+                in_face = (
+                    (face[:, 0] >= 0) & (face[:, 0] < img_w)
+                    & (face[:, 1] >= 0) & (face[:, 1] < img_h)
+                ).sum()
+                if int(in_face) < 34:   # < 50% of 68
+                    return False
 
     # -- Signal 1: 3D body normal -----------------------------------------
     smpl_list = person.get("smpl_j3d")
