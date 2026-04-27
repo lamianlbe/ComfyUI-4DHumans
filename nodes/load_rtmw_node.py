@@ -28,11 +28,23 @@ Configs are vendored under bmp_configs/mmpose_rtmw/ — same approach
 as BMP since mmpose's pip wheel doesn't ship config files. License:
 mmpose Apache-2.0; RTMW weights Apache-2.0.
 
-Score range note: RTMPose / RTMW use a SimCC head whose returned
-``keypoint_scores`` are unnormalized (sum of two 1D-distribution
-peaks, typical range 0.2 - 3+, NOT [0, 1]). Downstream consumers
-should either pick thresholds in that range (default 0.3-1.5) or
-normalize via ``clip(scores, 0, 3) / 3`` before writing into NPZ.
+Score range note: RTMW's SimCC codec actually emits TWO score
+channels when ``decode_visibility=True`` (which our vendored configs
+have):
+
+  * ``pred_instances.keypoint_scores``: raw ``min(max simcc_x,
+    max simcc_y)``. NOT normalised — typical range 0.2 - 3+. Despite
+    the name this is the LESS useful one for downstream filtering.
+  * ``pred_instances.keypoints_visible``: same peaks but with
+    ``simcc * decode_beta * sigma`` then softmax. **Clean [0, 1]
+    probability** — what you actually want for "is this joint
+    visible/reliable". BMPRTMWPose downstream prefers this field
+    automatically.
+
+So the user-observed values like ``[1.9, 1.23, ...]`` are the raw
+``keypoint_scores`` (the verification path used those because we
+didn't request ``keypoints_visible`` at debug time). The composite
+node uses the cleaner ``keypoints_visible`` automatically.
 """
 
 import logging

@@ -27,10 +27,20 @@ Pipeline per frame:
        by wrist-proximity. Replace 91..111 (left) / 112..132 (right) of
        that person's keypoints with WiLoR's 21 points.
 
-Score handling: RTMW's SimCC scores are unnormalized (typical range
-0.2 - 3+). We normalize to [0, 1] via ``clip(s, 0, 3) / 3`` before
-writing into the POSES dict so the existing PoseRenderer / Pose Editor
-(which use 0-1 thresholds) work without changes.
+Score handling: RTMW's SimCC head returns TWO score channels (when
+the codec has ``decode_visibility=True``, which our vendored RTMW-x
+configs do). The first is ``keypoint_scores`` — the raw min(max
+simcc_x, max simcc_y) which is unnormalised (typically 0.2 - 3+).
+The second is ``keypoints_visible`` — the same peaks but with
+``simcc * decode_beta * sigma`` followed by softmax, giving a clean
+[0, 1] probability. mmpose's base_head exposes both via
+``pred_instances.keypoint_scores`` and ``pred_instances.keypoints_
+visible`` respectively.
+
+We prefer ``keypoints_visible`` when present (clean [0, 1] semantics,
+matches what PoseRenderer / Pose Editor / Save NPZ expect), and fall
+back to ``clip(keypoint_scores, 0, 3) / 3`` only if a future RTMW
+variant ships with ``decode_visibility=False``.
 """
 
 import logging
@@ -90,9 +100,31 @@ def _bbox_from_mask(
     return np.array([x1, y1, x2, y2], dtype=np.float32)
 
 
-def _normalize_rtmw_score(score: np.ndarray) -> np.ndarray:
-    """Map RTMW SimCC scores → [0, 1] via clip + scale."""
+def _normalize_rtmw_score_fallback(score: np.ndarray) -> np.ndarray:
+    """Fallback for older / non-default RTMW configs that ship with
+    ``decode_visibility=False`` and therefore don't expose
+    ``keypoints_visible``. clip(s, 0, 3) / 3 is a coarse approximation
+    of the softmax-normalised visibility — usable but not as clean as
+    the real visibility output. Our vendored RTMW-x configs have
+    ``decode_visibility=True`` so this path is rarely hit."""
     return np.clip(score, 0.0, _RTMW_SCORE_NORM) / _RTMW_SCORE_NORM
+
+
+def _extract_kpt_scores(pred_instances) -> np.ndarray:
+    """Pick the best [0, 1]-normalised score available from an mmpose
+    ``InstanceData`` result. Prefers the softmax-normalised
+    ``keypoints_visible`` field (set by SimCCLabel.decode when
+    ``decode_visibility=True``); falls back to a clipped version of
+    raw ``keypoint_scores`` otherwise.
+
+    Returns ``(K,)`` float32 in [0, 1].
+    """
+    visible = getattr(pred_instances, "keypoints_visible", None)
+    if visible is not None:
+        # Already softmax-normalised in [0, 1]; just take instance 0.
+        return np.asarray(visible[0], dtype=np.float32)
+    raw = np.asarray(pred_instances.keypoint_scores[0], dtype=np.float32)
+    return _normalize_rtmw_score_fallback(raw)
 
 
 # --------------------------------------------------------------------------
@@ -505,10 +537,9 @@ class BMPRTMWPoseNode:
             for r_idx, r in enumerate(results):
                 p_idx = slot_indices[r_idx]
                 kp = r.pred_instances.keypoints[0]            # (133, 2)
-                sc = r.pred_instances.keypoint_scores[0]      # (133,)
-                sc_norm = _normalize_rtmw_score(sc)
+                sc = _extract_kpt_scores(r.pred_instances)    # (133,) in [0, 1]
                 kp133 = np.concatenate(
-                    [kp.astype(np.float32), sc_norm[:, None].astype(np.float32)],
+                    [kp.astype(np.float32), sc[:, None].astype(np.float32)],
                     axis=-1,
                 )
                 persons_133[p_idx][t] = kp133
