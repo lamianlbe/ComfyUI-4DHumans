@@ -625,6 +625,48 @@ class BMPRTMWPoseNode:
                         ),
                     },
                 ),
+                "recovery_max_gap_frames": (
+                    "INT",
+                    {
+                        "default": 10,
+                        "min": 0,
+                        "max": 60,
+                        "step": 1,
+                        "tooltip": (
+                            "Track-recovery merge — if a slot goes "
+                            "silent and a NEW slot's first detection "
+                            "appears within this many frames, AND "
+                            "their poses match (OKS ≥ "
+                            "recovery_oks_thresh), AND the two slots "
+                            "never co-existed in any prior frame, "
+                            "the new slot's data is merged back into "
+                            "the old one to keep IDs stable across "
+                            "brief disappearances. Set to 0 to "
+                            "disable. Strict-by-default (10 = ~0.3s "
+                            "@ 30fps); raise carefully — large gaps "
+                            "make false merges more likely."
+                        ),
+                    },
+                ),
+                "recovery_oks_thresh": (
+                    "FLOAT",
+                    {
+                        "default": 0.65,
+                        "min": 0.3,
+                        "max": 0.99,
+                        "step": 0.05,
+                        "tooltip": (
+                            "OKS threshold for track-recovery merging. "
+                            "Same person across a 10-frame gap "
+                            "typically scores > 0.7; distinct people "
+                            "score < 0.3. 0.65 is a slightly lenient "
+                            "default to forgive small pose changes "
+                            "during occlusion. Mirrors / matches the "
+                            "ghost-suppression OKS threshold so "
+                            "behaviour is symmetric."
+                        ),
+                    },
+                ),
                 "debug_overlay": (
                     "BOOLEAN",
                     {
@@ -653,6 +695,7 @@ class BMPRTMWPoseNode:
     def run(self, images, bmp_masks, rtmw,
             score_threshold, fps,
             ghost_oks_thresh, ghost_max_burst_frames,
+            recovery_max_gap_frames, recovery_oks_thresh,
             debug_overlay,
             bmp_pose=None, farl_face=None, wilor=None):
         from mmpose.apis import inference_topdown
@@ -1143,6 +1186,125 @@ class BMPRTMWPoseNode:
                         sr_end + 1, sa, sb, swap_reason,
                     )
 
+        # ---- Phase 3.7: track recovery merge (lost-and-back-again) --------
+        # When a person briefly leaves the frame / gets fully occluded /
+        # has all keypoints drop below conf threshold, BMP's IoU
+        # tracker often spawns a new track-id when they reappear (since
+        # the old slot's last mask was IoU=0 vs the gap). The result is
+        # a fragmented identity: e.g. Alice = slot 0 for frames 0..150,
+        # then slot 0 goes empty, then she's slot 4 for frames 161..300.
+        #
+        # If the gap is short (≤ recovery_max_gap_frames) and the pose
+        # at slot 0's last frame matches slot 4's first frame (OKS ≥
+        # recovery_oks_thresh) AND the two slots NEVER co-existed in
+        # any frame (sanity gate against merging two genuinely
+        # different people), we move slot 4's data into slot 0 and
+        # null slot 4 for those frames.
+        #
+        # Strict by default: 10-frame gap (≈0.3s @ 30fps) and OKS 0.65
+        # rule out almost all false merges, at the cost of leaving
+        # longer disappearances unfixed (user said this is acceptable).
+        recovery_merges = 0
+        if recovery_max_gap_frames > 0 and n_persons >= 2:
+            # Build active intervals per slot — runs of consecutive
+            # frames where ``persons_133[s][t]`` is not None.
+            intervals: List[Tuple[int, int, int]] = []  # (slot, start, end)
+            for s in range(n_persons):
+                run_start = None
+                for t in range(B):
+                    if persons_133[s][t] is not None and run_start is None:
+                        run_start = t
+                    elif persons_133[s][t] is None and run_start is not None:
+                        intervals.append((s, run_start, t - 1))
+                        run_start = None
+                if run_start is not None:
+                    intervals.append((s, run_start, B - 1))
+
+            # Process intervals chronologically. For each interval we
+            # try to absorb subsequent intervals (in any other slot)
+            # that match by OKS within the recovery gap window.
+            intervals.sort(key=lambda x: (x[1], x[2]))
+            merged_indices: set = set()
+
+            for j in range(len(intervals)):
+                if j in merged_indices:
+                    continue
+                s_j, st_j, en_j = intervals[j]
+
+                k = j + 1
+                while k < len(intervals):
+                    if k in merged_indices:
+                        k += 1
+                        continue
+                    s_k, st_k, en_k = intervals[k]
+
+                    if s_k == s_j:
+                        # Same slot — already disjoint by interval
+                        # construction, nothing to merge.
+                        k += 1
+                        continue
+
+                    gap = st_k - en_j - 1  # frames of None between intervals
+                    if gap > int(recovery_max_gap_frames):
+                        # All later intervals are even further away
+                        # (sorted by start). Stop scanning.
+                        break
+
+                    if st_k <= en_j:
+                        # Time-overlap. Two slots active in the same
+                        # frame ⇒ different people (ghost handler
+                        # would already have collapsed any genuine
+                        # ghost). Skip.
+                        k += 1
+                        continue
+
+                    # Pose continuity check via OKS at the boundary.
+                    kp_a = persons_133[s_j][en_j]
+                    kp_b = persons_133[s_k][st_k]
+                    bbox_a = _body_bbox_from_kp133(kp_a, score_threshold)
+                    bbox_b = _body_bbox_from_kp133(kp_b, score_threshold)
+                    oks = _body_oks(
+                        kp_a, kp_b, bbox_a, bbox_b, score_threshold,
+                    )
+
+                    if oks < float(recovery_oks_thresh):
+                        k += 1
+                        continue
+
+                    # Sanity gate: if these two slots EVER co-existed
+                    # in any frame across the whole video, they must
+                    # be different people (ghost handler would have
+                    # caught a SAM-split co-existence). Refuse to
+                    # merge.
+                    both_ever = any(
+                        (persons_133[s_j][t] is not None
+                         and persons_133[s_k][t] is not None)
+                        for t in range(B)
+                    )
+                    if both_ever:
+                        k += 1
+                        continue
+
+                    # Merge: move slot s_k's interval data into slot s_j,
+                    # leaving slot s_k Nulled for those frames.
+                    for t in range(st_k, en_k + 1):
+                        persons_133[s_j][t] = persons_133[s_k][t]
+                        persons_133[s_k][t] = None
+                    merged_indices.add(k)
+                    recovery_merges += 1
+                    _logger.info(
+                        "Track recovery: slot %d frames %d..%d → slot %d "
+                        "(gap=%d, OKS=%.3f)",
+                        s_k, st_k, en_k, s_j, gap, oks,
+                    )
+
+                    # The merged data extends slot s_j's interval to
+                    # ``en_k``. Continue scanning forward — a later
+                    # interval might be reachable now that en_j has
+                    # advanced.
+                    en_j = en_k
+                    k += 1
+
         # ---- Phase 4: pack POSES dict -------------------------------------
         poses_persons = []
         for p_idx in range(n_persons):
@@ -1181,13 +1343,14 @@ class BMPRTMWPoseNode:
             "BMP body overrides: %d | FaRL face %.2fs (%d overrides) | "
             "WiLoR %.2fs (%d hand overrides) | "
             "ghost suppression: %d bursts (%d frames nulled, "
-            "%d slot swaps applied) | total %.2fs",
+            "%d slot swaps) | track recovery: %d merges | total %.2fs",
             B, n_persons, rtmw_time,
             body_override_count,
             farl_time, farl_override_count,
             wilor_time, wilor_overrides_count,
             ghosts_suppressed_bursts, ghosts_suppressed_frames,
             ghosts_swaps_applied,
+            recovery_merges,
             elapsed,
         )
 
