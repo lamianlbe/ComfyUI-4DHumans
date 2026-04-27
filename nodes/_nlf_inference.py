@@ -389,6 +389,18 @@ def run_nlf_video(
     """
     model       = nlf_dict["model"]
     torch_dtype = nlf_dict.get("torch_dtype", torch.float32)
+    if torch_dtype != torch.float32 and not getattr(
+        run_nlf_video, "_warned_dtype", False
+    ):
+        _logger.warning(
+            "LoadNLFNode dtype=%s is ignored at inference time — "
+            "NLF's TorchScript graph mixes fp32 constants with "
+            "activations and crashes under autocast. Inference will "
+            "run in fp32. Set LoadNLF dtype=float32 to silence this "
+            "warning.",
+            nlf_dict.get("dtype", str(torch_dtype)),
+        )
+        run_nlf_video._warned_dtype = True
 
     B = images_np_u8.shape[0]
 
@@ -457,16 +469,22 @@ def run_nlf_video(
             t0 = time.perf_counter()
 
             with torch.inference_mode():
-                # Autocast lets bf16/fp16 NLF runs share the input tensor
-                # without an explicit per-call cast; fp32 stays the no-op
-                # path (autocast(enabled=False) when dtype==float32).
-                if torch_dtype == torch.float32 or not torch.cuda.is_available():
-                    pred = model.detect_smpl_batched(frame_batch)
-                else:
-                    with torch.autocast(
-                        device_type="cuda", dtype=torch_dtype,
-                    ):
-                        pred = model.detect_smpl_batched(frame_batch)
+                # IMPORTANT: NLF's TorchScript graph bakes in fp32
+                # constants (e.g. camspace_up / up_vector inside
+                # ptu3d.lookat_matrix). Wrapping the call in autocast
+                # casts activations to bf16/fp16 but leaves those
+                # constants at fp32, then linalg.cross asserts on the
+                # mismatch:
+                #   RuntimeError: Found dtype BFloat16 but expected Float
+                # The TorchScript graph also can't be reliably moved to
+                # half precision after-the-fact (model.bfloat16() leaves
+                # buffers as fp32). So NLF inference is fp32 only,
+                # period — the dtype field on the LoadNLFNode dict is
+                # kept for forward-compat / output-cast metadata but is
+                # ignored here. Mirrors the pre-existing
+                # run_nlf_inference (sapiens_prompthmr_pose_node path)
+                # which has always run NLF in fp32.
+                pred = model.detect_smpl_batched(frame_batch)
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()

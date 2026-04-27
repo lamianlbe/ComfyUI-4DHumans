@@ -59,10 +59,16 @@ class LoadNLFNode:
                     {
                         "default": "float32",
                         "tooltip": (
-                            "Autocast precision for NLF forward pass. "
-                            "NLF is a TorchScript model; autocast wraps "
-                            "its calls. fp32 is safest, bf16/fp16 faster "
-                            "on modern GPUs."
+                            "Metadata only — the actual NLF "
+                            "TorchScript graph bakes in fp32 constants "
+                            "(camspace_up, up_vector) so autocast to "
+                            "bf16/fp16 crashes inside ptu3d.lookat_"
+                            "matrix with 'Found dtype BFloat16 but "
+                            "expected Float'. Inference always runs "
+                            "fp32; downstream consumers may still cast "
+                            "outputs based on this field. Leave at "
+                            "float32 unless you know why you need "
+                            "otherwise."
                         ),
                     },
                 ),
